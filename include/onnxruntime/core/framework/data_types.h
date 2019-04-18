@@ -122,8 +122,8 @@ inline bool operator!=(const BFloat16& left, const BFloat16& right) {
 // DataTypeImpl pointer as unique DataTypeImpl identifier.
 using MLDataType = const DataTypeImpl*;
 // be used with class MLValue
-using DeleteFunc = void(*)(void*);
-using CreateFunc = void*(*)();
+using DeleteFunc = void (*)(void*);
+using CreateFunc = void* (*)();
 
 /**
  * \brief Base class for MLDataType
@@ -170,6 +170,10 @@ class DataTypeImpl {
   // Return the types for a concrete tensor type, like Tensor_Float
   template <typename elemT>
   static MLDataType GetTensorType();
+
+  // Return the MLDataType for a concrete sparse tensor type.
+  template <typename elemT>
+  static MLDataType GetSparseTensorType();
 
   /**
    * Convert an ONNX TypeProto to onnxruntime DataTypeImpl.
@@ -375,6 +379,65 @@ class TensorType : public TensorTypeBase {
   }
 };
 
+/// Use "IsSparseTensorContainedType<T>::value" to test if a type T
+/// is permitted as the element-type of a sparse-tensor.
+
+template <typename T>
+struct IsSparseTensorContainedType : public IsAnyOf<T, float, uint8_t, int8_t, uint16_t, int16_t,
+                                                    int32_t, int64_t, bool, MLFloat16,
+                                                    double, uint32_t, uint64_t, BFloat16> {
+};
+
+/// Common base-class for all sparse-tensors (with different element types).
+class SparseTensorTypeBase : public DataTypeImpl {
+ public:
+  bool IsCompatible(const ONNX_NAMESPACE::TypeProto& type_proto) const override;
+
+  size_t Size() const override;
+
+  DeleteFunc GetDeleteFunc() const override;
+
+  const ONNX_NAMESPACE::TypeProto* GetTypeProto() const override;
+
+  virtual MLDataType GetElementType() const {
+    // should never reach here.
+    ORT_NOT_IMPLEMENTED(__FUNCTION__, " is not implemented");
+  }
+
+  SparseTensorTypeBase(const SparseTensorTypeBase&) = delete;
+  SparseTensorTypeBase& operator=(const SparseTensorTypeBase&) = delete;
+
+ protected:
+  ONNX_NAMESPACE::TypeProto& mutable_type_proto();
+
+  SparseTensorTypeBase();
+  ~SparseTensorTypeBase() override;
+
+ private:
+  struct Impl;
+  Impl* impl_;
+};
+
+template <typename elemT>
+class SparseTensorType : public SparseTensorTypeBase {
+ public:
+  static_assert(data_types_internal::IsSparseTensorContainedType<elemT>::value,
+                "Requires one of the sparse-tensor fundamental types");
+
+  static MLDataType Type();
+
+  /// Return a MLDataType representing the element-type
+  MLDataType GetElementType() const override {
+    return DataTypeImpl::GetType<elemT>();
+  }
+
+ private:
+  SparseTensorType() {
+    using namespace data_types_internal;
+    TensorContainedTypeSetter<elemT>::SetSparseTensorElementType(this->mutable_type_proto());
+  }
+};
+
 /**
  * \brief Base type for all non-tensors, maps, sequences and opaques
  */
@@ -558,6 +621,17 @@ class NonOnnxType : public DataTypeImpl {
   template <>                                           \
   MLDataType DataTypeImpl::GetTensorType<ELEM_TYPE>() { \
     return TensorType<ELEM_TYPE>::Type();               \
+  }
+
+#define ORT_REGISTER_SPARSE_TENSOR_TYPE(ELEM_TYPE)            \
+  template <>                                                 \
+  MLDataType SparseTensorType<ELEM_TYPE>::Type() {            \
+    static SparseTensorType<ELEM_TYPE> tensor_type;           \
+    return &tensor_type;                                      \
+  }                                                           \
+  template <>                                                 \
+  MLDataType DataTypeImpl::GetSparseTensorType<ELEM_TYPE>() { \
+    return SparseTensorType<ELEM_TYPE>::Type();               \
   }
 
 #define ORT_REGISTER_MAP(TYPE)               \

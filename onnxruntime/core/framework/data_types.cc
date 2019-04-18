@@ -95,6 +95,9 @@ struct TensorContainedTypeSetter<T> {
   static void SetTensorElementType(ONNX_NAMESPACE::TypeProto& proto) {
     proto.mutable_tensor_type()->set_elem_type(ToTensorDataType<T>());
   }
+  static void SetSparseTensorElementType(ONNX_NAMESPACE::TypeProto& proto) {
+    // TODO: proto.mutable_tensor_type()->set_elem_type(ToTensorDataType<T>());
+  }
   static void SetMapKeyType(ONNX_NAMESPACE::TypeProto& proto) {
     proto.mutable_map_type()->set_key_type(ToTensorDataType<T>());
   }
@@ -369,6 +372,42 @@ MLDataType TensorTypeBase::Type() {
   return &tensor_base;
 }
 
+/// SparseTensor
+
+struct SparseTensorTypeBase::Impl : public data_types_internal::TypeProtoImpl {
+};
+
+bool SparseTensorTypeBase::IsCompatible(const ONNX_NAMESPACE::TypeProto& type_proto) const {
+  const auto* thisProto = GetTypeProto();
+  if (&type_proto == thisProto) {
+    return true;
+  }
+  if (type_proto.value_case() != TypeProto::ValueCase::kSparseTensorType) {
+    return false;
+  }
+
+  ORT_ENFORCE(thisProto->value_case() == TypeProto::ValueCase::kSparseTensorType);
+  ORT_ENFORCE(thisProto->sparse_tensor_type().has_elem_type());
+
+  return data_types_internal::IsCompatible(thisProto->sparse_tensor_type(), type_proto.sparse_tensor_type());
+}
+
+size_t SparseTensorTypeBase::Size() const {
+  return sizeof(SparseTensor);  // TODO: Would this work if we want variant types?
+}
+
+DeleteFunc TensorTypeBase::GetDeleteFunc() const {
+  return &Delete<SparseTensor>;
+}
+
+const ONNX_NAMESPACE::TypeProto* SparseTensorTypeBase::GetTypeProto() const {
+  return impl_->GetProto();
+}
+
+ONNX_NAMESPACE::TypeProto& SparseTensorTypeBase::mutable_type_proto() {
+  return impl_->mutable_type_proto();
+}
+
 /// NoTensorTypeBase
 struct NonTensorTypeBase::Impl : public data_types_internal::TypeProtoImpl {};
 
@@ -443,6 +482,21 @@ ORT_REGISTER_TENSOR_TYPE(uint64_t);
 ORT_REGISTER_TENSOR_TYPE(MLFloat16);
 ORT_REGISTER_TENSOR_TYPE(BFloat16);
 
+ORT_REGISTER_SPARSE_TENSOR_TYPE(int32_t);
+ORT_REGISTER_SPARSE_TENSOR_TYPE(float);
+ORT_REGISTER_SPARSE_TENSOR_TYPE(bool);
+// ORT_REGISTER_SPARSE_TENSOR_TYPE(std::string);
+ORT_REGISTER_SPARSE_TENSOR_TYPE(int8_t);
+ORT_REGISTER_SPARSE_TENSOR_TYPE(uint8_t);
+ORT_REGISTER_SPARSE_TENSOR_TYPE(uint16_t);
+ORT_REGISTER_SPARSE_TENSOR_TYPE(int16_t);
+ORT_REGISTER_SPARSE_TENSOR_TYPE(int64_t);
+ORT_REGISTER_SPARSE_TENSOR_TYPE(double);
+ORT_REGISTER_SPARSE_TENSOR_TYPE(uint32_t);
+ORT_REGISTER_SPARSE_TENSOR_TYPE(uint64_t);
+ORT_REGISTER_SPARSE_TENSOR_TYPE(MLFloat16);
+ORT_REGISTER_SPARSE_TENSOR_TYPE(BFloat16);
+
 ORT_REGISTER_MAP(MapStringToString);
 ORT_REGISTER_MAP(MapStringToInt64);
 ORT_REGISTER_MAP(MapStringToFloat);
@@ -465,6 +519,12 @@ ORT_REGISTER_SEQ(VectorMapInt64ToFloat);
   {                                                          \
     MLDataType mltype = DataTypeImpl::GetTensorType<TYPE>(); \
     reg_fn(mltype);                                          \
+  }
+
+#define REGISTER_SPARSE_TENSOR_PROTO(TYPE, reg_fn)                 \
+  {                                                                \
+    MLDataType mltype = DataTypeImpl::GetSparseTensorType<TYPE>(); \
+    reg_fn(mltype);                                                \
   }
 
 #define REGISTER_ONNX_PROTO(TYPE, reg_fn)              \
@@ -490,6 +550,21 @@ void RegisterAllProtos(const std::function<void(MLDataType)>& reg_fn) {
   REGISTER_TENSOR_PROTO(uint64_t, reg_fn);
   REGISTER_TENSOR_PROTO(MLFloat16, reg_fn);
   REGISTER_TENSOR_PROTO(BFloat16, reg_fn);
+
+  REGISTER_SPARSE_TENSOR_PROTO(int32_t, reg_fn);
+  REGISTER_SPARSE_TENSOR_PROTO(float, reg_fn);
+  REGISTER_SPARSE_TENSOR_PROTO(bool, reg_fn);
+  // REGISTER_SPARSE_TENSOR_PROTO(std::string, reg_fn);
+  REGISTER_SPARSE_TENSOR_PROTO(int8_t, reg_fn);
+  REGISTER_SPARSE_TENSOR_PROTO(uint8_t, reg_fn);
+  REGISTER_SPARSE_TENSOR_PROTO(uint16_t, reg_fn);
+  REGISTER_SPARSE_TENSOR_PROTO(int16_t, reg_fn);
+  REGISTER_SPARSE_TENSOR_PROTO(int64_t, reg_fn);
+  REGISTER_SPARSE_TENSOR_PROTO(double, reg_fn);
+  REGISTER_SPARSE_TENSOR_PROTO(uint32_t, reg_fn);
+  REGISTER_SPARSE_TENSOR_PROTO(uint64_t, reg_fn);
+  REGISTER_SPARSE_TENSOR_PROTO(MLFloat16, reg_fn);
+  REGISTER_SPARSE_TENSOR_PROTO(BFloat16, reg_fn);
 
   REGISTER_ONNX_PROTO(MapStringToString, reg_fn);
   REGISTER_ONNX_PROTO(MapStringToInt64, reg_fn);
