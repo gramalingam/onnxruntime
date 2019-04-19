@@ -37,6 +37,7 @@ using VectorMapInt64ToFloat = std::vector<MapInt64ToFloat>;
 
 class DataTypeImpl;
 class TensorTypeBase;
+class SparseTensorTypeBase;
 
 // MLFloat16
 union MLFloat16 {
@@ -184,6 +185,8 @@ class DataTypeImpl {
   static MLDataType TypeFromProto(const ONNX_NAMESPACE::TypeProto& proto);
 
   static const TensorTypeBase* TensorTypeFromONNXEnum(int type);
+  static const SparseTensorTypeBase* SparseTensorTypeFromONNXEnum(int type);
+
   static const char* ToString(MLDataType type);
   // Registers ONNX_NAMESPACE::DataType (internalized string) with
   // MLDataType. DataType is produced by internalizing an instance of
@@ -237,6 +240,15 @@ template <typename T>
 struct IsTensorContainedType : public IsAnyOf<T, float, uint8_t, int8_t, uint16_t, int16_t,
                                               int32_t, int64_t, std::string, bool, MLFloat16,
                                               double, uint32_t, uint64_t, BFloat16> {
+};
+
+/// Use "IsSparseTensorContainedType<T>::value" to test if a type T
+/// is permitted as the element-type of a sparse-tensor.
+
+template <typename T>
+struct IsSparseTensorContainedType : public IsAnyOf<T, float, uint8_t, int8_t, uint16_t, int16_t,
+                                                    int32_t, int64_t, bool, MLFloat16,
+                                                    double, uint32_t, uint64_t, BFloat16> {
 };
 
 /// This template's Get() returns a corresponding MLDataType
@@ -379,18 +391,11 @@ class TensorType : public TensorTypeBase {
   }
 };
 
-/// Use "IsSparseTensorContainedType<T>::value" to test if a type T
-/// is permitted as the element-type of a sparse-tensor.
-
-template <typename T>
-struct IsSparseTensorContainedType : public IsAnyOf<T, float, uint8_t, int8_t, uint16_t, int16_t,
-                                                    int32_t, int64_t, bool, MLFloat16,
-                                                    double, uint32_t, uint64_t, BFloat16> {
-};
-
 /// Common base-class for all sparse-tensors (with different element types).
 class SparseTensorTypeBase : public DataTypeImpl {
  public:
+  static MLDataType Type();
+
   bool IsCompatible(const ONNX_NAMESPACE::TypeProto& type_proto) const override;
 
   size_t Size() const override;
