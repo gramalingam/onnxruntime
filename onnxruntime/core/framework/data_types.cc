@@ -102,7 +102,7 @@ struct TensorContainedTypeSetter<T> {
     proto.mutable_tensor_type()->set_elem_type(ToTensorDataType<T>());
   }
   static void SetSparseTensorElementType(ONNX_NAMESPACE::TypeProto& proto) {
-    // TODO: proto.mutable_tensor_type()->set_elem_type(ToTensorDataType<T>());
+    proto.mutable_sparse_tensor_type()->set_elem_type(ToTensorDataType<T>());
   }
   static void SetMapKeyType(ONNX_NAMESPACE::TypeProto& proto) {
     proto.mutable_map_type()->set_key_type(ToTensorDataType<T>());
