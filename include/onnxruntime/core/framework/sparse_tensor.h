@@ -62,7 +62,7 @@ class SparseTensor final {
  private:
   int values_;
   int indices_;
-  int size_;  // The value of a single dimension
+  int64_t size_;  // The value of a single dimension
 };
 
 }  // namespace onnxruntime

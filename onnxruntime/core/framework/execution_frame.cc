@@ -343,11 +343,13 @@ Status ExecutionFrame::AllocateTensorWithPreAllocateBufferHelper(MLValue& mlvalu
   return Status::OK();
 }
 
-static Status AllocateTraditionalMLValue(MLValue& mlvalue, const NonTensorTypeBase& type) {
+/*
+static Status AllocateTraditionalMLValue(MLValue& mlvalue, const DataTypeImpl& type) {
   auto creator = type.GetCreateFunc();
   mlvalue.Init(creator(), &type, type.GetDeleteFunc());
   return Status::OK();
 }
+*/
 
 // This method is not thread safe!
 Status ExecutionFrame::AllocateAsPerAllocationPlan(MLValue& mlvalue, int mlvalue_index, const TensorShape* shape) {
@@ -370,7 +372,9 @@ Status ExecutionFrame::AllocateAsPerAllocationPlan(MLValue& mlvalue, int mlvalue
                   "Tried to allocate without valid type information, mlvalue index=" + std::to_string(mlvalue_index));
 
   if (!ml_type->IsTensorType()) {
-    return AllocateTraditionalMLValue(mlvalue, *static_cast<const NonTensorTypeBase*>(ml_type));
+    // return AllocateTraditionalMLValue(mlvalue, *ml_type);
+    ml_type->Init(mlvalue);
+    return Status::OK();
   }
 
   ORT_ENFORCE(shape, "Allocation of tensor types requires a shape.");

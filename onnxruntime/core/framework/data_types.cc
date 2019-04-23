@@ -28,6 +28,11 @@ template <>
 MLDataType DataTypeImpl::GetType<SparseTensor>() {
   return SparseTensorTypeBase::Type();
 }
+}  // namespace onnxruntime
+
+#include "core/framework/ml_value.h"
+
+namespace onnxruntime {
 
 static bool IsTensorTypeScalar(const ONNX_NAMESPACE::TypeProto_Tensor& tensor_type_proto) {
   int sz = tensor_type_proto.shape().dim_size();
@@ -404,11 +409,20 @@ bool SparseTensorTypeBase::IsCompatible(const ONNX_NAMESPACE::TypeProto& type_pr
 }
 
 size_t SparseTensorTypeBase::Size() const {
-  return sizeof(SparseTensor);  // TODO: Would this work if we want variant types?
+  return sizeof(SparseTensor);
 }
 
 DeleteFunc SparseTensorTypeBase::GetDeleteFunc() const {
   return &Delete<SparseTensor>;
+}
+
+CreateFunc SparseTensorTypeBase::GetCreateFunc() const {
+  return []() -> void* { return new SparseTensor(); };
+}
+
+void SparseTensorTypeBase::Init(MLValue& mlvalue) const {
+  auto* allocator = GetCreateFunc();
+  mlvalue.Init(allocator(), SparseTensorTypeBase::Type(), GetDeleteFunc());
 }
 
 const ONNX_NAMESPACE::TypeProto* SparseTensorTypeBase::GetTypeProto() const {
@@ -440,6 +454,10 @@ ONNX_NAMESPACE::TypeProto& NonTensorTypeBase::mutable_type_proto() {
 
 const ONNX_NAMESPACE::TypeProto* NonTensorTypeBase::GetTypeProto() const {
   return impl_->GetProto();
+}
+
+void NonTensorTypeBase::Init(MLValue& mlvalue) const {
+  mlvalue.Init(GetCreateFunc(), this, GetDeleteFunc());
 }
 
 bool NonTensorTypeBase::IsMapCompatible(const ONNX_NAMESPACE::TypeProto& type_proto) const {

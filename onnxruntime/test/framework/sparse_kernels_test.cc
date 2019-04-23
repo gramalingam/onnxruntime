@@ -22,7 +22,8 @@ namespace test {
 ONNX_NAMESPACE::OpSchema GetSparseFromCOOSchema() {
   ONNX_NAMESPACE::OpSchema schema("SparseFromCOO", __FILE__, __LINE__);
   schema.SetDoc(R"DOC(
-This operator constructs a sparse tensor.
+This operator constructs a sparse tensor from three tensors that provide a COO
+(coordinate) representation with linearized index values.
 )DOC")
       .SetDomain(onnxruntime::kMLDomain)
       .Input(
@@ -59,7 +60,7 @@ This operator constructs a sparse tensor.
           "Type of index tensor and shape")
       .TypeConstraint(
           "T",
-          {"sparse(int64)"},
+          {"sparse_tensor(int64)"},
           "Output type");
   schema.SinceVersion(10);
   return schema;
@@ -83,7 +84,7 @@ ONNX_NAMESPACE::OpSchema GetSparseToCOOSchema() {
           OpSchema::Single)
       .TypeConstraint(
           "T1",
-          {"sparse(int64)"},
+          {"sparse_tensor(int64)"},
           "Only int64 is allowed")
       .TypeConstraint(
           "T2",
@@ -108,8 +109,7 @@ class SparseFromCOOKernel final : public OpKernel {
     const Tensor& indices = *ctx->Input<Tensor>(1);
     const Tensor& shape = *ctx->Input<Tensor>(2);
 
-    // Shapes of values and indices should be the same since they refer to the same
-    // values
+    // values and indices should be 1-dimensional tensors
     const TensorShape& val_shape = values.Shape();
     const TensorShape& ind_shape = indices.Shape();
     ORT_ENFORCE(val_shape.NumDimensions() == 1, "Values must be a 1-dimensional tensor.");
@@ -119,7 +119,7 @@ class SparseFromCOOKernel final : public OpKernel {
     SparseTensor* output_sparse_tensor = ctx->Output<SparseTensor>(0);
 
     ORT_ENFORCE(output_sparse_tensor != nullptr);
-    // TODO
+    output_sparse_tensor->Size() = val_shape.Size();
 
     return Status::OK();
   }
@@ -137,14 +137,14 @@ class SparseToCOOKernel final : public OpKernel {
     const SparseTensor* sparse_input = ctx->Input<SparseTensor>(0);
     sparse_input;
     // TODO
-    /*
+
     const int64_t dims[1] = {1};
     TensorShape output_shape(dims, 1);
     Tensor* sparse_shape = ctx->Output(0, output_shape);
     int64_t* shape_data = sparse_shape->MutableData<int64_t>();
     ORT_ENFORCE(shape_data != nullptr);
     *shape_data = sparse_input->Size();
-	*/
+
     return Status::OK();
   }
 };
@@ -162,7 +162,7 @@ KernelDefBuilder ConstructSparseFromCOO() {
       .TypeConstraint("shape",
                       DataTypeImpl::GetTensorType<int64_t>())
       .TypeConstraint("sparse_rep",
-                      DataTypeImpl::GetType<SparseTensor>());
+                      DataTypeImpl::GetSparseTensorType<int64_t>());
   return def;
 }
 
@@ -170,10 +170,10 @@ KernelDefBuilder ConstructSparseToCOO() {
   KernelDefBuilder def;
   def.SetName("SparseToCOO")
       .SetDomain(onnxruntime::kMLDomain)
-      .SinceVersion(8)
+      .SinceVersion(10)
       .Provider(onnxruntime::kCpuExecutionProvider)
       .TypeConstraint("sparse_rep",
-                      DataTypeImpl::GetType<SparseTensor>())
+                      DataTypeImpl::GetSparseTensorType<int64_t>())
       .TypeConstraint("values",
                       DataTypeImpl::GetTensorType<int64_t>());
   return def;
@@ -239,7 +239,7 @@ TEST_F(SparseTensorTests, RunModel) {
     inputs.push_back(&sparse_shape_arg);
 
     //Output is our custom data type
-    TypeProto output_sparse_tensor(*DataTypeImpl::GetType<SparseTensor>()->GetTypeProto());
+    TypeProto output_sparse_tensor(*DataTypeImpl::GetSparseTensorType<int64_t>()->GetTypeProto());
     auto& output_sparse_tensor_arg = graph.GetOrCreateNodeArg("sparse_rep", &output_sparse_tensor);
     outputs.push_back(&output_sparse_tensor_arg);
 
@@ -308,7 +308,7 @@ TEST_F(SparseTensorTests, RunModel) {
   auto& rtensor = fetches.front().Get<Tensor>();
   // Should get the original shape back in the form of a tensor
   EXPECT_EQ(1, rtensor.Shape().NumDimensions());
-  EXPECT_EQ(5, *rtensor.template Data<int64_t>());
+  EXPECT_EQ(2, *rtensor.template Data<int64_t>());
 }
 
 }  // namespace test
