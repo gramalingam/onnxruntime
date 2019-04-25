@@ -73,7 +73,7 @@ ONNX_NAMESPACE::OpSchema GetSparseToCOOSchema() {
       .Input(
           0,
           "sparse_rep",
-          "A sparse tensor to be unpacked",
+          "A sparse tensor to be unpacked into COO format",
           "T1",
           OpSchema::Single)
       .Output(
@@ -112,14 +112,21 @@ class SparseFromCOOKernel final : public OpKernel {
     // values and indices should be 1-dimensional tensors
     const TensorShape& val_shape = values.Shape();
     const TensorShape& ind_shape = indices.Shape();
+    const TensorShape& shape_shape = shape.Shape();
+
+    auto size = val_shape.Size();
+
     ORT_ENFORCE(val_shape.NumDimensions() == 1, "Values must be a 1-dimensional tensor.");
     ORT_ENFORCE(ind_shape.NumDimensions() == 1, "Indices must be a 1-dimensional tensor with linearized index values.");
+    ORT_ENFORCE(ind_shape.Size() == size, "Values and Indices must have same size.");
+    ORT_ENFORCE(shape_shape.NumDimensions() == 1, "Shape must be a 1-dimensional tensor.");
 
-    shape;  // TODO
     SparseTensor* output_sparse_tensor = ctx->Output<SparseTensor>(0);
-
     ORT_ENFORCE(output_sparse_tensor != nullptr);
-    output_sparse_tensor->Size() = val_shape.Size();
+
+    output_sparse_tensor->Values().assign(values.Data<int64_t>(), values.Data<int64_t>() + size);
+    output_sparse_tensor->Indices().assign(indices.Data<int64_t>(), indices.Data<int64_t>() + size);
+    output_sparse_tensor->Shape() = TensorShape(shape.Data<int64_t>(), shape_shape.Size());
 
     return Status::OK();
   }
@@ -135,15 +142,18 @@ class SparseToCOOKernel final : public OpKernel {
   Status Compute(OpKernelContext* ctx) const override {
     ORT_ENFORCE(ctx->InputCount() == 1, "Expecting a single SparseTensorSample input");
     const SparseTensor* sparse_input = ctx->Input<SparseTensor>(0);
-    sparse_input;
-    // TODO
+    const auto& values = sparse_input->Values();
+    auto size = static_cast<int64_t>(values.size());
 
-    const int64_t dims[1] = {1};
-    TensorShape output_shape(dims, 1);
-    Tensor* sparse_shape = ctx->Output(0, output_shape);
-    int64_t* shape_data = sparse_shape->MutableData<int64_t>();
-    ORT_ENFORCE(shape_data != nullptr);
-    *shape_data = sparse_input->Size();
+    // const int64_t dims[1] = {size};
+    TensorShape output_shape{size};
+
+    Tensor* output = ctx->Output(0, output_shape);
+    int64_t* ptr = output->MutableData<int64_t>();
+    ORT_ENFORCE(ptr != nullptr);
+    for (auto i = size - 1; i >= 0; --i)
+      *(ptr + i) = values[i];
+    // *shape_data = sparse_input->Size();
 
     return Status::OK();
   }
@@ -275,7 +285,7 @@ TEST_F(SparseTensorTests, RunModel) {
 
   // Prepare inputs/outputs
   std::vector<int64_t> val_dims = {2};
-  std::vector<int64_t> values = {1, 2};
+  std::vector<int64_t> values = {99, 2};
   // prepare inputs
   MLValue ml_values;
   CreateMLValue<int64_t>(TestCPUExecutionProvider()->GetAllocator(0, OrtMemTypeDefault), val_dims, values, &ml_values);
@@ -308,7 +318,7 @@ TEST_F(SparseTensorTests, RunModel) {
   auto& rtensor = fetches.front().Get<Tensor>();
   // Should get the original shape back in the form of a tensor
   EXPECT_EQ(1, rtensor.Shape().NumDimensions());
-  EXPECT_EQ(2, *rtensor.template Data<int64_t>());
+  EXPECT_EQ(99, *rtensor.template Data<int64_t>());
 }
 
 }  // namespace test

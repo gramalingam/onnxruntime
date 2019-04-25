@@ -4,6 +4,7 @@
 // Licensed under the MIT License.
 
 #include "core/framework/data_types.h"
+#include "core/framework/tensor_shape.h"
 
 using namespace onnxruntime::common;
 
@@ -41,8 +42,8 @@ class SparseTensor final {
     return indices_;
   }
 
-  const auto& Size() const {
-    return size_;
+  const auto& Shape() const {
+    return shape_;
   }
 
   auto& Values() {
@@ -53,16 +54,16 @@ class SparseTensor final {
     return indices_;
   }
 
-  auto& Size() {
-    return size_;
+  auto& Shape() {
+    return shape_;
   }
 
   void foo();  // TODO
 
  private:
-  int values_;
-  int indices_;
-  int64_t size_;  // The value of a single dimension
+  std::vector<int64_t> values_;
+  std::vector<int64_t> indices_;
+  TensorShape shape_;  // The value of a single dimension
 };
 
 }  // namespace onnxruntime
