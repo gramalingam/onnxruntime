@@ -169,6 +169,10 @@ class DataTypeImpl {
     return false;
   }
 
+  virtual bool IsSparseTensorType() const {
+    return false;
+  }
+
   // Returns this if this is of tensor-type and null otherwise
   virtual const TensorTypeBase* AsTensorType() const {
     return nullptr;
@@ -406,12 +410,16 @@ class SparseTensorTypeBase : public DataTypeImpl {
  public:
   static MLDataType Type();
 
+  bool IsSparseTensorType() const override {
+    return true;
+  }
+
   bool IsCompatible(const ONNX_NAMESPACE::TypeProto& type_proto) const override;
 
   size_t Size() const override;
 
   DeleteFunc GetDeleteFunc() const override;
-  CreateFunc GetCreateFunc() const override;
+  // CreateFunc GetCreateFunc() const override;
 
   void Init(MLValue& mlvalue) const override;
 

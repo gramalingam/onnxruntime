@@ -8,9 +8,9 @@ using namespace onnxruntime::common;
 
 namespace onnxruntime {
 
-// TODO: Other
-// extend: DataTypeImpl::ToString(MLDataType type) in data_types.cc
+SparseTensor::SparseTensor(void* values, int64_t* indices, size_t nnz, const TensorShape& shape) : p_values_(values),
+                                                                                                   p_indices_(indices),
+                                                                                                   shape_(shape),
+                                                                                                   nnz_(nnz) {}
 
-void SparseTensor::foo() {
-}
 }  // namespace onnxruntime

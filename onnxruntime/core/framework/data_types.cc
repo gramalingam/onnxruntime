@@ -416,9 +416,9 @@ DeleteFunc SparseTensorTypeBase::GetDeleteFunc() const {
   return &Delete<SparseTensor>;
 }
 
-CreateFunc SparseTensorTypeBase::GetCreateFunc() const {
-  return []() -> void* { return new SparseTensor(); };
-}
+//CreateFunc SparseTensorTypeBase::GetCreateFunc() const {
+//  return []() -> void* { return new SparseTensor(); };
+//}
 
 void SparseTensorTypeBase::Init(MLValue& mlvalue) const {
   auto* allocator = GetCreateFunc();

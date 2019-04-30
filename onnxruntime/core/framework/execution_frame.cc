@@ -45,7 +45,7 @@ MLValue* IExecutionFrame::GetMutableNodeInputOrOutputMLValue(int index) {
 // TO DO: make it thread safe
 // This method is not thread safe!
 // Return S_OK and nullptr if index map to an value that is an unused optional input/output
-Status IExecutionFrame::GetOrCreateNodeOutputMLValue(int index, const TensorShape* shape, MLValue*& p_mlvalue) {
+Status IExecutionFrame::GetOrCreateNodeOutputMLValue(int index, const TensorShape* shape, MLValue*& p_mlvalue, size_t nnz) {
   auto status = Status::OK();
   int mlvalue_idx = GetNodeIdxToMLValueIdx(index);
 
@@ -64,7 +64,7 @@ Status IExecutionFrame::GetOrCreateNodeOutputMLValue(int index, const TensorShap
                     " Requested shape:", shape ? shape->ToString() : "null");
       }
     } else {
-      status = CreateNodeOutputMLValueImpl(*p_mlvalue, mlvalue_idx, shape);
+      status = CreateNodeOutputMLValueImpl(*p_mlvalue, mlvalue_idx, shape, nnz);
     }
   }
 
@@ -352,7 +352,7 @@ static Status AllocateTraditionalMLValue(MLValue& mlvalue, const DataTypeImpl& t
 */
 
 // This method is not thread safe!
-Status ExecutionFrame::AllocateAsPerAllocationPlan(MLValue& mlvalue, int mlvalue_index, const TensorShape* shape) {
+Status ExecutionFrame::AllocateAsPerAllocationPlan(MLValue& mlvalue, int mlvalue_index, const TensorShape* shape, size_t nnz) {
   // if there is a custom allocator for this mlvalue_index, call it to do the allocation
   auto custom_alloc_entry = custom_allocators_.find(mlvalue_index);
   if (custom_alloc_entry != custom_allocators_.cend()) {
@@ -371,6 +371,14 @@ Status ExecutionFrame::AllocateAsPerAllocationPlan(MLValue& mlvalue, int mlvalue
     return Status(ONNXRUNTIME, INVALID_ARGUMENT,
                   "Tried to allocate without valid type information, mlvalue index=" + std::to_string(mlvalue_index));
 
+  if (ml_type->IsSparseTensorType()) {
+    // TODO
+    auto* values = new int64_t[nnz];
+    auto* indices = new int64_t[nnz];
+    auto* sparse = new SparseTensor(values, indices, nnz, *shape);
+    mlvalue.Init(sparse, SparseTensorTypeBase::Type(), ml_type->GetDeleteFunc());
+    return Status::OK();
+  }
   if (!ml_type->IsTensorType()) {
     // return AllocateTraditionalMLValue(mlvalue, *ml_type);
     ml_type->Init(mlvalue);
@@ -421,8 +429,8 @@ AllocatorPtr ExecutionFrame::GetAllocatorImpl(const OrtAllocatorInfo& info) cons
 
 // This method is not thread safe!
 // Return S_OK and nullptr if index map to an value that is an unused optional input/output
-Status ExecutionFrame::CreateNodeOutputMLValueImpl(MLValue& mlvalue, int mlvalue_idx, const TensorShape* shape) {
-  return AllocateAsPerAllocationPlan(mlvalue, mlvalue_idx, shape);
+Status ExecutionFrame::CreateNodeOutputMLValueImpl(MLValue& mlvalue, int mlvalue_idx, const TensorShape* shape, size_t nnz) {
+  return AllocateAsPerAllocationPlan(mlvalue, mlvalue_idx, shape, nnz);
 }
 
 Status ExecutionFrame::ReleaseMLValueImpl(int mlvalue_idx) {

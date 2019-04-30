@@ -10,59 +10,50 @@ using namespace onnxruntime::common;
 
 namespace onnxruntime {
 
-// An implementation of sparse tensor.
-
 /**
  * @brief This class implements SparseTensor.
- *
- * @details The class captures the 3 necessary elements of a Sparse Tensor
- *          values - a vector of non-zero sparse tensor values
- *          indices - a vector of indices of non zero values
- *          shape   - a scalar tensor that indicates the size of a single dimension
- *                   It is assumed that all of the values for the tensors are int64
- *          we use tensor datatypes as effective memory managers.
  */
 
-// This type is a result of the construct_sparse OpKernel.
 class SparseTensor final {
  public:
-  SparseTensor() = default;
-  ~SparseTensor() = default;
+  SparseTensor(void* values, int64_t* indices, size_t nnz, const TensorShape& shape);
+  ~SparseTensor() = default;  // TODO
 
   SparseTensor(const SparseTensor&) = default;
   SparseTensor& operator=(const SparseTensor&) = default;
   SparseTensor(SparseTensor&&) = default;
   SparseTensor& operator=(SparseTensor&&) = default;
 
-  const auto& Values() const {
-    return values_;
+  size_t NumValues() const { return nnz_; }
+
+  const int64_t* Values() const {
+    return static_cast<const int64_t*>(p_values_);  // TODO
   }
 
-  const auto& Indices() const {
-    return indices_;
+  const int64_t* Indices() const {
+    return p_indices_;
   }
 
   const auto& Shape() const {
     return shape_;
   }
 
-  auto& Values() {
-    return values_;
+  int64_t* Values() {
+    return static_cast<int64_t*>(p_values_);  // TODO
   }
 
-  auto& Indices() {
-    return indices_;
+  int64_t* Indices() {
+    return p_indices_;
   }
 
   auto& Shape() {
     return shape_;
   }
 
-  void foo();  // TODO
-
  private:
-  std::vector<int64_t> values_;
-  std::vector<int64_t> indices_;
+  size_t nnz_;
+  void* p_values_;
+  int64_t* p_indices_;
   TensorShape shape_;  // The value of a single dimension
 };
 

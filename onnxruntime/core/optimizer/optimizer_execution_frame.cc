@@ -100,7 +100,7 @@ AllocatorPtr OptimizerExecutionFrame::GetAllocatorImpl(const OrtAllocatorInfo& i
 
 // This method is not thread safe!
 // Return S_OK and nullptr if index map to an value that is an unused optional input/output
-Status OptimizerExecutionFrame::CreateNodeOutputMLValueImpl(MLValue& mlvalue, int mlvalue_idx, const TensorShape* shape) {
+Status OptimizerExecutionFrame::CreateNodeOutputMLValueImpl(MLValue& mlvalue, int mlvalue_idx, const TensorShape* shape, size_t nnz) {
   const DataTypeImpl* ml_type = utils::GetMLDataType(*(info_.GetMLValueIdxNodeArgMap().at(mlvalue_idx)));
   if (ml_type == nullptr)
     return Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT,

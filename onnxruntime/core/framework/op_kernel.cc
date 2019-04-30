@@ -28,7 +28,12 @@ Tensor* OpKernelContext::Output(int index, const TensorShape& shape) {
   return p_ml_value ? p_ml_value->GetMutable<Tensor>() : nullptr;
 }
 
-MLValue* OpKernelContext::OutputMLValue(int index, const TensorShape& shape) {
+SparseTensor* OpKernelContext::Output(int index, size_t nnz, const TensorShape& shape) {
+  auto p_ml_value = OutputMLValue(index, shape, nnz);
+  return p_ml_value ? p_ml_value->GetMutable<SparseTensor>() : nullptr;
+}
+
+MLValue* OpKernelContext::OutputMLValue(int index, const TensorShape& shape, size_t nnz) {
   if (index < 0 || index >= OutputCount())
     return nullptr;
 
@@ -37,7 +42,7 @@ MLValue* OpKernelContext::OutputMLValue(int index, const TensorShape& shape) {
   //This warning only exists in Release build.
   //I believe it's a false alarm.
   MLValue* p_ml_value = nullptr;
-  Status status = execution_frame_->GetOrCreateNodeOutputMLValue(GetOutputArgIndex(index), &shape, p_ml_value);
+  Status status = execution_frame_->GetOrCreateNodeOutputMLValue(GetOutputArgIndex(index), &shape, p_ml_value, nnz);
   ORT_ENFORCE(status.IsOK(), status.ErrorMessage());
   return p_ml_value;
 }

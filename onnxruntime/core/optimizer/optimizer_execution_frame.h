@@ -77,7 +77,7 @@ class OptimizerExecutionFrame final : public IExecutionFrame {
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(OptimizerExecutionFrame);
 
   AllocatorPtr GetAllocatorImpl(const OrtAllocatorInfo& info) const override;
-  Status CreateNodeOutputMLValueImpl(MLValue& mlvalue, int mlvalue_idx, const TensorShape* shape) override;
+  Status CreateNodeOutputMLValueImpl(MLValue& mlvalue, int mlvalue_idx, const TensorShape* shape, size_t nnz) override;
 
   const Info& info_;
 };
