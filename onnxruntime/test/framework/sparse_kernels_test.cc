@@ -27,12 +27,11 @@ struct SparseFromCOO {
   };
 
   static ONNX_NAMESPACE::OpSchema OpSchema() {
-    ONNX_NAMESPACE::OpSchema schema(SparseFromCOO::OpName(), __FILE__, __LINE__);
+    ONNX_NAMESPACE::OpSchema schema;
     schema.SetDoc(R"DOC(
 This operator constructs a sparse tensor from three tensors that provide a COO
 (coordinate) representation with linearized index values.
 )DOC")
-        .SetDomain(onnxruntime::kMLDomain)
         .Input(
             0,
             "values",
@@ -69,7 +68,6 @@ This operator constructs a sparse tensor from three tensors that provide a COO
             "T",
             {"sparse_tensor(int64)"},
             "Output type");
-    schema.SinceVersion(10);
     return schema;
   }
 
@@ -129,11 +127,10 @@ struct SparseAbs {
   };
 
   static ONNX_NAMESPACE::OpSchema OpSchema() {
-    ONNX_NAMESPACE::OpSchema schema(OpName(), __FILE__, __LINE__);
+    ONNX_NAMESPACE::OpSchema schema;
     schema.SetDoc(R"DOC(
 This operator applies the Abs op element-wise to the input sparse-tensor.
 )DOC")
-        .SetDomain(onnxruntime::kMLDomain)
         .Input(
             0,
             "input",
@@ -150,7 +147,6 @@ This operator applies the Abs op element-wise to the input sparse-tensor.
             "T",
             {"sparse_tensor(int64)"},
             "Input and Output type");
-    schema.SinceVersion(10);
     return schema;
   }
 
@@ -196,6 +192,8 @@ This operator applies the Abs op element-wise to the input sparse-tensor.
   }
 };
 
+// op SparseAbs
+
 // op SparseToCOO
 struct SparseToCOO {
   static const std::string OpName() {
@@ -203,9 +201,8 @@ struct SparseToCOO {
   };
 
   static ONNX_NAMESPACE::OpSchema OpSchema() {
-    ONNX_NAMESPACE::OpSchema schema(OpName(), __FILE__, __LINE__);
+    ONNX_NAMESPACE::OpSchema schema;
     schema.SetDoc("Unpack a sparse tensor.")
-        .SetDomain(onnxruntime::kMLDomain)
         .Input(
             0,
             "sparse_rep",
@@ -226,7 +223,6 @@ struct SparseToCOO {
             "T2",
             {"tensor(int64)"},
             "Type of the values component");
-    schema.SinceVersion(10);
     return schema;
   }
 
@@ -282,7 +278,11 @@ class SparseTensorTests : public testing::Test {
 
   template <typename Op>
   void Add() {
-    schemas.push_back(Op::OpSchema());
+    auto schema = Op::OpSchema();
+    schema.SetName(Op::OpName());
+    schema.SetDomain(onnxruntime::kMLDomain);
+    schema.SinceVersion(10);
+    schemas.push_back(schema);
 
     Action register_kernel = [](CustomRegistry* registry) {
       auto kernel_def_builder = Op::KernelDef();
