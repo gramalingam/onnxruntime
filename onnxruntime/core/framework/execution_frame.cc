@@ -373,10 +373,32 @@ Status ExecutionFrame::AllocateAsPerAllocationPlan(MLValue& mlvalue, int mlvalue
 
   if (ml_type->IsSparseTensorType()) {
     // TODO
-    auto* values = new int64_t[nnz];
-    auto* indices = new int64_t[nnz];
-    auto* sparse = new SparseTensor(values, indices, nnz, *shape);
-    mlvalue.Init(sparse, SparseTensorTypeBase::Type(), ml_type->GetDeleteFunc());
+    auto element_type = ml_type->AsSparseTensorType()->GetElementType();
+    auto alloc = GetAllocator(alloc_info);
+    //size_t size;
+    //if (!IAllocator::CalcMemSizeForArrayWithAlignment<64>(nnz, element_type->Size(), &size)) {
+    //  return Status(ONNXRUNTIME, FAIL, "size overflow");
+    //}
+    int64_t num_dims = shape->NumDimensions();
+    int64_t num_entries = static_cast<int64_t>(nnz);
+    TensorShape valuesShape{num_entries};
+    std::unique_ptr<Tensor> values = std::make_unique<Tensor>(element_type, valuesShape, alloc);
+    auto index_type = DataTypeImpl::GetTensorType<int64_t>();
+    TensorShape indexShape{num_entries, num_dims};
+    std::unique_ptr<Tensor> indices = std::make_unique<Tensor>(index_type, indexShape, alloc);
+    std::unique_ptr<SparseTensor> sparse = std::make_unique<SparseTensor>(values.release(), indices.release(), shape);
+    // create fence if needed
+    if (per_alloc_plan.create_fence_if_async) {
+      ORT_ENFORCE(mlvalue.Fence() == nullptr);
+      FencePtr f = alloc->CreateFence(&session_state_);
+      mlvalue.SetFence(f);
+    }
+    mlvalue.Init(sparse.release(),
+                 DataTypeImpl::GetType<SparseTensor>(),
+                 DataTypeImpl::GetType<SparseTensor>()->GetDeleteFunc());
+
+    //auto* sparse = new SparseTensor(values, indices, nnz, *shape);
+    //mlvalue.Init(sparse, SparseTensorTypeBase::Type(), ml_type->GetDeleteFunc());
     return Status::OK();
   }
   if (!ml_type->IsTensorType()) {

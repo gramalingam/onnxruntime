@@ -5,6 +5,7 @@
 
 #include "core/framework/data_types.h"
 #include "core/framework/tensor_shape.h"
+#include "core/framework/tensor.h"
 
 using namespace onnxruntime::common;
 
@@ -16,7 +17,7 @@ namespace onnxruntime {
 
 class SparseTensor final {
  public:
-  SparseTensor(void* values, int64_t* indices, size_t nnz, const TensorShape& shape);
+  SparseTensor(Tensor* values, Tensor* indices, const TensorShape& shape);
   ~SparseTensor() = default;  // TODO
 
   SparseTensor(const SparseTensor&) = default;
@@ -24,36 +25,35 @@ class SparseTensor final {
   SparseTensor(SparseTensor&&) = default;
   SparseTensor& operator=(SparseTensor&&) = default;
 
-  size_t NumValues() const { return nnz_; }
+  size_t NumValues() const { return values_->Shape().Size(); }
 
-  const int64_t* Values() const {
-    return static_cast<const int64_t*>(p_values_);  // TODO
+  const Tensor& Values() const {
+    return *values_;
   }
 
-  const int64_t* Indices() const {
-    return p_indices_;
+  const Tensor& Indices() const {
+    return *indices_;
   }
 
-  const auto& Shape() const {
+  const TensorShape& Shape() const {
     return shape_;
   }
 
-  int64_t* Values() {
-    return static_cast<int64_t*>(p_values_);  // TODO
+  Tensor& Values() {
+    return *values_;
   }
 
-  int64_t* Indices() {
-    return p_indices_;
+  Tensor& Indices() {
+    return *indices_;
   }
 
-  auto& Shape() {
+  TensorShape& Shape() {
     return shape_;
   }
 
  private:
-  size_t nnz_;
-  void* p_values_;
-  int64_t* p_indices_;
+  Tensor* values_;
+  Tensor* indices_;
   TensorShape shape_;  // The value of a single dimension
 };
 

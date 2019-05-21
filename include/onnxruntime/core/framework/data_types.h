@@ -178,6 +178,11 @@ class DataTypeImpl {
     return nullptr;
   }
 
+  // Returns this if this is of sparse-tensor-type and null otherwise
+  virtual const SparseTensorTypeBase* AsSparseTensorType() const {
+    return nullptr;
+  }
+
   // Return the type meta that we are using in the runtime.
   template <typename T, typename... Types>
   static MLDataType GetType();
@@ -412,6 +417,10 @@ class SparseTensorTypeBase : public DataTypeImpl {
 
   bool IsSparseTensorType() const override {
     return true;
+  }
+
+  const SparseTensorTypeBase* AsSparseTensorType() const override {
+    return this;
   }
 
   bool IsCompatible(const ONNX_NAMESPACE::TypeProto& type_proto) const override;

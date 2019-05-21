@@ -98,12 +98,12 @@ This operator constructs a sparse tensor from three tensors that provide a COO
       ORT_ENFORCE(shape_shape.NumDimensions() == 1, "Shape must be a 1-dimensional tensor.");
 
       TensorShape sh(shape.Data<int64_t>(), shape_shape.Size());
-      SparseTensor* output_sparse_tensor = ctx->Output(0, static_cast<size_t>(size), sh);  // TODO
+      SparseTensor* output = ctx->Output(0, static_cast<size_t>(size), sh);  // TODO
       ORT_ENFORCE(output_sparse_tensor != nullptr);
 
-      memcpy(output_sparse_tensor->Values(), values.Data<int64_t>(), size * sizeof(int64_t));
-      memcpy(output_sparse_tensor->Indices(), indices.Data<int64_t>(), size * sizeof(int64_t));
-      output_sparse_tensor->Shape() = TensorShape(shape.Data<int64_t>(), shape_shape.Size());
+      memcpy(output->Values().MutableData<int64_t>(), values.Data<int64_t>(), size * sizeof(int64_t));
+      memcpy(output->Indices().MutableData<int64_t>(), indices.Data<int64_t>(), size * sizeof(int64_t));
+      output->Shape() = TensorShape(shape.Data<int64_t>(), shape_shape.Size());
 
       return Status::OK();
     }
@@ -161,7 +161,7 @@ This operator applies the Abs op element-wise to the input sparse-tensor.
       ORT_ENFORCE(ctx->InputCount() == 1, "Expecting 1 input");
 
       const SparseTensor* input = ctx->Input<SparseTensor>(0);
-      auto* input_values = input->Values();
+      auto* input_values = input->Values().Data<int64_t>();
       auto size = input->NumValues();
       auto& shape = input->Shape();
 
@@ -169,7 +169,7 @@ This operator applies the Abs op element-wise to the input sparse-tensor.
 
       // compute output values:
 
-      auto* output_values = output->Values();
+      auto* output_values = output->Values().MutableData<int64_t>();
       // output_values.resize(size);
       for (int i = 0; i < size; ++i)
         output_values[i] = std::abs(input_values[i]);
@@ -177,7 +177,7 @@ This operator applies the Abs op element-wise to the input sparse-tensor.
       // copy indices/shape from input to output:
 
       // TODO
-      memcpy(output->Indices(), input->Indices(), size * sizeof(int64_t));
+      memcpy(output->Indices().MutableData<int64_t>(), input->Indices().Data<int64_t>(), size * sizeof(int64_t));
       output->Shape() = shape;
 
       return Status::OK();
@@ -236,7 +236,7 @@ struct SparseToCOO {
     Status Compute(OpKernelContext* ctx) const override {
       ORT_ENFORCE(ctx->InputCount() == 1, "Expecting a single SparseTensorSample input");
       const SparseTensor* sparse_input = ctx->Input<SparseTensor>(0);
-      const auto* values = sparse_input->Values();
+      const auto* values = sparse_input->Values().Data<int64_t>();
       auto size = static_cast<int64_t>(sparse_input->NumValues());
 
       TensorShape output_shape{size};

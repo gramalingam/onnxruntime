@@ -8,9 +8,8 @@ using namespace onnxruntime::common;
 
 namespace onnxruntime {
 
-SparseTensor::SparseTensor(void* values, int64_t* indices, size_t nnz, const TensorShape& shape) : p_values_(values),
-                                                                                                   p_indices_(indices),
-                                                                                                   shape_(shape),
-                                                                                                   nnz_(nnz) {}
+SparseTensor::SparseTensor(Tensor* values, Tensor* indices, const TensorShape& shape) : values_(values),
+                                                                                        indices_(indices),
+                                                                                        shape_(shape) {}
 
 }  // namespace onnxruntime
