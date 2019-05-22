@@ -99,7 +99,7 @@ This operator constructs a sparse tensor from three tensors that provide a COO
 
       TensorShape sh(shape.Data<int64_t>(), shape_shape.Size());
       SparseTensor* output = ctx->Output(0, static_cast<size_t>(size), sh);  // TODO
-      ORT_ENFORCE(output_sparse_tensor != nullptr);
+      ORT_ENFORCE(output != nullptr);
 
       memcpy(output->Values().MutableData<int64_t>(), values.Data<int64_t>(), size * sizeof(int64_t));
       memcpy(output->Indices().MutableData<int64_t>(), indices.Data<int64_t>(), size * sizeof(int64_t));

@@ -20,10 +20,10 @@ class SparseTensor final {
   SparseTensor(Tensor* values, Tensor* indices, const TensorShape& shape);
   ~SparseTensor() = default;  // TODO
 
-  SparseTensor(const SparseTensor&) = default;
-  SparseTensor& operator=(const SparseTensor&) = default;
-  SparseTensor(SparseTensor&&) = default;
-  SparseTensor& operator=(SparseTensor&&) = default;
+  SparseTensor(const SparseTensor&) = delete;
+  SparseTensor& operator=(const SparseTensor&) = delete;
+  SparseTensor(SparseTensor&&) = delete;
+  SparseTensor& operator=(SparseTensor&&) = delete;
 
   size_t NumValues() const { return values_->Shape().Size(); }
 

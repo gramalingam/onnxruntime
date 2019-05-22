@@ -386,7 +386,7 @@ Status ExecutionFrame::AllocateAsPerAllocationPlan(MLValue& mlvalue, int mlvalue
     auto index_type = DataTypeImpl::GetTensorType<int64_t>();
     TensorShape indexShape{num_entries, num_dims};
     std::unique_ptr<Tensor> indices = std::make_unique<Tensor>(index_type, indexShape, alloc);
-    std::unique_ptr<SparseTensor> sparse = std::make_unique<SparseTensor>(values.release(), indices.release(), shape);
+    std::unique_ptr<SparseTensor> sparse = std::make_unique<SparseTensor>(values.release(), indices.release(), *shape);
     // create fence if needed
     if (per_alloc_plan.create_fence_if_async) {
       ORT_ENFORCE(mlvalue.Fence() == nullptr);
