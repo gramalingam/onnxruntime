@@ -12,27 +12,41 @@ using namespace onnxruntime::common;
 namespace onnxruntime {
 
 /**
- * @brief This class implements SparseTensor.
+ * @brief This class implements SparseTensor. 
+ * We represent a SparseTensor as a triple <values, indices, shape>. "values" and "indices" themselves
+ * are implemented as Tensors. 
+ * We follow the Tensor design for memory ownership/management: a sparse-tensor does not own the "value"
+ * or "indices" tensors.
  */
 
 class SparseTensor final {
  public:
-  SparseTensor(Tensor* values, Tensor* indices, const TensorShape& shape);
-  ~SparseTensor() = default;  // TODO
+  SparseTensor(MLDataType elt_type,
+               const TensorShape& shape,
+               size_t nnz,
+               void* values_data,
+               void* indices_data,
+               const OrtAllocatorInfo& allocator_info);
 
-  SparseTensor(const SparseTensor&) = delete;
-  SparseTensor& operator=(const SparseTensor&) = delete;
-  SparseTensor(SparseTensor&&) = delete;
-  SparseTensor& operator=(SparseTensor&&) = delete;
+  SparseTensor(MLDataType elt_type,
+               const TensorShape& shape,
+               size_t nnz,
+               std::shared_ptr<IAllocator> allocator);
 
-  size_t NumValues() const { return values_->Shape().Size(); }
+  ~SparseTensor() = default;
+
+  // For now, disallow all copy, assignment, and move.
+  ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(SparseTensor);
+
+  // Returns the number of entries in the values tensor (aka "NNZ" or "number of nonzero values")
+  size_t NumValues() const { return values_.Shape().Size(); }
 
   const Tensor& Values() const {
-    return *values_;
+    return values_;
   }
 
   const Tensor& Indices() const {
-    return *indices_;
+    return indices_;
   }
 
   const TensorShape& Shape() const {
@@ -40,11 +54,11 @@ class SparseTensor final {
   }
 
   Tensor& Values() {
-    return *values_;
+    return values_;
   }
 
   Tensor& Indices() {
-    return *indices_;
+    return indices_;
   }
 
   TensorShape& Shape() {
@@ -52,9 +66,9 @@ class SparseTensor final {
   }
 
  private:
-  Tensor* values_;
-  Tensor* indices_;
-  TensorShape shape_;  // The value of a single dimension
+  Tensor values_;
+  Tensor indices_;
+  TensorShape shape_;  // The shape of corresponding dense-tensor.
 };
 
 }  // namespace onnxruntime

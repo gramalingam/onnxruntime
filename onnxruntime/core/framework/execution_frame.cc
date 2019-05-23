@@ -349,29 +349,27 @@ static Status AllocateTraditionalMLValue(MLValue& mlvalue, const DataTypeImpl& t
   return Status::OK();
 }
 
-static Status AllocateSparseTensor(MLValue& mlvalue, const DataTypeImpl& ml_type, AllocatorPtr alloc,
+static Status AllocateSparseTensor(MLValue& mlvalue, const DataTypeImpl& ml_type, AllocatorPtr allocator,
                                    const TensorShape& shape, size_t nnz, bool create_fence,
                                    const SessionState& session_state) {
   // TODO
   auto element_type = ml_type.AsSparseTensorType()->GetElementType();
-  // auto alloc = GetAllocator(alloc_info);
-  int64_t num_dims = shape.NumDimensions();
-  int64_t num_entries = static_cast<int64_t>(nnz);
-  TensorShape valuesShape{num_entries};
-  std::unique_ptr<Tensor> values = std::make_unique<Tensor>(element_type, valuesShape, alloc);
-  auto index_type = DataTypeImpl::GetType<int64_t>();
-  TensorShape indexShape{num_entries, num_dims};
-  std::unique_ptr<Tensor> indices = std::make_unique<Tensor>(index_type, indexShape, alloc);
-  std::unique_ptr<SparseTensor> sparse = std::make_unique<SparseTensor>(values.release(), indices.release(), shape);
+  // int64_t num_dims = shape.NumDimensions();
+  // auto index_type = DataTypeImpl::GetType<int64_t>();
+  // void* values_data = allocator->AllocArray(nnz, element_type->Size());
+  // void* indices_data = allocator->AllocArray(nnz * num_dims, index_type->Size());
+  // auto sparse = std::make_unique<SparseTensor>(element_type, shape, nnz, values_data, indices_data, allocator->Info());
+  auto sparse = std::make_unique<SparseTensor>(element_type, shape, nnz, allocator);
+  auto deleter = DataTypeImpl::GetType<SparseTensor>()->GetDeleteFunc();
+  mlvalue.Init(sparse.release(), DataTypeImpl::GetType<SparseTensor>(), deleter);
+
   // create fence if needed
   if (create_fence) {
     ORT_ENFORCE(mlvalue.Fence() == nullptr);
-    FencePtr f = alloc->CreateFence(&session_state);
+    FencePtr f = allocator->CreateFence(&session_state);
     mlvalue.SetFence(f);
   }
-  mlvalue.Init(sparse.release(),
-               DataTypeImpl::GetType<SparseTensor>(),
-               DataTypeImpl::GetType<SparseTensor>()->GetDeleteFunc());
+
   return Status::OK();
 }
 
@@ -399,29 +397,6 @@ Status ExecutionFrame::AllocateAsPerAllocationPlan(MLValue& mlvalue, int mlvalue
   if (ml_type->IsSparseTensorType()) {
     return AllocateSparseTensor(mlvalue, *ml_type, GetAllocator(alloc_info),
                                 *shape, nnz, per_alloc_plan.create_fence_if_async, session_state_);
-    /*
-    // TODO
-    auto element_type = ml_type->AsSparseTensorType()->GetElementType();
-    // auto alloc = GetAllocator(alloc_info);
-    int64_t num_dims = shape->NumDimensions();
-    int64_t num_entries = static_cast<int64_t>(nnz);
-    TensorShape valuesShape{num_entries};
-    std::unique_ptr<Tensor> values = std::make_unique<Tensor>(element_type, valuesShape, alloc);
-    auto index_type = DataTypeImpl::GetType<int64_t>();
-    TensorShape indexShape{num_entries, num_dims};
-    std::unique_ptr<Tensor> indices = std::make_unique<Tensor>(index_type, indexShape, alloc);
-    std::unique_ptr<SparseTensor> sparse = std::make_unique<SparseTensor>(values.release(), indices.release(), *shape);
-    // create fence if needed
-    if (per_alloc_plan.create_fence_if_async) {
-      ORT_ENFORCE(mlvalue.Fence() == nullptr);
-      FencePtr f = alloc->CreateFence(&session_state_);
-      mlvalue.SetFence(f);
-    }
-    mlvalue.Init(sparse.release(),
-                 DataTypeImpl::GetType<SparseTensor>(),
-                 DataTypeImpl::GetType<SparseTensor>()->GetDeleteFunc());
-    return Status::OK();
-	*/
   }
   if (!ml_type->IsTensorType()) {
     return AllocateTraditionalMLValue(mlvalue, *ml_type);
