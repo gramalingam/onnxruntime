@@ -21,33 +21,30 @@ namespace test {
 
 // op SparseFromCOO
 struct SparseFromCOO {
-  static std::string OpName() {
-    static std::string name{"SparseFromCOO"};
-    return name;
-  };
+  static std::string OpName() { return "SparseFromCOO"; };
 
   static ONNX_NAMESPACE::OpSchema OpSchema() {
     ONNX_NAMESPACE::OpSchema schema;
     schema.SetDoc(R"DOC(
 This operator constructs a sparse tensor from three tensors that provide a COO
-(coordinate) representation with linearized index values.
+(coordinate) representation.
 )DOC")
         .Input(
             0,
             "values",
-            "Single dimensional Tensor that holds all non-zero values",
+            "A 1-dimensional tensor of shape [NNZ] that holds all non-zero values",
             "T1",
             OpSchema::Single)
         .Input(
             1,
             "indices",
-            "Single dimensional tensor that holds linearized indices of non-zero values",
+            "A 2-dimensional tensor of shape [NNZ,d] that holds the (d) indices of non-zero values",
             "T2",
             OpSchema::Single)
         .Input(
             2,
             "shape",
-            "Single dimensional tensor that holds the shape of the underlying dense tensor",
+            "A 1-dimensional tensor of shape [d] that holds the shape of the underlying dense tensor",
             "T2",
             OpSchema::Single)
         .Output(
@@ -83,27 +80,32 @@ This operator constructs a sparse tensor from three tensors that provide a COO
 
       const Tensor& values = *ctx->Input<Tensor>(0);
       const Tensor& indices = *ctx->Input<Tensor>(1);
-      const Tensor& shape = *ctx->Input<Tensor>(2);
+      const Tensor& shape_tensor = *ctx->Input<Tensor>(2);
 
       // values and indices should be 1-dimensional tensors
       const TensorShape& val_shape = values.Shape();
       const TensorShape& ind_shape = indices.Shape();
-      const TensorShape& shape_shape = shape.Shape();
+      const TensorShape& shape_shape = shape_tensor.Shape();
 
-      auto size = val_shape.Size();
+      auto nnz = val_shape.Size();
+      auto numdims = shape_shape.Size();
 
       ORT_ENFORCE(val_shape.NumDimensions() == 1, "Values must be a 1-dimensional tensor.");
-      ORT_ENFORCE(ind_shape.NumDimensions() == 1, "Indices must be a 1-dimensional tensor with linearized index values.");
-      ORT_ENFORCE(ind_shape.Size() == size, "Values and Indices must have same size.");
+
+      ORT_ENFORCE(ind_shape.NumDimensions() == 2, "Indices must be a 2-dimensional tensor.");
+      ORT_ENFORCE(ind_shape[0] == nnz, "Indices must have [NNZ,d] shape.");
+      ORT_ENFORCE(ind_shape[1] == numdims, "Indices must have [NNZ,d] shape.");
+
       ORT_ENFORCE(shape_shape.NumDimensions() == 1, "Shape must be a 1-dimensional tensor.");
 
-      TensorShape sh(shape.Data<int64_t>(), shape_shape.Size());
-      SparseTensor* output = ctx->Output(0, static_cast<size_t>(size), sh);  // TODO
+      TensorShape shape(shape_tensor.Data<int64_t>(), shape_shape.Size());
+
+      SparseTensor* output = ctx->Output(0, static_cast<size_t>(nnz), shape);
       ORT_ENFORCE(output != nullptr);
 
-      memcpy(output->Values().MutableData<int64_t>(), values.Data<int64_t>(), size * sizeof(int64_t));
-      memcpy(output->Indices().MutableData<int64_t>(), indices.Data<int64_t>(), size * sizeof(int64_t));
-      output->Shape() = TensorShape(shape.Data<int64_t>(), shape_shape.Size());
+      memcpy(output->Values().MutableData<int64_t>(), values.Data<int64_t>(), nnz * sizeof(int64_t));
+      memcpy(output->Indices().MutableData<int64_t>(), indices.Data<int64_t>(), nnz * numdims * sizeof(int64_t));
+      // output->Shape() = TensorShape(shape_tensor.Data<int64_t>(), shape_shape.Size());
 
       return Status::OK();
     }
@@ -122,10 +124,9 @@ This operator constructs a sparse tensor from three tensors that provide a COO
 
 // op SparseAbs
 struct SparseAbs {
-  static const std::string OpName() {
-    return "SparseAbs";
-  };
+  static const std::string OpName() { return "SparseAbs"; };
 
+  // The ONNX schema for SparseAbs:
   static ONNX_NAMESPACE::OpSchema OpSchema() {
     ONNX_NAMESPACE::OpSchema schema;
     schema.SetDoc(R"DOC(
@@ -134,13 +135,13 @@ This operator applies the Abs op element-wise to the input sparse-tensor.
         .Input(
             0,
             "input",
-            "Single dimensional Tensor that holds all non-zero values",
+            "Input sparse tensor",
             "T",
             OpSchema::Single)
         .Output(
             0,
             "output",
-            "A sparse representation of the result",
+            "Output sparse tensor",
             "T",
             OpSchema::Single)
         .TypeConstraint(
@@ -150,9 +151,7 @@ This operator applies the Abs op element-wise to the input sparse-tensor.
     return schema;
   }
 
-  /**
- *  @brief An implementation of the SparseAbs op.
- */
+  // A kernel implementation of SparseAbs:
   class OpKernelImpl final : public OpKernel {
    public:
     OpKernelImpl(const OpKernelInfo& info) : OpKernel{info} {}
@@ -162,28 +161,31 @@ This operator applies the Abs op element-wise to the input sparse-tensor.
 
       const SparseTensor* input = ctx->Input<SparseTensor>(0);
       auto* input_values = input->Values().Data<int64_t>();
-      auto size = input->NumValues();
+      auto nnz = input->NumValues();
       auto& shape = input->Shape();
 
-      SparseTensor* output = ctx->Output(0, static_cast<size_t>(size), shape);
+      // Allocate/get output-tensor:
+      SparseTensor* output = ctx->Output(0, nnz, shape);
 
       // compute output values:
-
       auto* output_values = output->Values().MutableData<int64_t>();
-      // output_values.resize(size);
-      for (int i = 0; i < size; ++i)
+      for (int i = 0; i < nnz; ++i)
         output_values[i] = std::abs(input_values[i]);
 
-      // copy indices/shape from input to output:
+      // Currently, there is no way to share the indices/shape between two sparse-tensors.
+      // So, we copy indices/shape from input to output.
+      // TODO: Extend allocation-planner to enable such sharing.
+      const auto& input_indices = input->Indices();
+      auto num_indices = input_indices.Shape().Size();
+      memcpy(output->Indices().MutableData<int64_t>(), input_indices.Data<int64_t>(), num_indices * sizeof(int64_t));
 
-      // TODO
-      memcpy(output->Indices().MutableData<int64_t>(), input->Indices().Data<int64_t>(), size * sizeof(int64_t));
       output->Shape() = shape;
 
       return Status::OK();
     }
   };
 
+  // A KernelDefBuilder for SparseAbs:
   static KernelDefBuilder KernelDef() {
     KernelDefBuilder def;
     def.SetName(OpName())
@@ -192,21 +194,17 @@ This operator applies the Abs op element-wise to the input sparse-tensor.
   }
 };
 
-// op SparseAbs
-
-// op SparseToCOO
-struct SparseToCOO {
-  static const std::string OpName() {
-    return "SparseToCOO";
-  };
+// op SparseToValues
+struct SparseToValues {
+  static const std::string OpName() { return "SparseToValues"; };
 
   static ONNX_NAMESPACE::OpSchema OpSchema() {
     ONNX_NAMESPACE::OpSchema schema;
-    schema.SetDoc("Unpack a sparse tensor.")
+    schema.SetDoc("Return the non-zero values in a sparse tensor (as a dense tensor).")
         .Input(
             0,
             "sparse_rep",
-            "A sparse tensor to be unpacked into COO format",
+            "Input sparse tensor.",
             "T1",
             OpSchema::Single)
         .Output(
@@ -226,9 +224,7 @@ struct SparseToCOO {
     return schema;
   }
 
-  /**
- *  @brief An implementation of the SparseToCOO op.
- */
+  //  A kernel implementation of SparseToValues
   class OpKernelImpl final : public OpKernel {
    public:
     OpKernelImpl(const OpKernelInfo& info) : OpKernel{info} {}
@@ -237,23 +233,21 @@ struct SparseToCOO {
       ORT_ENFORCE(ctx->InputCount() == 1, "Expecting a single SparseTensorSample input");
       const SparseTensor* sparse_input = ctx->Input<SparseTensor>(0);
       const auto* values = sparse_input->Values().Data<int64_t>();
-      auto size = static_cast<int64_t>(sparse_input->NumValues());
+      auto nnz = static_cast<int64_t>(sparse_input->NumValues());
 
-      TensorShape output_shape{size};
+      TensorShape output_shape{nnz};
 
       Tensor* output = ctx->Output(0, output_shape);
-      int64_t* ptr = output->MutableData<int64_t>();
-      ORT_ENFORCE(ptr != nullptr);
+      int64_t* output_data = output->MutableData<int64_t>();
+      ORT_ENFORCE(output_data != nullptr);
 
-      memcpy(ptr, values, size * sizeof(int64_t));
-      //for (auto i = size - 1; i >= 0; --i)
-      //  *(ptr + i) = values[i];
-      // *shape_data = sparse_input->Size();
+      memcpy(output_data, values, nnz * sizeof(int64_t));
 
       return Status::OK();
     }
   };
 
+  // A KernelDefBuilder for SparseToValues
   static KernelDefBuilder KernelDef() {
     KernelDefBuilder def;
     def.SetName(OpName())
@@ -334,7 +328,6 @@ class SparseTensorTests : public testing::Test {
   }
 
   MLValue Constant(const std::vector<int64_t>& elts, const std::vector<int64_t>& shape) {
-    // ml_values.push_back(MLValue());
     MLValue mlvalue;
     CreateMLValue<int64_t>(TestCPUExecutionProvider()->GetAllocator(0, OrtMemTypeDefault), shape, elts, &mlvalue);
     return mlvalue;
@@ -376,11 +369,11 @@ class SparseTensorTests : public testing::Test {
   std::vector<TypeProto> types;
 };
 
-TEST_F(SparseTensorTests, RunModel) {
+TEST_F(SparseTensorTests, Test1) {
   // Register ops
   Add<SparseFromCOO>();
   Add<SparseAbs>();
-  Add<SparseToCOO>();
+  Add<SparseToValues>();
   RegisterOps();
 
   // Build model/graph
@@ -395,7 +388,7 @@ TEST_F(SparseTensorTests, RunModel) {
   Node(SparseAbs::OpName(), {sparse1}, {sparse2});
 
   auto NZV2 = Dense("output");
-  Node(SparseToCOO::OpName(), {sparse2}, {NZV2});
+  Node(SparseToValues::OpName(), {sparse2}, {NZV2});
 
   EXPECT_TRUE(graph.Resolve().IsOK());
 
@@ -407,7 +400,7 @@ TEST_F(SparseTensorTests, RunModel) {
 
   // Inputs for run:
   MLValue NZV_values = Constant({-99, 2});
-  MLValue NZI_values = Constant({1, 4});
+  MLValue NZI_values = Constant({1, 4}, {2, 1});
   MLValue shape_value = Constant({5});
 
   NameMLValMap feeds{
