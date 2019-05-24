@@ -73,7 +73,7 @@ struct ort_endian {
 //BFloat16
 struct BFloat16 {
   uint16_t val{0};
-  explicit BFloat16() {}
+  explicit BFloat16() = default;
   explicit BFloat16(uint16_t v) : val(v) {}
   explicit BFloat16(float v) {
     uint16_t* dst = reinterpret_cast<uint16_t*>(&v);
@@ -153,10 +153,6 @@ class DataTypeImpl {
     ORT_NOT_IMPLEMENTED(__FUNCTION__, " is not implemented");
   }
 
-  virtual void Init(MLValue&) const {
-    ORT_NOT_IMPLEMENTED(__FUNCTION__, " is not implemented");
-  }
-
   /**
    * \brief Retrieves an instance of TypeProto for
    *        a given MLDataType
@@ -198,7 +194,7 @@ class DataTypeImpl {
   /**
    * Convert an ONNX TypeProto to onnxruntime DataTypeImpl.
    * However, this conversion is lossy. Don't try to use 'this->GetTypeProto()' converting it back
-   * Don't pass the returned value to MLValue::MLValue(...) function
+   * Don't pass the returned value to OrtValue::OrtValue(...) function
    * \param proto
    */
   static MLDataType TypeFromProto(const ONNX_NAMESPACE::TypeProto& proto);
@@ -430,8 +426,6 @@ class SparseTensorTypeBase : public DataTypeImpl {
   DeleteFunc GetDeleteFunc() const override;
   // CreateFunc GetCreateFunc() const override;
 
-  void Init(MLValue& mlvalue) const override;
-
   const ONNX_NAMESPACE::TypeProto* GetTypeProto() const override;
 
   virtual MLDataType GetElementType() const {
@@ -483,8 +477,6 @@ class NonTensorTypeBase : public DataTypeImpl {
   DeleteFunc GetDeleteFunc() const override = 0;
 
   CreateFunc GetCreateFunc() const override = 0;
-
-  void Init(MLValue& mlvalue) const override;
 
   const ONNX_NAMESPACE::TypeProto* GetTypeProto() const override;
 

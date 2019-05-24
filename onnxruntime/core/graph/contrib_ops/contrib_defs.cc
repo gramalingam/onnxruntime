@@ -5,7 +5,6 @@
 #include "core/graph/contrib_ops/attn_lstm_schema_defs.h"
 #include "core/graph/contrib_ops/contrib_defs.h"
 #include "core/graph/contrib_ops/range_schema_defs.h"
-#include "core/graph/contrib_ops/reverse_sequence_schema_defs.h"
 #include "core/graph/op.h"
 #include "onnx/defs/schema.h"
 #include "onnx/defs/shape_inference.h"
@@ -96,9 +95,9 @@ If scale is not provided, crop the borders as provided.)DOC";
       .Output(0, "output", "Result, has same type as input, with H and W dimensions reduced.", "T")
       .TypeConstraint("T", {"tensor(float16)", "tensor(float)", "tensor(double)"}, "Constrain input and output types to float tensors.");
 
-  static const char* ThresholdedRelu_ver1_doc = R"DOC( 
-ThresholdedRelu takes one input data (Tensor<T>) and produces one output data 
-(Tensor<T>) where the rectified linear function, y = x for x > alpha, y = 0 otherwise, 
+  static const char* ThresholdedRelu_ver1_doc = R"DOC(
+ThresholdedRelu takes one input data (Tensor<T>) and produces one output data
+(Tensor<T>) where the rectified linear function, y = x for x > alpha, y = 0 otherwise,
 is applied to the tensor elementwise. )DOC";
 
   ONNX_CONTRIB_OPERATOR_SCHEMA(ThresholdedRelu)
@@ -729,14 +728,14 @@ activation and leaky_relu_alpha.)DOC")
 
   ONNX_CONTRIB_OPERATOR_SCHEMA_ELSEWHERE(AttnLSTM, RegisterAttnLSTMContribOpSchema);
   ONNX_CONTRIB_OPERATOR_SCHEMA_ELSEWHERE(Range, RegisterRangeOpSchema);
-  ONNX_CONTRIB_OPERATOR_SCHEMA_ELSEWHERE(ReverseSequence, RegisterReverseSequenceOpSchema);
 
   static const char* Tokenizer_ver1_doc = R"DOC(
   Tokenizer divides each string in X into a vector of strings along the last axis. Allowed input shapes are [C] and [N, C].
   If the maximum number of tokens found per input string is D, the output shape would be [N, C, D] when input shape is [N, C].
   Similarly, if input shape is [C] then the output should be [C, D]. Tokenizer has two different operation modes.
   The first mode is selected when "tokenexp" is not set and "separators" is set. If "tokenexp" is set and "separators" is not set,
-  the second mode will be used. The first mode breaks each input string into tokens by removing separators.
+  the second mode will be used. The first mode breaks each input string into tokens by matching and removing separators.
+  "separators" is a list of strings which are regular expressions. "tokenexp" is a single regular expression.
 
   Let's assume "separators" is [" "] and consider an example.
   If input is
@@ -750,6 +749,9 @@ activation and leaky_relu_alpha.)DOC")
 
  whose shape is [2, 5] because you can find at most 5 tokens per input string.
  Note that the input at most can have two axes, so 3-D and higher dimension are not supported.
+
+ If "separators" contains a single empty string, the Tokenizer will enter into character tokenezation mode. This means all strings
+ will be broken part into individual characters.
 
  For each input string, the second mode searches matches of "tokenexp" and each match will be a token in Y.
  The matching of "tokenexp" is conducted greedily (i.e., a match should be as long as possible).
@@ -798,14 +800,11 @@ of [N, 0] then [N, 0].
           OPTIONAL)
       .Attr(
           "separators",
-          "an optional list of strings (type: AttributeProto::STRINGS), each single string in this attribute is a separator."
+          "an optional list of strings attribute that contains a list of separators - regular expressions to match separators"
           " Two consecutive segments in X connected by a separator would be divided into two tokens."
           " For example, if the input is \"Hello World!\" and this attribute contains only one space character,"
           " the corresponding output would be [\"Hello\", \"World!\"]. To achieve character-level tokenization,"
-          " one should set the separators to [\"\"], which contains only one empty string."
-          " If 'separators' is a L-element array, there will be L rounds of tokenization using one stop word."
-          " More specifically, in the first round, the first element in 'separators' is used to tokenize each string in the input."
-          " Then, the second element in 'separators' will be used to tokenize the resulted strings produced at the first round.",
+          " one should set the 'separators' to [\"\"], which contains an empty string.",
           AttributeProto::STRINGS,
           OPTIONAL)
       .Attr(
@@ -874,64 +873,6 @@ with the exception that numpy default keepdims to False instead of True.)DOC")
           "keepdims",
           "Keep the reduced dimension or not, default 1 mean keep reduced dimension.",
           AttributeProto::INT);
-
-  ONNX_CONTRIB_OPERATOR_SCHEMA(NonMaxSuppression)
-      .SetDomain(kMSDomain)
-      .SinceVersion(1)
-      .SetDoc(R"DOC(
-Filter out boxes that have high intersection-over-union (IOU) overlap with previously selected boxes.
-Bounding boxes with score less than score_threshold are removed. Bounding box format is indicated by attribute center_point_box.
-Note that this algorithm is agnostic to where the origin is in the coordinate system and more generally is invariant to
-orthogonal transformations and translations of the coordinate system; thus translating or reflections of the coordinate system
-result in the same boxes being selected by the algorithm.
-The selected_indices output is a set of integers indexing into the input collection of bounding boxes representing the selected boxes.
-The bounding box coordinates corresponding to the selected indices can then be obtained using the Gather or GatherND operation.
-Note: The boxes doesn't has class dimension which means it alwasy has scores calculated for different classes on same box.)DOC")
-      .Input(
-          0,
-          "boxes",
-          "An input tensor with shape [num_batches, spatial_dimension, 4]. The single box data format is indicated by center_point_box.",
-          "tensor(float)")
-      .Input(
-          1,
-          "scores",
-          "An input tensor with shape [num_batches, num_classes, spatial_dimension]",
-          "tensor(float)")
-      .Input(
-          2,
-          "max_output_boxes_per_class",
-          "Integer representing the maximum number of boxes to be selected per batch per class. It is a scalar.",
-          "tensor(int32)",
-          OpSchema::Optional)
-      .Input(
-          3,
-          "iou_threshold",
-          "Float representing the threshold for deciding whether boxes overlap too much with respect to IOU. It is scalar. Value range [0, 1].",
-          "tensor(float)",
-          OpSchema::Optional)
-      .Input(
-          4,
-          "score_threshold",
-          "Float representing the threshold for deciding when to remove boxes based on score. It is a scalar",
-          "tensor(float)",
-          OpSchema::Optional)
-      .Output(
-          0,
-          "selected_indices",
-          "selected indices from the boxes tensor. [num_selected_indices, 3], the selected indices format is [batch_index, class_index, box_index].",
-          "tensor(int32)")
-      .Attr(
-          "center_point_box",
-          "Integer indicate the format of the box data. The default is 0."
-          "0 - the box data is supplied as [y1, x1, y2, x2] where (y1, x1) and (y2, x2) are the coordinates of any diagonal pair of box corners"
-          "and the coordinates can be provided as normalized (i.e., lying in the interval [0, 1]) or absolute. Mostly used for TF models."
-          "1 - the box data is supplied as [x_center, y_center, width, height]. Mostly used for Pytoch models.",
-          AttributeProto::INT,
-          static_cast<int64_t>(0))
-      .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
-        auto selected_indices_type = ctx.getOutputType(0)->mutable_tensor_type();
-        selected_indices_type->set_elem_type(::ONNX_NAMESPACE::TensorProto_DataType::TensorProto_DataType_INT32);
-      });
 
   ONNX_CONTRIB_OPERATOR_SCHEMA(MurmurHash3)
       .SetDomain(kMSDomain)
@@ -1072,60 +1013,180 @@ Example 4:
           "Constrain to tensor(float).")
       .SetDoc(R"DOC(The WordConvEmbedding takes in a batch of sequence words and embed each word to a vector.)DOC");
 
-  ONNX_CONTRIB_OPERATOR_SCHEMA(ROIAlign)
+  ONNX_CONTRIB_OPERATOR_SCHEMA(Pad)
       .SetDomain(kMSDomain)
       .SinceVersion(1)
       .Attr(
-          "spatial_scale",
-          "Multiplicative spatial scale factor to translate ROI coordinates "
-          "from their input spatial scale to the scale used when pooling, "
-          "i.e., spatial scale of the input feature map X relative to the "
-          "input image. E.g.; default is 1.0f. ",
-          AttributeProto::FLOAT,
-          1.f)
-      .Attr(
-          "pooled_h",
-          "default 1; Pooled output Y's height.",
-          AttributeProto::INT,
-          static_cast<int64_t>(1))
-      .Attr(
-          "pooled_w",
-          "default 1; Pooled output Y's width.",
-          AttributeProto::INT,
-          static_cast<int64_t>(1))
-      .Attr(
-          "sampling_ratio",
-          "Number of sampling points in the interpolation grid used to compute "
-          "the output value of each pooled output bin. If > 0, then exactly "
-          "sampling_ratio x sampling_ratio grid points are used. If == 0, then "
-          "an adaptive number of grid points are used (computed as "
-          "ceil(roi_width / pooled_w), and likewise for height). Default is 0.",
-          AttributeProto::INT,
-          static_cast<int64_t>(0))
-      .Attr(
           "mode",
-          "The pooling method. Two modes are supported: 'avg' and 'max'. "
-          "Default is 'avg'.",
+          "Three modes: `constant`(default) - pads with a given constant value, "
+          "`reflect` - pads with the reflection of the vector mirrored on the first and last values of the vector along each axis, "
+          "`edge` - pads with the edge values of array",
           AttributeProto::STRING,
-          std::string("avg"))
-      .Input(0, "X", "Input data tensor from the previous operator; 4-D feature map of shape (N x C x H x W), where N is the batch size, C is the number of channels, and H and W are the height and the width of the data.", "T")
-      .Input(1, "rois", "RoIs (Regions of Interest2) to pool over; rois is 2-D input of shape (num_rois, 5) given as [[batch_id, x1, y1, x2, y2], ...]. The RoIs' coordinates are in the coordinate system of the input image.", "T")
-      .Output(0, "Y", "RoI pooled output, 4-D tesnor of shape (num_rois, C, pooled_h, pooled_w). The r-th batch element Y[r-1] is a pooled feature map corresponding to the r-th RoI X[r-1].", "T")
+          std::string("constant"))
+      .Input(0, "data", "Input tensor.", "T")
+      .Input(
+          1,
+          "pads",
+          "Tensor of integers indicating the number of padding elements to add or remove (if negative) "
+          "at the beginning and end of each axis. For 2D input tensor, it is the number of pixels. "
+          "`pads` should be a 1D tensor of shape [2 * input_rank] or a 2D tensor of shape [1, 2 * input_rank]. "
+          "`pads` format (1D example) should be as follow [x1_begin, x2_begin,...,x1_end, x2_end,...], "
+          "where xi_begin is the number of pixels added at the beginning of axis `i` and "
+          "xi_end, the number of pixels added at the end of axis `i`.",
+          "tensor(int64)")
+      .Input(
+          2,
+          "value",
+          "(Optional) A scalar or rank 1 tensor containing a single value to be filled if the mode chosen is `constant` (by default it is 0.0).",
+          "T",
+          OpSchema::Optional)
+      .Output(0, "output", "Tensor after padding.", "T")
       .TypeConstraint(
           "T",
           {"tensor(float16)", "tensor(float)", "tensor(double)"},
-          "Constrain to float, float16 and double tensors.")
-      .SetDoc(R"DOC(Region of Interest (RoI) align operation described in the
-  [Mask R-CNN paper](https://arxiv.org/abs/1703.06870).
-  RoIAlign consumes an input tensor X and region of interests (rois)
-  to apply pooling across each RoI; it produces a 4-D tensor of shape
-  (num_rois, C, pooled_h, pooled_w).
+          "Constrain input and output types to float tensors.")
+      .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
+        // Type inference
+        propagateElemTypeFromInputToOutput(ctx, 0, 0);
+        // Shape inference needs the input data shape
+        if (!hasNInputShapes(ctx, 1)) {
+          return;
+        }
+        const auto& input_shape = ctx.getInputType(0)->tensor_type().shape();
+        const auto input_rank = input_shape.dim_size();
 
-  RoIAlign is proposed to avoid the misalignment by removing
-  quantizations while converting from original image into feature
-  map and from feature map into RoI feature; in each ROI bin,
-  the value of the sampled locations are computed directly
-  through bilinear interpolation.)DOC");
+        // Infer output shape if 'pads' tensor is available
+        const auto* pads_initializer = ctx.getInputData(1);
+        if (nullptr != pads_initializer) {
+          const auto& pads_shape = ctx.getInputType(1)->tensor_type().shape();
+          if ((pads_initializer->dims_size() != 1 &&
+               pads_initializer->dims_size() != 2) ||
+              (pads_initializer->dims_size() == 2 &&
+               pads_shape.dim((int)0).dim_value() != 1) ||
+              pads_initializer->data_type() != ONNX_NAMESPACE::TensorProto::INT64)
+            fail_shape_inference(
+                "'pads' input must be a 1D (shape: [input_rank]) "
+                "or 2D tensor (shape: [1, input_rank]) of type int64");
+
+          // make a copy of the returned const vector - may have to resize
+          // this in next step
+          std::vector<int64_t> pads_data;
+          if (pads_initializer->has_raw_data())
+            return;
+          else
+            pads_data.insert(
+                pads_data.end(),
+                pads_initializer->int64_data().begin(),
+                pads_initializer->int64_data().end());
+
+          // fill with zeros if needed to reach appropriate size
+          if (pads_data.size() != static_cast<size_t>(2 * input_rank))
+            pads_data.resize(2 * input_rank, 0);
+
+          const auto& output_shape =
+              ctx.getOutputType(0)->mutable_tensor_type()->mutable_shape();
+          for (size_t i = 0; (int64_t)i < input_rank; ++i) {
+            const auto& input_dim = input_shape.dim((int)i);
+            auto* output_dim = output_shape->add_dim();
+            if (input_dim.has_dim_value()) {
+              output_dim->set_dim_value(
+                  input_dim.dim_value() + pads_data[i] + pads_data[i + input_rank]);
+            } else if (pads_data[i] + pads_data[i + input_rank] == 0) {
+              *output_dim = input_dim;
+            }
+          }
+        } else {
+          // Infer ouput shapes' rank in any case
+          auto* output_shape_0 = getOutputShape(ctx, 0);
+          for (size_t i = 0; (int64_t)i < input_rank; ++i) {
+            output_shape_0->add_dim();
+          }
+        }
+        return;
+      })
+      .SetDoc(R"DOC(
+            Given `data` tensor, pads, mode, and value.
+            Example:
+            Insert 0 pads to the beginning of the second dimension.
+            data = [
+                    [1.0, 1.2],
+                    [2.3, 3.4],
+                    [4.5, 5.7],
+                    ]
+            pads = [0, 2, 0, 0]
+            output = [
+                    [
+                    [0.0, 0.0, 1.0, 1.2],
+                    [0.0, 0.0, 2.3, 3.4],
+                    [0.0, 0.0, 4.5, 5.7],
+                    ],
+                    ]
+            )DOC");
+
+  ONNX_CONTRIB_OPERATOR_SCHEMA(Unique)
+      .SetDomain(kMSDomain)
+      .SinceVersion(1)
+      .Input(0, "x", "A 1-D input tensor that is to be processed.", "T")
+      .Output(0, "y",
+              "A 1-D tensor of the same type as 'x' "
+              "containing all the unique values in 'x' sorted "
+              "in the same order that they occur in the input 'x'",
+              "T")
+      .Output(1, "idx",
+              "A 1-D INT64 tensor of the same size as 'x' "
+              "containing the indices for each value in 'x' "
+              "in the output 'uniques'",
+              "tensor(int64)")
+      .Output(2, "counts",
+              "A 1-D INT64 tensor containing the "
+              "the count of each element "
+              "of 'uniques' in the input 'x'",
+              "tensor(int64)")
+      .TypeConstraint("T", OpSchema::all_tensor_types(), "Input can be of any tensor type.")
+      .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
+        // Type inference
+        ONNX_NAMESPACE::propagateElemTypeFromInputToOutput(ctx, 0, 0);
+        ONNX_NAMESPACE::updateOutputElemType(ctx, 1, ONNX_NAMESPACE::TensorProto::INT64);
+        ONNX_NAMESPACE::updateOutputElemType(ctx, 2, ONNX_NAMESPACE::TensorProto::INT64);
+
+        // Shape inference
+
+        // shape of output 'uniques' and 'counts'
+        // depends on actual input data, but the rank is always 1
+        ctx.getOutputType(0)
+            ->mutable_tensor_type()
+            ->mutable_shape()
+            ->add_dim();
+
+        ctx.getOutputType(2)
+            ->mutable_tensor_type()
+            ->mutable_shape()
+            ->add_dim();
+
+        // if the input shape doesn't exist, further shape inference is not possible
+        if (!hasNInputShapes(ctx, 1)) {
+          return;
+        }
+
+        // 'idx' output has same shape as input
+        ONNX_NAMESPACE::propagateShapeFromInputToOutput(ctx, 0, 1);
+
+        return;
+      })
+      .SetDoc(R"DOC(
+              Finds all the unique values (deduped list) present in the given input tensor. 
+              This operator returns 3 outputs. 
+              The first output tensor 'uniques' contains all of the unique elements of the input, 
+              sorted in the same order that they occur in the input.
+              The second output tensor 'idx' is the same size as the input and it contains the index 
+              of each value of the input in 'uniques'.
+              The third output tensor 'counts' contains the count of each element of 'uniques' in the input.
+              Example:
+                input_x = [2, 1, 1, 3, 4, 3]
+                output_uniques = [2, 1, 3, 4]
+                output_idx = [0, 1, 1, 2, 3, 2]
+                output_counts = [1, 2, 2, 1]
+              )DOC");
 
 #ifdef MICROSOFT_INTERNAL
   // register internal ops

@@ -420,11 +420,6 @@ DeleteFunc SparseTensorTypeBase::GetDeleteFunc() const {
 //  return []() -> void* { return new SparseTensor(); };
 //}
 
-void SparseTensorTypeBase::Init(MLValue& mlvalue) const {
-  auto* allocator = GetCreateFunc();
-  mlvalue.Init(allocator(), SparseTensorTypeBase::Type(), GetDeleteFunc());
-}
-
 const ONNX_NAMESPACE::TypeProto* SparseTensorTypeBase::GetTypeProto() const {
   return impl_->GetProto();
 }
@@ -454,10 +449,6 @@ ONNX_NAMESPACE::TypeProto& NonTensorTypeBase::mutable_type_proto() {
 
 const ONNX_NAMESPACE::TypeProto* NonTensorTypeBase::GetTypeProto() const {
   return impl_->GetProto();
-}
-
-void NonTensorTypeBase::Init(MLValue& mlvalue) const {
-  mlvalue.Init(GetCreateFunc(), this, GetDeleteFunc());
 }
 
 bool NonTensorTypeBase::IsMapCompatible(const ONNX_NAMESPACE::TypeProto& type_proto) const {
