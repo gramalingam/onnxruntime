@@ -352,13 +352,7 @@ static Status AllocateTraditionalMLValue(MLValue& mlvalue, const DataTypeImpl& t
 static Status AllocateSparseTensor(MLValue& mlvalue, const DataTypeImpl& ml_type, AllocatorPtr allocator,
                                    const TensorShape& shape, size_t nnz, bool create_fence,
                                    const SessionState& session_state) {
-  // TODO
   auto element_type = ml_type.AsSparseTensorType()->GetElementType();
-  // int64_t num_dims = shape.NumDimensions();
-  // auto index_type = DataTypeImpl::GetType<int64_t>();
-  // void* values_data = allocator->AllocArray(nnz, element_type->Size());
-  // void* indices_data = allocator->AllocArray(nnz * num_dims, index_type->Size());
-  // auto sparse = std::make_unique<SparseTensor>(element_type, shape, nnz, values_data, indices_data, allocator->Info());
   auto sparse = std::make_unique<SparseTensor>(element_type, shape, nnz, allocator);
   auto deleter = DataTypeImpl::GetType<SparseTensor>()->GetDeleteFunc();
   mlvalue.Init(sparse.release(), DataTypeImpl::GetType<SparseTensor>(), deleter);
