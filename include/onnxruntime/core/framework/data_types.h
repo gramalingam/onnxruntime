@@ -39,6 +39,8 @@ class DataTypeImpl;
 class TensorTypeBase;
 class SparseTensorTypeBase;
 class MLValue;
+class Tensor;
+class SparseTensor;
 
 // MLFloat16
 union MLFloat16 {

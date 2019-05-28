@@ -17,22 +17,20 @@
 #endif
 
 using namespace ONNX_NAMESPACE;
+
 namespace onnxruntime {
 
+// Return the MLDataType used for a generic Tensor
 template <>
 MLDataType DataTypeImpl::GetType<Tensor>() {
   return TensorTypeBase::Type();
 }
 
+// Return the MLDataType used for a generic SparseTensor
 template <>
 MLDataType DataTypeImpl::GetType<SparseTensor>() {
   return SparseTensorTypeBase::Type();
 }
-}  // namespace onnxruntime
-
-#include "core/framework/ml_value.h"
-
-namespace onnxruntime {
 
 static bool IsTensorTypeScalar(const ONNX_NAMESPACE::TypeProto_Tensor& tensor_type_proto) {
   int sz = tensor_type_proto.shape().dim_size();
