@@ -289,7 +289,15 @@ class SparseTensorTests : public testing::Test {
     register_actions.push_back(register_kernel);
   }
 
+  template <typename Op1, typename Op2, typename... Ops>
+  void Add() {
+    Add<Op1>();
+    Add<Op2, Ops...>();
+  }
+
+  template <typename... Ops>
   void RegisterOps() {
+    Add<Ops...>();
     EXPECT_TRUE(registry->RegisterOpSet(schemas, onnxruntime::kMLDomain, 10, 11).IsOK());
     for (auto registerop : register_actions)
       registerop(registry.get());
@@ -333,6 +341,16 @@ class SparseTensorTests : public testing::Test {
     return mlvalue;
   }
 
+  NameMLValMap feeds;
+
+  void AddInput(NodeArg* arg, const std::vector<int64_t>& value) {
+    feeds[arg->Name()] = Constant(value);
+  }
+
+  void AddInput(NodeArg* arg, const std::vector<int64_t>& value, const std::vector<int64_t>& shape) {
+    feeds[arg->Name()] = Constant(value, shape);
+  }
+
   void ExpectEq(MLValue val1, MLValue val2) {
     // Restricted to case where val1 and val2 are int64_t tensors
     auto& tensor1 = val1.Get<Tensor>();
@@ -355,6 +373,26 @@ class SparseTensorTests : public testing::Test {
     }
   }
 
+  std::vector<std::string> output_names;
+  std::vector<MLValue> expected_output;
+
+  void ExpectOutput(NodeArg* arg, const std::vector<int64_t>& value) {
+    output_names.push_back(arg->Name());
+    expected_output.push_back(Constant(value));
+  }
+
+  void RunTest() {
+    RunOptions run_options;
+    std::vector<MLValue> fetches;
+
+    EXPECT_TRUE(session_object.Run(run_options, feeds, output_names, &fetches).IsOK());
+
+    ASSERT_EQ(expected_output.size(), fetches.size());
+    for (int i = 0; i < fetches.size(); ++i) {
+      ExpectEq(fetches[i], expected_output[i]);
+    }
+  }
+
  protected:
   std::vector<OpSchema> schemas;
   std::vector<Action> register_actions;
@@ -369,55 +407,82 @@ class SparseTensorTests : public testing::Test {
   std::vector<TypeProto> types;
 };
 
+// Test ops SparseFromCOO, SparseAbs, and SparseToValues.
+// Tests 1-dimensional int64 sparse tensor.
 TEST_F(SparseTensorTests, Test1) {
   // Register ops
-  Add<SparseFromCOO>();
-  Add<SparseAbs>();
-  Add<SparseToValues>();
-  RegisterOps();
+  RegisterOps<SparseFromCOO, SparseAbs, SparseToValues>();
 
   // Build model/graph
-  auto NZV = Dense("values");   // Non-Zero-Values
-  auto NZI = Dense("indices");  // Non-Zero-Indices
-  auto shape = Dense("shape");
-  auto sparse1 = Sparse("sparse1");
 
-  Node(SparseFromCOO::OpName(), {NZV, NZI, shape}, {sparse1});
+  // Node: create a sparse tensor from COO components:
+  // sparse1 <- SparseFromCOO(values, indices, shape)
+  auto values = Dense("values");     // a dense tensor containing non-zero-values
+  auto indices = Dense("indices");   // a dense tensor containing indices of non-zero-values
+  auto shape = Dense("shape");       // a dense tensor representing shape
+  auto sparse1 = Sparse("sparse1");  // a sparse tensor created from above
 
+  Node(SparseFromCOO::OpName(), {values, indices, shape}, {sparse1});
+
+  // Node:apply SparseAbs op
+  // sparse2 <- SparseAbs(sparse1)
   auto sparse2 = Sparse("sparse2");
   Node(SparseAbs::OpName(), {sparse1}, {sparse2});
 
-  auto NZV2 = Dense("output");
-  Node(SparseToValues::OpName(), {sparse2}, {NZV2});
+  // Node: Extract non-zero values from sparse2
+  // output <- SparseToValues(sparse2)
+  auto output = Dense("output");
+  Node(SparseToValues::OpName(), {sparse2}, {output});
 
+  // Check graph, serialize it and deserialize it back
   EXPECT_TRUE(graph.Resolve().IsOK());
-
-  // Serialize model and deserialize it back
   SerializeAndLoad();
 
   // Run the model
-  RunOptions run_options;
+  AddInput(values, {-99, 2});
+  AddInput(indices, {1, 4}, {2, 1});
+  AddInput(shape, {5});
+  ExpectOutput(output, {99, 2});
+  RunTest();
+}
 
-  // Inputs for run:
-  MLValue NZV_values = Constant({-99, 2});
-  MLValue NZI_values = Constant({1, 4}, {2, 1});
-  MLValue shape_value = Constant({5});
+// Test ops SparseFromCOO, SparseAbs, and SparseToValues.
+// Tests 2-dimensional int64 sparse tensor.
+TEST_F(SparseTensorTests, Test2) {
+  // Register ops
+  RegisterOps<SparseFromCOO, SparseAbs, SparseToValues>();
 
-  NameMLValMap feeds{
-      {NZV->Name(), NZV_values},
-      {NZI->Name(), NZI_values},
-      {shape->Name(), shape_value}};
+  // Build model/graph
 
-  std::vector<std::string> output_names{NZV2->Name()};
+  // Node: create a sparse tensor from COO components:
+  // sparse1 <- SparseFromCOO(values, indices, shape)
+  auto values = Dense("values");     // a dense tensor containing non-zero-values
+  auto indices = Dense("indices");   // a dense tensor containing indices of non-zero-values
+  auto shape = Dense("shape");       // a dense tensor representing shape
+  auto sparse1 = Sparse("sparse1");  // a sparse tensor created from above
 
-  std::vector<MLValue> fetches;
+  Node(SparseFromCOO::OpName(), {values, indices, shape}, {sparse1});
 
-  EXPECT_TRUE(session_object.Run(run_options, feeds, output_names, &fetches).IsOK());
+  // Node:apply SparseAbs op
+  // sparse2 <- SparseAbs(sparse1)
+  auto sparse2 = Sparse("sparse2");
+  Node(SparseAbs::OpName(), {sparse1}, {sparse2});
 
-  ASSERT_EQ(1, fetches.size());
-  auto& output = fetches.front();
+  // Node: Extract non-zero values from sparse2
+  // output <- SparseToValues(sparse2)
+  auto output = Dense("output");
+  Node(SparseToValues::OpName(), {sparse2}, {output});
 
-  ExpectEq(output, {99, 2});
+  // Check graph, serialize it and deserialize it back
+  EXPECT_TRUE(graph.Resolve().IsOK());
+  SerializeAndLoad();
+
+  // Run the model
+  AddInput(values, {-99, 2});
+  AddInput(indices, {1, 1, 4, 4}, {2, 2});
+  AddInput(shape, {5, 5});
+  ExpectOutput(output, {99, 2});
+  RunTest();
 }
 
 }  // namespace test
