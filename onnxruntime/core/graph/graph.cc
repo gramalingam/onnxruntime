@@ -1810,8 +1810,10 @@ Status Graph::VerifyNodeAndOpMatch() {
 
       if (node.op_ && node.op_->HasFunction()) {
         auto onnx_function_proto = node.op_->GetFunction();
+        FunctionBodyQueryContext ctx; // TODO
+        auto dynamic_func_nodes = node.op_->GetDynamicNodes(ctx);
         auto func_ptr = onnxruntime::make_unique<onnxruntime::FunctionImpl>(*this, node.Index(), *onnx_function_proto,
-            logger_);
+            logger_, dynamic_func_nodes);
         function_container_.emplace_back(std::move(func_ptr));
         node.SetFunctionBody(*function_container_.back());
       }
