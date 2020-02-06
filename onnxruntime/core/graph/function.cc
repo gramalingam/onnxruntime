@@ -227,12 +227,19 @@ static  std::unordered_map<std::string, int> GetOpsetVersionMap(const ONNX_NAMES
 FunctionImpl::FunctionImpl(const onnxruntime::Graph& graph,
                            const onnxruntime::NodeIndex& node_index,
                            const ONNX_NAMESPACE::FunctionProto& onnx_func_proto,
-                           const logging::Logger& logger)
+                           const logging::Logger& logger,
+                           const std::vector<NodeProto> dynamic_nodes = {})
     : parent_graph_(&graph),
       body_ (onnx_func_proto.name(), false, onnxruntime::ModelMetaData(), IOnnxRuntimeOpSchemaRegistryList(),
              GetOpsetVersionMap(onnx_func_proto), {}, logger),
       onnx_func_proto_(onnx_func_proto)
     {
+  // First, add the dynamic nodes to the function body
+  for (const auto node : dynamic_nodes) {
+    auto new_node = onnx_func_proto_.add_node();
+    new_node->CopyFrom(node);
+  }
+
   // Make a copy of the FunctionProto.
   // All FunctionBody ops with the same op type seem to share the same FunctionProto struct within a model.
   // Hence, we make a copy prior to generating the graph representation of the function,
