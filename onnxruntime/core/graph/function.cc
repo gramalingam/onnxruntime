@@ -148,10 +148,9 @@ FunctionImpl::FunctionImpl(const onnxruntime::Graph& graph,
                            std::unique_ptr<IndexedSubGraph> customized_func,
                            const logging::Logger& logger)
     : parent_graph_(&graph),
-     body_("fused_function_subgraph", false, onnxruntime::ModelMetaData(),
-           IOnnxRuntimeOpSchemaRegistryList({graph.GetSchemaRegistry()}),
-           graph.DomainToVersionMap(), {}, logger)
-    {
+      body_("fused_function_subgraph", false, onnxruntime::ModelMetaData(),
+            IOnnxRuntimeOpSchemaRegistryList({graph.GetSchemaRegistry()}),
+            graph.DomainToVersionMap(), {}, logger) {
   customized_func_body_ = std::move(customized_func);
   auto& function_body_graph = body_.MainGraph();
 
@@ -220,7 +219,7 @@ FunctionImpl::FunctionImpl(const onnxruntime::Graph& graph,
   ORT_ENFORCE(status.IsOK(), status.ErrorMessage());
 }
 
-static  std::unordered_map<std::string, int> GetOpsetVersionMap(const ONNX_NAMESPACE::FunctionProto& onnx_func_proto){
+static std::unordered_map<std::string, int> GetOpsetVersionMap(const ONNX_NAMESPACE::FunctionProto& onnx_func_proto) {
   return std::unordered_map<std::string, int>{{onnxruntime::kOnnxDomain, static_cast<int>(onnx_func_proto.since_version())}};
 }
 
@@ -229,15 +228,13 @@ FunctionImpl::FunctionImpl(const onnxruntime::Graph& graph,
                            const ONNX_NAMESPACE::FunctionProto& onnx_func_proto,
                            const logging::Logger& logger)
     : parent_graph_(&graph),
-      body_ (onnx_func_proto.name(), false, onnxruntime::ModelMetaData(), IOnnxRuntimeOpSchemaRegistryList(),
-             GetOpsetVersionMap(onnx_func_proto), {}, logger),
-      onnx_func_proto_(onnx_func_proto)
-    {
+      body_(onnx_func_proto.name(), false, onnxruntime::ModelMetaData(), IOnnxRuntimeOpSchemaRegistryList(),
+            GetOpsetVersionMap(onnx_func_proto), {}, logger),
+      onnx_func_proto_(onnx_func_proto) {
   // Make a copy of the FunctionProto.
   // All FunctionBody ops with the same op type seem to share the same FunctionProto struct within a model.
   // Hence, we make a copy prior to generating the graph representation of the function,
   // as we might make some modifications to the FunctionProto along the way
-
 
   auto node_in_parent_graph = parent_graph_->GetNode(node_index);
   op_schema_ = onnxruntime::make_unique<ONNX_NAMESPACE::OpSchema>();
@@ -309,6 +306,42 @@ FunctionImpl::FunctionImpl(const onnxruntime::Graph& graph,
   ONNX_NAMESPACE::NodeProto function_op_node_proto;  // NodeProto pertaining to the op with a FunctionBody
   node_in_parent_graph->ToProto(function_op_node_proto);
 
+  ONNX_NAMESPACE::TypeProto tensor_int32;  // dummy type used for unused formal parameters
+  tensor_int32.mutable_tensor_type()->set_elem_type(ONNX_NAMESPACE::TensorProto_DataType_INT32);
+  tensor_int32.mutable_tensor_type()->mutable_shape()->add_dim()->set_dim_value(1);
+
+  std::vector<const NodeArg*> new_graph_inputs, new_graph_outputs;
+  for (int i = 0; i < onnx_func_proto_.input_size(); ++i) {
+    const std::string& formal_param_name = onnx_func_proto_.input().Get(i);
+    std::string new_name = formal_param_name;
+    const ONNX_NAMESPACE::TypeProto* actual_type = &tensor_int32;
+    if (i < function_op_node_proto.input_size()) {
+      const std::string& actual_param_name = function_op_node_proto.input().Get(i);
+      if (!actual_param_name.empty()) {
+        new_name = actual_param_name;
+        const onnxruntime::NodeArg* node_arg = parent_graph_->GetNodeArg(actual_param_name);
+        actual_type = node_arg->TypeAsProto();
+      }  // else: use a dummy type for a missing (optional) parameter
+    }
+    NodeArg& arg = function_body_graph.GetOrCreateNodeArg(new_name, actual_type);
+    new_graph_inputs.push_back(&arg);
+  }
+  for (int i = 0; i < onnx_func_proto_.output_size(); ++i) {
+    const std::string& formal_param_name = onnx_func_proto_.output().Get(i);
+    std::string new_name = formal_param_name;
+    const ONNX_NAMESPACE::TypeProto* actual_type = nullptr;
+    if (i < function_op_node_proto.output_size()) {
+      const std::string& actual_param_name = function_op_node_proto.output().Get(i);
+      if (!actual_param_name.empty()) {
+        new_name = actual_param_name;
+        const onnxruntime::NodeArg* node_arg = parent_graph_->GetNodeArg(actual_param_name);
+        actual_type = node_arg->TypeAsProto();
+      }  // else: use nullptr for a missing (optional) parameter
+    }
+    NodeArg& arg = function_body_graph.GetOrCreateNodeArg(new_name, actual_type);
+    new_graph_inputs.push_back(&arg);
+  }
+
   // iterate over each node in the FunctionProto and fix inputs/outputs
   for (auto node = onnx_func_proto_.mutable_node()->begin(); node != onnx_func_proto_.mutable_node()->end(); ++node) {
     std::vector<onnxruntime::NodeArg*> inputs;
@@ -325,10 +358,13 @@ FunctionImpl::FunctionImpl(const onnxruntime::Graph& graph,
       auto iter = input_name_idx_map.find(tensor_name);
       if (iter != input_name_idx_map.end()) {
         // Preserving NodeArg and input/output names
-        const onnxruntime::NodeArg* node_arg = parent_graph_->GetNodeArg(function_op_node_proto.input()
-                                                                             .Get(iter->second));
-        auto& n_input = function_body_graph.GetOrCreateNodeArg(
-            function_op_node_proto.input().Get(iter->second), node_arg->TypeAsProto());
+        const std::string& actual_parameter_name = function_op_node_proto.input().Get(iter->second);
+        const ONNX_NAMESPACE::TypeProto* actual_type = nullptr;
+        if (!actual_parameter_name.empty()) {
+          const onnxruntime::NodeArg* node_arg = parent_graph_->GetNodeArg(actual_parameter_name);
+          actual_type = node_arg->TypeAsProto();
+        }  // else: use nullptr for type for a missing (optional) parameter
+        auto& n_input = function_body_graph.GetOrCreateNodeArg(actual_parameter_name, actual_type);
         inputs.push_back(&n_input);
       } else {
         auto& n_input = function_body_graph.GetOrCreateNodeArg(
@@ -341,10 +377,13 @@ FunctionImpl::FunctionImpl(const onnxruntime::Graph& graph,
       auto iter = output_name_idx_map.find(tensor_name);
       if (iter != output_name_idx_map.end()) {
         // Preserving NodeArg and input/output names
-        const onnxruntime::NodeArg* node_arg = parent_graph_->GetNodeArg(function_op_node_proto.output()
-                                                                             .Get(iter->second));
-        auto& n_output = function_body_graph.GetOrCreateNodeArg(
-            function_op_node_proto.output().Get(iter->second), node_arg->TypeAsProto());
+        const std::string& actual_parameter_name = function_op_node_proto.output().Get(iter->second);
+        const ONNX_NAMESPACE::TypeProto* actual_type = nullptr;
+        if (!actual_parameter_name.empty()) {
+          const onnxruntime::NodeArg* node_arg = parent_graph_->GetNodeArg(actual_parameter_name);
+          actual_type = node_arg->TypeAsProto();
+        }  // else: use nullptr for type for a missing (optional) parameter
+        auto& n_output = function_body_graph.GetOrCreateNodeArg(actual_parameter_name, actual_type);
         outputs.push_back(&n_output);
       } else {
         auto& n_output = function_body_graph.GetOrCreateNodeArg(
