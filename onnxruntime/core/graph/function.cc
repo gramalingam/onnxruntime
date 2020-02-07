@@ -342,6 +342,9 @@ FunctionImpl::FunctionImpl(const onnxruntime::Graph& graph,
     new_graph_inputs.push_back(&arg);
   }
 
+  function_body_graph.SetInputs(new_graph_inputs);
+  function_body_graph.SetOutputs(new_graph_outputs);
+
   // iterate over each node in the FunctionProto and fix inputs/outputs
   for (auto node = onnx_func_proto_.mutable_node()->begin(); node != onnx_func_proto_.mutable_node()->end(); ++node) {
     std::vector<onnxruntime::NodeArg*> inputs;
