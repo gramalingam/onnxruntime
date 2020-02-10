@@ -306,6 +306,7 @@ FunctionImpl::FunctionImpl(const onnxruntime::Graph& graph,
   ONNX_NAMESPACE::NodeProto function_op_node_proto;  // NodeProto pertaining to the op with a FunctionBody
   node_in_parent_graph->ToProto(function_op_node_proto);
 
+  /*
   ONNX_NAMESPACE::TypeProto tensor_int32;  // dummy type used for unused formal parameters
   tensor_int32.mutable_tensor_type()->set_elem_type(ONNX_NAMESPACE::TensorProto_DataType_INT32);
   tensor_int32.mutable_tensor_type()->mutable_shape()->add_dim()->set_dim_value(1);
@@ -344,6 +345,7 @@ FunctionImpl::FunctionImpl(const onnxruntime::Graph& graph,
 
   function_body_graph.SetInputs(new_graph_inputs);
   function_body_graph.SetOutputs(new_graph_outputs);
+  */
 
   // iterate over each node in the FunctionProto and fix inputs/outputs
   for (auto node = onnx_func_proto_.mutable_node()->begin(); node != onnx_func_proto_.mutable_node()->end(); ++node) {
@@ -363,10 +365,10 @@ FunctionImpl::FunctionImpl(const onnxruntime::Graph& graph,
         // Preserving NodeArg and input/output names
         const std::string& actual_parameter_name = function_op_node_proto.input().Get(iter->second);
         const ONNX_NAMESPACE::TypeProto* actual_type = nullptr;
-        if (!actual_parameter_name.empty()) {
-          const onnxruntime::NodeArg* node_arg = parent_graph_->GetNodeArg(actual_parameter_name);
-          actual_type = node_arg->TypeAsProto();
-        }  // else: use nullptr for type for a missing (optional) parameter
+        // if (!actual_parameter_name.empty()) {
+        const onnxruntime::NodeArg* node_arg = parent_graph_->GetNodeArg(actual_parameter_name);
+        actual_type = node_arg->TypeAsProto();
+        // }  // else: use nullptr for type for a missing (optional) parameter
         auto& n_input = function_body_graph.GetOrCreateNodeArg(actual_parameter_name, actual_type);
         inputs.push_back(&n_input);
       } else {
@@ -382,10 +384,10 @@ FunctionImpl::FunctionImpl(const onnxruntime::Graph& graph,
         // Preserving NodeArg and input/output names
         const std::string& actual_parameter_name = function_op_node_proto.output().Get(iter->second);
         const ONNX_NAMESPACE::TypeProto* actual_type = nullptr;
-        if (!actual_parameter_name.empty()) {
-          const onnxruntime::NodeArg* node_arg = parent_graph_->GetNodeArg(actual_parameter_name);
-          actual_type = node_arg->TypeAsProto();
-        }  // else: use nullptr for type for a missing (optional) parameter
+        // if (!actual_parameter_name.empty()) {
+        const onnxruntime::NodeArg* node_arg = parent_graph_->GetNodeArg(actual_parameter_name);
+        actual_type = node_arg->TypeAsProto();
+        // }  // else: use nullptr for type for a missing (optional) parameter
         auto& n_output = function_body_graph.GetOrCreateNodeArg(actual_parameter_name, actual_type);
         outputs.push_back(&n_output);
       } else {
