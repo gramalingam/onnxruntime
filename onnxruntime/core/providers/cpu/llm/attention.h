@@ -63,6 +63,29 @@ class AttentionBase : public OpKernel {
                                bool transpose_output,      // whether to transpose the output from BxNxSxH to BxSxNxH
                                concurrency::ThreadPool* tp) const;
 
+  // FlashAttention-style tiled CPU path. Avoids materialising the full
+  // [B, N, S, T] attention-probability tensor between the two GEMMs by tiling
+  // Q/K/V and accumulating an online-softmax result. Supports the full feature
+  // set: GQA/MQA, KV cache, causal + external masks, softcap, nonpad_kv_seqlen,
+  // fp16 and fp32.
+  //
+  // Enabled at runtime via the environment variable ORT_ATTENTION_USE_FLASH=1.
+  // When qk_matmul_output_mode != kNone the caller falls back to the existing
+  // materialising path because snapshot outputs require the full score matrix.
+  Status ApplyFlashAttention(OpKernelContext* context,
+                             const T* Q,
+                             const T* K,
+                             const T* V,
+                             const Tensor* mask_index,
+                             const T* past_key,
+                             const T* past_value,
+                             Tensor* output,
+                             Tensor* present_key,
+                             Tensor* present_value,
+                             const attention_helper::AttentionParameters& parameters,
+                             AllocatorPtr allocator,
+                             concurrency::ThreadPool* tp) const;
+
   void ComputeAttentionProbs(T* attention_probs,                                       // output buffer with size BxNxSxT
                              const T* Q,                                               // Q data. Its size is BxNxSxH
                              const T* K,                                               // k data. Its size is BxNxLxH

@@ -8,12 +8,16 @@
 #include "core/common/common.h"
 #include "core/common/safeint.h"
 #include "core/mlas/inc/mlas.h"
+#include "core/platform/env.h"
+#include "core/platform/env_var_utils.h"
 #include "core/platform/threadpool.h"
 #include "core/util/math.h"
 #include "core/util/math_cpuonly.h"
 #include "core/providers/cpu/math/gemm.h"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <vector>
 
 using onnxruntime::attention_helper::AttentionParameters;
@@ -705,6 +709,514 @@ void AttentionBase<T>::ComputeVxAttentionScore(T* output,                  // bu
       });
 }
 
+// ---------------------------------------------------------------------------
+// FlashAttention-style tiled CPU path
+// ---------------------------------------------------------------------------
+//
+// Algorithm (per task = one (batch, q_head, q_block) triple):
+//
+//   Initialize m[q_block] = -inf, l[q_block] = 0, O[q_block, v_head] = 0
+//   For kv_block in 0..total_seq by kv_block_size:
+//     S = scale * Q_block @ K_block^T
+//     S = softcap(S)           (optional)
+//     S += attn_mask_tile      (optional)
+//     S[nonpad positions] = -inf
+//     S[causal-masked positions] = -inf
+//     For each q row i:
+//       m_new = max(m[i], rowmax(S[i,:]))
+//       S[i,:] = exp(S[i,:] - m_new)
+//       O[i,:] *= exp(m[i] - m_new)
+//       l[i]   = exp(m[i] - m_new) * l[i] + rowsum(S[i,:])
+//       m[i]   = m_new
+//     O += S @ V_block
+//   O /= l[:]
+//
+// All intermediate arithmetic is in float32 regardless of input type.
+// For MLFloat16 inputs the Q/K/V tiles are upcasted per kv_block; the
+// accumulated float32 output is downcasted at the end.
+//
+// Parallelism is over batch × q_heads × q_chunks.  Each worker uses a
+// dedicated scratch slot (one per pool thread + one for the calling thread)
+// to hold m, l, S_tile, O_tile, and (for fp16) float32 copies of Q/K/V tiles.
+//
+// Enabled at runtime by setting the environment variable:
+//   ORT_ATTENTION_USE_FLASH=1
+//
+// qk_matmul_output_mode snapshots are NOT supported on this path; the caller
+// falls back to the standard materialising path in that case.
+
+template <typename T>
+Status AttentionBase<T>::ApplyFlashAttention(
+    OpKernelContext* context,
+    const T* Q,
+    const T* K,
+    const T* V,
+    const Tensor* mask_index,
+    const T* past_key,
+    const T* past_value,
+    Tensor* output,
+    Tensor* present_key,
+    Tensor* present_value,
+    const AttentionParameters& parameters,
+    AllocatorPtr allocator,
+    ThreadPool* tp) const {
+  ORT_ENFORCE(!((past_key != nullptr) && (present_key == nullptr)),
+              "ApplyFlashAttention: past_key without present_key is unsupported.");
+  ORT_ENFORCE(!((past_value != nullptr) && (present_value == nullptr)),
+              "ApplyFlashAttention: past_value without present_value is unsupported.");
+
+  // ---- Constants / shorthand ----
+  const int batch_size = parameters.batch_size;
+  const int q_num_heads = parameters.q_num_heads;
+  const int kv_num_heads = parameters.kv_num_heads;
+  const int head_size = parameters.head_size;
+  const int v_head_size = parameters.v_head_size;
+  const int q_seq_len = parameters.q_sequence_length;
+  const int kv_seq_len = parameters.kv_sequence_length;
+  const int past_seq_len = parameters.past_sequence_length;
+  const int total_seq_len = parameters.total_sequence_length;
+  const float scale = parameters.scale;
+  const bool causal = parameters.is_causal && q_seq_len > 1;
+  const bool softcap_active = (parameters.softcap > 0.0f);
+  const float softcap = parameters.softcap;
+  constexpr bool is_fp16 = std::is_same<T, MLFloat16>::value;
+
+  // ---- Tile-size computation (same formula as contrib MultiHeadAttention) ----
+  int l2_cache_size = Env::Default().GetL2CacheSize();
+  if (l2_cache_size <= 0) {
+    l2_cache_size = 256 * 1024;  // conservative fallback: 256 KB
+  }
+  int kv_block_size = l2_cache_size / (static_cast<int>(sizeof(float)) * 4 * (head_size + v_head_size));
+  kv_block_size = std::max(kv_block_size, 1);
+  kv_block_size = std::min(kv_block_size, total_seq_len);
+  int q_block_size = std::min(kv_block_size, head_size + v_head_size);
+  q_block_size = std::max(q_block_size, 1);
+  q_block_size = std::min(q_block_size, q_seq_len);
+
+  // ---- Prepare attention mask (identical logic to ComputeAttentionProbs) ----
+  const ptrdiff_t probs_matrix_size = SafeInt<ptrdiff_t>(q_seq_len) * total_seq_len;
+
+  int mask_batch_size = static_cast<int>(mask_index == nullptr || mask_index->Shape().NumDimensions() < 4
+                                             ? 1
+                                             : mask_index->Shape().GetDims()[0]);
+  int mask_num_heads = static_cast<int>(mask_index == nullptr || mask_index->Shape().NumDimensions() < 3
+                                            ? 1
+                                            : (mask_index->Shape().NumDimensions() < 4
+                                                   ? mask_index->Shape().GetDims()[0]
+                                                   : mask_index->Shape().GetDims()[1]));
+
+  T* mask_data = nullptr;
+  bool delete_mask_data = false;
+  if (mask_index == nullptr) {
+    if (causal) {
+      size_t mask_bytes = SafeInt<size_t>(q_seq_len) * total_seq_len * sizeof(T);
+      void* raw = allocator->Alloc(mask_bytes);
+      memset(raw, 0, mask_bytes);
+      mask_data = static_cast<T*>(raw);
+      for (int s = 0; s < q_seq_len; ++s) {
+        for (int t = past_seq_len + s + 1; t < total_seq_len; ++t) {
+          mask_data[s * total_seq_len + t] = mask_filter_value<T>();
+        }
+      }
+      delete_mask_data = true;
+    }
+  } else {
+    const bool is_bool_mask = mask_index->IsDataType<bool>();
+    const bool need_copy = is_bool_mask || causal;
+    if (need_copy) {
+      size_t mask_bytes = SafeInt<size_t>(mask_index->Shape().Size()) * sizeof(T);
+      mask_data = static_cast<T*>(allocator->Alloc(mask_bytes));
+      delete_mask_data = true;
+      if (is_bool_mask) {
+        make_copy(mask_data, mask_index->Data<bool>(), SafeInt<size_t>(mask_index->Shape().Size()));
+      } else {
+        make_copy(mask_data, mask_index->Data<T>(), SafeInt<size_t>(mask_index->Shape().Size()));
+      }
+      if (causal) {
+        int slices = mask_batch_size * mask_num_heads;
+        for (int slice = 0; slice < slices; ++slice) {
+          T* base = mask_data + probs_matrix_size * slice;
+          for (int s = 0; s < q_seq_len; ++s) {
+            for (int t = past_seq_len + s + 1; t < total_seq_len; ++t) {
+              base[s * total_seq_len + t] = mask_filter_value<T>();
+            }
+          }
+        }
+      }
+    } else {
+      mask_data = const_cast<T*>(mask_index->Data<T>());
+    }
+  }
+
+  // ---- Materialise present_key / present_value (pre-build before parallel loop) ----
+  // For the flash path we always materialise up-front when requested so the
+  // inner tiled loop can address K/V as a simple contiguous array.
+  const size_t past_k_chunk = static_cast<size_t>(past_seq_len) * head_size;
+  const size_t k_input_chunk = static_cast<size_t>(kv_seq_len) * head_size;
+  const size_t present_k_chunk = past_k_chunk + k_input_chunk;
+  const size_t past_v_chunk = static_cast<size_t>(past_seq_len) * v_head_size;
+  const size_t v_input_chunk = static_cast<size_t>(kv_seq_len) * v_head_size;
+  const size_t present_v_chunk = past_v_chunk + v_input_chunk;
+
+  T* present_key_data = present_key != nullptr ? present_key->MutableData<T>() : nullptr;
+  T* present_value_data = present_value != nullptr ? present_value->MutableData<T>() : nullptr;
+
+  if (present_key_data != nullptr) {
+    for (std::ptrdiff_t bi = 0; bi < batch_size; ++bi) {
+      for (std::ptrdiff_t hi = 0; hi < kv_num_heads; ++hi) {
+        ConcatStateChunk(past_key, K, present_key_data,
+                         past_k_chunk, k_input_chunk, present_k_chunk,
+                         kv_num_heads, head_size, bi, hi, parameters.transpose_output);
+      }
+    }
+  }
+  if (present_value_data != nullptr) {
+    for (std::ptrdiff_t bi = 0; bi < batch_size; ++bi) {
+      for (std::ptrdiff_t hi = 0; hi < kv_num_heads; ++hi) {
+        ConcatStateChunk(past_value, V, present_value_data,
+                         past_v_chunk, v_input_chunk, present_v_chunk,
+                         kv_num_heads, v_head_size, bi, hi, parameters.transpose_output);
+      }
+    }
+  }
+
+  // ---- Effective K / V pointers and their layout ----
+  // After materialising present_key/value the storage is always in
+  // non-transposed (BNSH-4D) order:  [batch, kv_head, total_seq, head_size].
+  // When there is no present tensor we fall back to the original K/V pointer
+  // and must respect the 3D-transposed layout if parameters.transpose_output.
+  const T* K_eff = (present_key_data != nullptr) ? present_key_data : K;
+  const T* V_eff = (present_value_data != nullptr) ? present_value_data : V;
+  const int kv_seq_eff = (present_key_data != nullptr) ? total_seq_len : kv_seq_len;
+  const bool kv_transposed = parameters.transpose_output && (present_key_data == nullptr);
+
+  // ---- Scratch buffer size per parallel range ----
+  // Scratch layout (all float32):
+  //   m[q_block_size]                      running max per q-row
+  //   l[q_block_size]                      running normalisation per q-row
+  //   S[q_block_size * kv_block_size]      score tile
+  //   O[q_block_size * v_head_size]        accumulated output tile
+  //   q_fp32[q_block_size * head_size]     (fp16 only) upcast Q tile
+  //   k_fp32[kv_block_size * head_size]    (fp16 only) upcast K tile
+  //   v_fp32[kv_block_size * v_head_size]  (fp16 only) upcast V tile
+
+  const size_t ml_floats = static_cast<size_t>(q_block_size) * 2;
+  const size_t s_floats = static_cast<size_t>(q_block_size) * kv_block_size;
+  const size_t o_floats = static_cast<size_t>(q_block_size) * v_head_size;
+  const size_t fp16_extra = is_fp16
+                                ? (static_cast<size_t>(q_block_size) * head_size +
+                                   static_cast<size_t>(kv_block_size) * head_size +
+                                   static_cast<size_t>(kv_block_size) * v_head_size)
+                                : 0;
+  const size_t floats_per_range = ml_floats + s_floats + o_floats + fp16_extra;
+
+  // ---- Parallel loop over (batch, q_head, q_chunk) ----
+  const int q_chunks = (q_seq_len + q_block_size - 1) / q_block_size;
+  const int total_tasks = batch_size * q_num_heads * q_chunks;
+
+  TensorOpCost unit_cost;
+  unit_cost.compute_cycles = static_cast<double>(
+      2 * head_size * q_block_size * total_seq_len +
+      2 * total_seq_len * v_head_size * q_block_size);
+  unit_cost.bytes_loaded =
+      static_cast<double>((static_cast<size_t>(head_size) + v_head_size) * total_seq_len * sizeof(T));
+  unit_cost.bytes_stored =
+      static_cast<double>(static_cast<size_t>(q_block_size) * v_head_size * sizeof(T));
+
+  T* output_data = output->MutableData<T>();
+
+  ThreadPool::TryParallelFor(tp, total_tasks, unit_cost, [&](std::ptrdiff_t task_begin, std::ptrdiff_t task_end) {
+    // Each parallel range allocates its own scratch on the stack.  floats_per_range
+    // is at most a few tens of KB for typical head sizes so this is safe.
+    std::vector<float> local_scratch(floats_per_range);
+    float* slot_base = local_scratch.data();
+
+    float* m_buf = slot_base;
+    float* l_buf = m_buf + q_block_size;
+    float* s_tile = l_buf + q_block_size;
+    float* o_tile = s_tile + s_floats;
+    // fp16-only upcast buffers (nullptr-equivalent for float; never dereferenced)
+    float* q_fp32_buf = is_fp16 ? o_tile + o_floats : nullptr;
+    float* k_fp32_buf = is_fp16 ? q_fp32_buf + static_cast<size_t>(q_block_size) * head_size : nullptr;
+    float* v_fp32_buf = is_fp16 ? k_fp32_buf + static_cast<size_t>(kv_block_size) * head_size : nullptr;
+
+    for (std::ptrdiff_t task = task_begin; task < task_end; ++task) {
+      // Decode (batch_i, head_i, q_chunk_i) from flat task index.
+      std::ptrdiff_t tmp = task;
+      const std::ptrdiff_t q_chunk_i = tmp % q_chunks;
+      tmp /= q_chunks;
+      const std::ptrdiff_t head_i = tmp % q_num_heads;
+      const std::ptrdiff_t batch_i = tmp / q_num_heads;
+
+      const int q_block_start = static_cast<int>(q_chunk_i) * q_block_size;
+      const int actual_q_rows = std::min(q_block_size, q_seq_len - q_block_start);
+
+      // GQA: map q_head → kv_head
+      const std::ptrdiff_t kv_head_i = head_i * kv_num_heads / q_num_heads;
+
+      // ---- Q tile pointer and row-stride ----
+      const T* q_tile_ptr;
+      int q_lda;
+      if (parameters.transpose_output) {
+        // 3D layout [B, S, N, H]: Q[batch_i, q_block_start, head_i, :]
+        q_tile_ptr = Q + batch_i * q_seq_len * q_num_heads * head_size +
+                     q_block_start * q_num_heads * head_size +
+                     head_i * head_size;
+        q_lda = q_num_heads * head_size;
+      } else {
+        // 4D layout [B, N, S, H]: Q[batch_i, head_i, q_block_start, :]
+        q_tile_ptr = Q + (batch_i * q_num_heads + head_i) * q_seq_len * head_size +
+                     q_block_start * head_size;
+        q_lda = head_size;
+      }
+
+      // For fp16, upcast the Q tile into a contiguous fp32 buffer once per q_block.
+      const float* q_gemm_ptr;
+      int q_gemm_lda;
+      if constexpr (is_fp16) {
+        for (int qr = 0; qr < actual_q_rows; ++qr) {
+          MlasConvertHalfToFloatBuffer(q_tile_ptr + qr * q_lda,
+                                       q_fp32_buf + qr * head_size,
+                                       static_cast<size_t>(head_size));
+        }
+        q_gemm_ptr = q_fp32_buf;
+        q_gemm_lda = head_size;
+      } else {
+        q_gemm_ptr = reinterpret_cast<const float*>(q_tile_ptr);
+        q_gemm_lda = q_lda;
+      }
+
+      // ---- Mask slice offset for this (batch, head) ----
+      const ptrdiff_t mask_data_offset =
+          (mask_data != nullptr)
+              ? probs_matrix_size * (head_i % mask_num_heads +
+                                     (batch_i % mask_batch_size) * mask_num_heads)
+              : 0;
+
+      // Nonpad KV length for this batch item
+      const int valid_kv_len =
+          parameters.has_nonpad_kv_seqlen
+              ? static_cast<int>(parameters.nonpad_kv_seqlen_data[batch_i])
+              : total_seq_len;
+
+      // ---- Initialise m, l, O ----
+      for (int r = 0; r < actual_q_rows; ++r) {
+        m_buf[r] = std::numeric_limits<float>::lowest();
+        l_buf[r] = 0.0f;
+      }
+      // Zero O_tile (we always use beta=1 in the SGEMM below; first pass works
+      // because O starts at 0 and exp(lowest - new_m) ≈ 0 zeroes the scale).
+      std::fill(o_tile, o_tile + static_cast<size_t>(actual_q_rows) * v_head_size, 0.0f);
+
+      // ---- Tiled KV loop ----
+      for (int kv_start = 0; kv_start < total_seq_len; kv_start += kv_block_size) {
+        const int actual_kv_rows = std::min(kv_block_size, total_seq_len - kv_start);
+
+        // ---- K tile pointer and row-stride ----
+        const T* k_tile_ptr;
+        int k_ldb;
+        if (kv_transposed) {
+          // 3D layout [B, S, N, H]
+          k_tile_ptr = K_eff + batch_i * kv_seq_eff * kv_num_heads * head_size +
+                       kv_start * kv_num_heads * head_size +
+                       kv_head_i * head_size;
+          k_ldb = kv_num_heads * head_size;
+        } else {
+          // 4D layout [B, N, S, H]
+          k_tile_ptr = K_eff + (batch_i * kv_num_heads + kv_head_i) * kv_seq_eff * head_size +
+                       kv_start * head_size;
+          k_ldb = head_size;
+        }
+
+        // ---- V tile pointer and row-stride ----
+        const T* v_tile_ptr;
+        int v_ldb;
+        if (kv_transposed) {
+          v_tile_ptr = V_eff + batch_i * kv_seq_eff * kv_num_heads * v_head_size +
+                       kv_start * kv_num_heads * v_head_size +
+                       kv_head_i * v_head_size;
+          v_ldb = kv_num_heads * v_head_size;
+        } else {
+          v_tile_ptr = V_eff + (batch_i * kv_num_heads + kv_head_i) * kv_seq_eff * v_head_size +
+                       kv_start * v_head_size;
+          v_ldb = v_head_size;
+        }
+
+        // For fp16: upcast K and V tiles into contiguous fp32 buffers.
+        const float* k_gemm_ptr;
+        int k_gemm_ldb;
+        const float* v_gemm_ptr;
+        int v_gemm_ldb;
+        if constexpr (is_fp16) {
+          for (int kr = 0; kr < actual_kv_rows; ++kr) {
+            MlasConvertHalfToFloatBuffer(k_tile_ptr + kr * k_ldb,
+                                         k_fp32_buf + kr * head_size,
+                                         static_cast<size_t>(head_size));
+            MlasConvertHalfToFloatBuffer(v_tile_ptr + kr * v_ldb,
+                                         v_fp32_buf + kr * v_head_size,
+                                         static_cast<size_t>(v_head_size));
+          }
+          k_gemm_ptr = k_fp32_buf;
+          k_gemm_ldb = head_size;
+          v_gemm_ptr = v_fp32_buf;
+          v_gemm_ldb = v_head_size;
+        } else {
+          k_gemm_ptr = reinterpret_cast<const float*>(k_tile_ptr);
+          k_gemm_ldb = k_ldb;
+          v_gemm_ptr = reinterpret_cast<const float*>(v_tile_ptr);
+          v_gemm_ldb = v_ldb;
+        }
+
+        // ---- S_tile = scale * Q_block @ K_block^T ----
+        // Shape: [actual_q_rows, actual_kv_rows], stored in s_tile with stride kv_block_size.
+        MlasGemm(CblasNoTrans, CblasTrans,
+                 static_cast<size_t>(actual_q_rows),
+                 static_cast<size_t>(actual_kv_rows),
+                 static_cast<size_t>(head_size),
+                 scale, q_gemm_ptr, static_cast<size_t>(q_gemm_lda),
+                 k_gemm_ptr, static_cast<size_t>(k_gemm_ldb),
+                 0.0f, s_tile, static_cast<size_t>(kv_block_size),
+                 nullptr, nullptr);
+
+        // ---- Softcap (optional) ----
+        if (softcap_active) {
+          for (int r = 0; r < actual_q_rows; ++r) {
+            float* row = s_tile + r * kv_block_size;
+            for (int c = 0; c < actual_kv_rows; ++c) {
+              row[c] = std::tanh(row[c] / softcap) * softcap;
+            }
+          }
+        }
+
+        // ---- External attention mask tile ----
+        if (mask_data != nullptr) {
+          for (int r = 0; r < actual_q_rows; ++r) {
+            const T* mask_row = mask_data + mask_data_offset +
+                                (q_block_start + r) * total_seq_len + kv_start;
+            float* s_row = s_tile + r * kv_block_size;
+            if constexpr (is_fp16) {
+              for (int c = 0; c < actual_kv_rows; ++c) {
+                s_row[c] += mask_row[c].ToFloat();
+              }
+            } else {
+              for (int c = 0; c < actual_kv_rows; ++c) {
+                s_row[c] += static_cast<float>(mask_row[c]);
+              }
+            }
+          }
+        }
+
+        // ---- Nonpad masking ----
+        if (valid_kv_len < total_seq_len) {
+          for (int r = 0; r < actual_q_rows; ++r) {
+            float* s_row = s_tile + r * kv_block_size;
+            for (int c = 0; c < actual_kv_rows; ++c) {
+              if (kv_start + c >= valid_kv_len) {
+                s_row[c] = std::numeric_limits<float>::lowest();
+              }
+            }
+          }
+        }
+
+        // ---- Causal masking (when causal==true, is_causal&&q_seq>1) ----
+        // A position (q_block_start+r, kv_start+c) is causally masked when
+        //   kv_start + c > past_seq_len + q_block_start + r
+        if (causal) {
+          for (int r = 0; r < actual_q_rows; ++r) {
+            float* s_row = s_tile + r * kv_block_size;
+            const int threshold = past_seq_len + q_block_start + r;
+            for (int c = 0; c < actual_kv_rows; ++c) {
+              if (kv_start + c > threshold) {
+                s_row[c] = std::numeric_limits<float>::lowest();
+              }
+            }
+          }
+        }
+
+        // ---- Online softmax update + O rescaling ----
+        for (int r = 0; r < actual_q_rows; ++r) {
+          float* s_row = s_tile + r * kv_block_size;
+          float* o_row = o_tile + r * v_head_size;
+
+          // Row max of this tile
+          float row_max = s_row[0];
+          for (int c = 1; c < actual_kv_rows; ++c) {
+            if (s_row[c] > row_max) row_max = s_row[c];
+          }
+
+          const float new_m = std::max(m_buf[r], row_max);
+          const float exp_diff = std::exp(m_buf[r] - new_m);
+
+          // Rescale accumulated output for the change in running max
+          if (exp_diff != 1.0f) {
+            for (int c = 0; c < v_head_size; ++c) {
+              o_row[c] *= exp_diff;
+            }
+          }
+
+          // exp-normalise the score row and accumulate into l
+          float rowsum = 0.0f;
+          const float neg_new_m = -new_m;
+          for (int c = 0; c < actual_kv_rows; ++c) {
+            float e = std::exp(s_row[c] + neg_new_m);
+            s_row[c] = e;
+            rowsum += e;
+          }
+
+          l_buf[r] = exp_diff * l_buf[r] + rowsum;
+          m_buf[r] = new_m;
+        }
+
+        // ---- O += S_norm @ V_block (SGEMM, single-threaded) ----
+        MlasGemm(CblasNoTrans, CblasNoTrans,
+                 static_cast<size_t>(actual_q_rows),
+                 static_cast<size_t>(v_head_size),
+                 static_cast<size_t>(actual_kv_rows),
+                 1.0f, s_tile, static_cast<size_t>(kv_block_size),
+                 v_gemm_ptr, static_cast<size_t>(v_gemm_ldb),
+                 1.0f, o_tile, static_cast<size_t>(v_head_size),
+                 nullptr, nullptr);
+      }  // kv_block loop
+
+      // ---- Normalise O and write to output ----
+      for (int r = 0; r < actual_q_rows; ++r) {
+        float* o_row = o_tile + r * v_head_size;
+        const float inv_l = (l_buf[r] > 0.0f) ? 1.0f / l_buf[r] : 0.0f;
+        for (int c = 0; c < v_head_size; ++c) {
+          o_row[c] *= inv_l;
+        }
+
+        // Write to output tensor with the correct layout
+        T* dst;
+        if (parameters.transpose_output) {
+          // 3D output [B, S, N, H_v]
+          dst = output_data +
+                batch_i * q_seq_len * q_num_heads * v_head_size +
+                (q_block_start + r) * q_num_heads * v_head_size +
+                head_i * v_head_size;
+        } else {
+          // 4D output [B, N, S, H_v]
+          dst = output_data +
+                (batch_i * q_num_heads + head_i) * q_seq_len * v_head_size +
+                (q_block_start + r) * v_head_size;
+        }
+
+        if constexpr (is_fp16) {
+          MlasConvertFloatToHalfBuffer(o_row, dst, static_cast<size_t>(v_head_size));
+        } else {
+          memcpy(dst, o_row, static_cast<size_t>(v_head_size) * sizeof(float));
+        }
+      }
+    }  // task loop
+  });  // TryParallelFor
+
+  if (delete_mask_data) {
+    allocator->Free(mask_data);
+  }
+
+  return Status::OK();
+}
+
 template <typename T>
 Status AttentionBase<T>::ApplyAttention(OpKernelContext* context,
                                         const T* Q,                            // Q data with shape BxNxSxH
@@ -725,8 +1237,25 @@ Status AttentionBase<T>::ApplyAttention(OpKernelContext* context,
   auto* tp = context->GetOperatorThreadPool();
 
   const T* past_key_data = past_key != nullptr ? past_key->Data<T>() : nullptr;
-  T* present_key_data = present_key != nullptr ? present_key->MutableData<T>() : nullptr;
   const T* past_value_data = past_value != nullptr ? past_value->Data<T>() : nullptr;
+
+  // ORT_ATTENTION_USE_FLASH=1 selects the FlashAttention-style tiled path for
+  // benchmarking.  The flash path avoids materialising the full [B,N,S,T]
+  // probability tensor.  It falls back to the classic path when snapshot
+  // outputs (qk_matmul_output_mode) are requested, because those require the
+  // full matrix.
+  static const bool use_flash =
+      ParseEnvironmentVariableWithDefault<bool>("ORT_ATTENTION_USE_FLASH", false);
+
+  if (use_flash && parameters.qk_matmul_output_mode == QKMatMulOutputMode::kNone) {
+    return this->ApplyFlashAttention(context, Q, K, V,
+                                     mask_index,
+                                     past_key_data, past_value_data,
+                                     output, present_key, present_value,
+                                     parameters, allocator, tp);
+  }
+
+  T* present_key_data = present_key != nullptr ? present_key->MutableData<T>() : nullptr;
   T* present_value_data = present_value != nullptr ? present_value->MutableData<T>() : nullptr;
   T* output_qk_data = output_qk != nullptr ? output_qk->MutableData<T>() : nullptr;
 
