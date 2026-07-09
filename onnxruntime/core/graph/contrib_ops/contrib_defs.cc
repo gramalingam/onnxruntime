@@ -1662,6 +1662,83 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
         .TypeConstraint("T4", {"tensor(float)"}, "Constrain FP4 global scale type to float32 tensors.")
         .TypeAndShapeInferenceFunction(ONNX_NAMESPACE::propagateShapeAndTypeFromFirstInput));
 
+constexpr const char* GroupedMatMul_ver1_doc = R"DOC(
+Grouped matrix multiplication. Each token (a row along the flattened leading dimensions of
+`input`) is multiplied by one weight matrix selected from a stack of `num_groups` matrices
+via `group_indices`. This is the core computation of Mixture-of-Experts (MoE) feed-forward
+layers and corresponds to torch.nn.functional.grouped_mm.
+
+Let M be the product of all `input` dimensions except the last (the number of tokens).
+Semantics (with the leading dims flattened):
+
+    for i in range(M):
+        g = group_indices[i]                        # 0 <= g < num_groups
+        output[i] = input[i] @ weights[g]           # [K] @ [K, N] -> [N]
+        if bias is not None:
+            output[i] += bias[g]
+
+`weights` and `bias` are shared across all tokens. Empty groups (no token assigned to a
+group) are valid; the corresponding weight matrix is simply unused. Top-k MoE routing is
+expressed by flattening the k selected experts into the token dimension before the op (no
+top-k or routing is built into this op).
+)DOC";
+
+ONNX_MS_OPERATOR_SET_SCHEMA(
+    GroupedMatMul, 1,
+    OpSchema()
+        .SetDoc(GroupedMatMul_ver1_doc)
+        .Input(0,
+               "input",
+               "Input tensor of shape (..., K). Any rank >= 2; all leading dimensions are token "
+               "dimensions and K is the hidden (contraction) dimension.",
+               "T")
+        .Input(1,
+               "weights",
+               "Weight tensor of shape (num_groups, K, N). One K x N weight matrix per group.",
+               "T")
+        .Input(2,
+               "group_indices",
+               "Group assignment per token. Shape equals the shape of `input` without its last "
+               "dimension. Each value must be in the range [0, num_groups).",
+               "I")
+        .Input(3,
+               "bias",
+               "Optional per-group bias of shape (num_groups, N).",
+               "T",
+               OpSchema::Optional)
+        .Output(0,
+                "output",
+                "Output tensor of shape (..., N): the shape of `input` with its last dimension "
+                "replaced by N.",
+                "T")
+        .TypeConstraint("T",
+                        {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"},
+                        "Constrain input and output types to float tensors.")
+        .TypeConstraint("I", {"tensor(int64)"}, "Constrain group index type to int64 tensors.")
+        .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
+          propagateElemTypeFromInputToOutput(ctx, 0, 0);
+          if (!hasInputShape(ctx, 0) || !hasInputShape(ctx, 1)) {
+            return;
+          }
+          const auto& input_shape = getInputShape(ctx, 0);
+          const auto& weights_shape = getInputShape(ctx, 1);
+          const int input_rank = input_shape.dim_size();
+          if (input_rank < 2) {
+            fail_shape_inference("GroupedMatMul input must have rank >= 2.");
+          }
+          if (weights_shape.dim_size() != 3) {
+            fail_shape_inference("GroupedMatMul weights must have rank 3 (num_groups, K, N).");
+          }
+          // Output shape is input shape with the last dim replaced by N (weights dim 2).
+          ONNX_NAMESPACE::TensorShapeProto output_shape;
+          for (int i = 0; i < input_rank - 1; ++i) {
+            *output_shape.add_dim() = input_shape.dim(i);
+          }
+          *output_shape.add_dim() = weights_shape.dim(2);
+          updateOutputShape(ctx, 0, output_shape);
+        }));
+
+
 ONNX_MS_OPERATOR_SET_SCHEMA(SampleOp, 1,
                             OpSchema()
                                 .Input(0, "X", "input", "T")
