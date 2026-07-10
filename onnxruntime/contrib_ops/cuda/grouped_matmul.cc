@@ -35,19 +35,20 @@ Status GroupedMatMul<T>::ComputeInternal(OpKernelContext* context) const {
   const Tensor* input = context->Input<Tensor>(0);
   const Tensor* weights = context->Input<Tensor>(1);
   const Tensor* group_indices = context->Input<Tensor>(2);
-  const Tensor* bias = context->Input<Tensor>(3);
+  const Tensor* combine_weights = context->Input<Tensor>(3);
+  const Tensor* bias = context->Input<Tensor>(4);
 
   const auto& input_shape = input->Shape();
   const auto& weights_shape = weights->Shape();
 
-  ORT_RETURN_IF_NOT(input_shape.NumDimensions() >= 2,
-                    "GroupedMatMul: input must have rank >= 2, got rank ", input_shape.NumDimensions());
+  ORT_RETURN_IF_NOT(input_shape.NumDimensions() == 2,
+                    "GroupedMatMul: input must have rank 2 (M, K), got rank ", input_shape.NumDimensions());
   ORT_RETURN_IF_NOT(weights_shape.NumDimensions() == 3,
                     "GroupedMatMul: weights must have rank 3 (num_groups, K, N), got rank ",
                     weights_shape.NumDimensions());
 
-  const int64_t K = input_shape[input_shape.NumDimensions() - 1];
-  const int64_t num_tokens = input_shape.Size() / K;
+  const int64_t M = input_shape[0];
+  const int64_t K = input_shape[1];
   const int64_t num_groups = weights_shape[0];
   const int64_t weights_K = weights_shape[1];
   const int64_t N = weights_shape[2];
@@ -56,9 +57,17 @@ Status GroupedMatMul<T>::ComputeInternal(OpKernelContext* context) const {
                     "GroupedMatMul: weights dim 1 (", weights_K, ") must equal input last dim (", K, ").");
 
   const auto& indices_shape = group_indices->Shape();
-  ORT_RETURN_IF_NOT(indices_shape.Size() == num_tokens,
-                    "GroupedMatMul: group_indices must have one entry per token (", num_tokens,
-                    "), got ", indices_shape.Size(), ".");
+  ORT_RETURN_IF_NOT(indices_shape.NumDimensions() == 2 && indices_shape[0] == M,
+                    "GroupedMatMul: group_indices must have shape (M, k) with M = ", M, ", got ",
+                    indices_shape.ToString(), ".");
+  const int64_t k = indices_shape[1];
+  const int64_t num_selections = M * k;
+
+  const bool has_combine = combine_weights != nullptr;
+  if (has_combine) {
+    ORT_RETURN_IF_NOT(combine_weights->Shape() == indices_shape,
+                      "GroupedMatMul: combine_weights must have the same shape as group_indices (M, k).");
+  }
 
   if (bias != nullptr) {
     const auto& bias_shape = bias->Shape();
@@ -66,35 +75,40 @@ Status GroupedMatMul<T>::ComputeInternal(OpKernelContext* context) const {
                       "GroupedMatMul: bias must have shape (num_groups, N) = (", num_groups, ", ", N, ").");
   }
 
-  // Output shape: input shape with last dim replaced by N.
-  TensorShapeVector output_dims(input_shape.GetDims().begin(), input_shape.GetDims().end());
-  output_dims[output_dims.size() - 1] = N;
+  // Output shape: (M, N) when combining over k, otherwise (M, k, N).
+  TensorShapeVector output_dims;
+  output_dims.push_back(M);
+  if (!has_combine) {
+    output_dims.push_back(k);
+  }
+  output_dims.push_back(N);
   Tensor* output = context->Output(0, TensorShape(output_dims));
 
-  if (num_tokens == 0 || N == 0) {
+  if (num_selections == 0 || N == 0) {
     return Status::OK();
   }
 
   cudaStream_t stream = static_cast<cudaStream_t>(GetComputeStream(context));
 
-  // Copy group indices to host to build the per-group permutation. This is a small (num_tokens)
-  // transfer and lets us sort/bucket without a device radix sort.
-  auto host_indices = AllocateBufferOnCPUPinned<int64_t>(static_cast<size_t>(num_tokens));
+  // Copy group indices to host to build the per-group permutation. This is a small
+  // (num_selections) transfer and lets us sort/bucket without a device radix sort.
+  auto host_indices = AllocateBufferOnCPUPinned<int64_t>(static_cast<size_t>(num_selections));
   CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(host_indices.get(), group_indices->Data<int64_t>(),
-                                       static_cast<size_t>(num_tokens) * sizeof(int64_t),
+                                       static_cast<size_t>(num_selections) * sizeof(int64_t),
                                        cudaMemcpyDeviceToHost, stream));
   CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
 
-  // Bucket tokens by group id (stable within each group), producing:
-  //   row_map[p]   = original token index at group-contiguous position p
+  // Bucket selections by group id (stable within each group), producing:
+  //   row_map[p]   = original selection index at group-contiguous position p
   //   group_ids[p] = group id at position p
   //   group_offsets[g] = start position of group g in the permuted order
   std::vector<int64_t> group_counts(static_cast<size_t>(num_groups), 0);
   const int64_t* h_indices = host_indices.get();
-  for (int64_t i = 0; i < num_tokens; ++i) {
-    const int64_t g = h_indices[i];
+  for (int64_t p = 0; p < num_selections; ++p) {
+    const int64_t g = h_indices[p];
     ORT_RETURN_IF_NOT(g >= 0 && g < num_groups,
-                      "GroupedMatMul: group index ", g, " at token ", i, " is out of range [0, ", num_groups, ").");
+                      "GroupedMatMul: group index ", g, " at selection ", p, " is out of range [0, ",
+                      num_groups, ").");
     group_counts[static_cast<size_t>(g)]++;
   }
 
@@ -103,31 +117,31 @@ Status GroupedMatMul<T>::ComputeInternal(OpKernelContext* context) const {
     group_offsets[static_cast<size_t>(g) + 1] = group_offsets[static_cast<size_t>(g)] + group_counts[static_cast<size_t>(g)];
   }
 
-  auto host_row_map = AllocateBufferOnCPUPinned<int64_t>(static_cast<size_t>(num_tokens));
-  auto host_group_ids = AllocateBufferOnCPUPinned<int64_t>(static_cast<size_t>(num_tokens));
+  auto host_row_map = AllocateBufferOnCPUPinned<int64_t>(static_cast<size_t>(num_selections));
+  auto host_group_ids = AllocateBufferOnCPUPinned<int64_t>(static_cast<size_t>(num_selections));
   std::vector<int64_t> cursor(group_offsets.begin(), group_offsets.end() - 1);
-  for (int64_t i = 0; i < num_tokens; ++i) {
-    const int64_t g = h_indices[i];
+  for (int64_t p = 0; p < num_selections; ++p) {
+    const int64_t g = h_indices[p];
     const int64_t pos = cursor[static_cast<size_t>(g)]++;
-    host_row_map.get()[pos] = i;
+    host_row_map.get()[pos] = p;
     host_group_ids.get()[pos] = g;
   }
 
   // Upload permutation arrays to device.
-  auto row_map = GetScratchBuffer<int64_t>(static_cast<size_t>(num_tokens), context->GetComputeStream());
-  auto group_ids = GetScratchBuffer<int64_t>(static_cast<size_t>(num_tokens), context->GetComputeStream());
+  auto row_map = GetScratchBuffer<int64_t>(static_cast<size_t>(num_selections), context->GetComputeStream());
+  auto group_ids = GetScratchBuffer<int64_t>(static_cast<size_t>(num_selections), context->GetComputeStream());
   CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(row_map.get(), host_row_map.get(),
-                                       static_cast<size_t>(num_tokens) * sizeof(int64_t),
+                                       static_cast<size_t>(num_selections) * sizeof(int64_t),
                                        cudaMemcpyHostToDevice, stream));
   CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(group_ids.get(), host_group_ids.get(),
-                                       static_cast<size_t>(num_tokens) * sizeof(int64_t),
+                                       static_cast<size_t>(num_selections) * sizeof(int64_t),
                                        cudaMemcpyHostToDevice, stream));
 
-  // Gather input rows into group-contiguous order.
-  auto permuted_input = GetScratchBuffer<CudaT>(static_cast<size_t>(num_tokens * K), context->GetComputeStream());
-  auto permuted_output = GetScratchBuffer<CudaT>(static_cast<size_t>(num_tokens * N), context->GetComputeStream());
+  // Gather each selection's source token row (token = selection / k) into group-contiguous order.
+  auto permuted_input = GetScratchBuffer<CudaT>(static_cast<size_t>(num_selections * K), context->GetComputeStream());
+  auto permuted_output = GetScratchBuffer<CudaT>(static_cast<size_t>(num_selections * N), context->GetComputeStream());
   LaunchGroupedMatMulGather<CudaT>(stream, reinterpret_cast<const CudaT*>(input->Data<T>()),
-                                   row_map.get(), permuted_input.get(), num_tokens, K);
+                                   row_map.get(), permuted_input.get(), num_selections, K, k);
 
   // One dense GEMM per non-empty group.
   const CudaT alpha = ToCudaType<T>::FromFloat(1.0f);
@@ -160,11 +174,23 @@ Status GroupedMatMul<T>::ComputeInternal(OpKernelContext* context) const {
         UseTF32()));
   }
 
-  // Scatter results back to original token order, adding the optional per-group bias.
   const CudaT* bias_data = bias ? reinterpret_cast<const CudaT*>(bias->Data<T>()) : nullptr;
-  LaunchGroupedMatMulScatter<CudaT>(stream, permuted_output.get(), row_map.get(), group_ids.get(),
-                                    bias_data, reinterpret_cast<CudaT*>(output->MutableData<T>()),
-                                    num_tokens, N);
+
+  if (has_combine) {
+    // Scatter per-expert results (with bias) into selection order [M, k, N], then reduce over
+    // the k selected experts with the combine weights into the [M, N] output.
+    auto per_expert = GetScratchBuffer<CudaT>(static_cast<size_t>(num_selections * N), context->GetComputeStream());
+    LaunchGroupedMatMulScatter<CudaT>(stream, permuted_output.get(), row_map.get(), group_ids.get(),
+                                      bias_data, per_expert.get(), num_selections, N);
+    LaunchGroupedMatMulCombine<CudaT>(stream, per_expert.get(),
+                                      reinterpret_cast<const CudaT*>(combine_weights->Data<T>()),
+                                      reinterpret_cast<CudaT*>(output->MutableData<T>()), M, k, N);
+  } else {
+    // Scatter per-expert results (with bias) directly into the [M, k, N] output.
+    LaunchGroupedMatMulScatter<CudaT>(stream, permuted_output.get(), row_map.get(), group_ids.get(),
+                                      bias_data, reinterpret_cast<CudaT*>(output->MutableData<T>()),
+                                      num_selections, N);
+  }
 
   return Status::OK();
 }

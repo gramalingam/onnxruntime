@@ -12,13 +12,16 @@ namespace cuda {
 
 using namespace onnxruntime::cuda;
 
-// GroupedMatMul: for each token (row along the flattened leading dims of `input`), multiply by
-// one weight matrix selected from a stack of `num_groups` matrices via `group_indices`.
+// GroupedMatMul: each token (row of `input`) is multiplied by k weight matrices selected from a
+// stack of `num_groups` matrices via `group_indices` (shape [M, k]). When optional
+// `combine_weights` is provided, the k results are combined into a weighted sum.
 // See docs/GroupedMatMul.md for the full specification.
 //
-// The kernel uses the standard grouped-GEMM strategy: tokens are stable-sorted by group index,
-// gathered into group-contiguous order, one dense cuBLAS GEMM is run per non-empty group, and the
-// results (plus optional per-group bias) are scattered back to the original token order.
+// The kernel uses the standard grouped-GEMM strategy: selections are stable-sorted by group index,
+// each selection's source token row is gathered into group-contiguous order, one dense cuBLAS GEMM
+// is run per non-empty group, and the results (plus optional per-group bias) are scattered back to
+// selection order. When combine weights are present a final reduction over the k experts produces
+// the [M, N] output; otherwise the per-expert [M, k, N] results are returned directly.
 template <typename T>
 class GroupedMatMul final : public CudaKernel {
  public:

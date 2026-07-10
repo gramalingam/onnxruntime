@@ -1663,24 +1663,35 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
         .TypeAndShapeInferenceFunction(ONNX_NAMESPACE::propagateShapeAndTypeFromFirstInput));
 
 constexpr const char* GroupedMatMul_ver1_doc = R"DOC(
-Grouped matrix multiplication. Each token (a row along the flattened leading dimensions of
-`input`) is multiplied by one weight matrix selected from a stack of `num_groups` matrices
-via `group_indices`. This is the core computation of Mixture-of-Experts (MoE) feed-forward
+Grouped matrix multiplication. Each token (a row of `input`) is multiplied by one or more
+weight matrices selected, per token, from a stack of `num_groups` matrices via
+`group_indices`. This is the core computation of Mixture-of-Experts (MoE) feed-forward
 layers and corresponds to torch.nn.functional.grouped_mm.
 
-Let M be the product of all `input` dimensions except the last (the number of tokens).
-Semantics (with the leading dims flattened):
+`input` has shape (M, K) where M is the number of tokens (callers with batched inputs of
+shape (..., K) Reshape the leading dimensions into M first; Reshape is free in ONNX Runtime).
+`group_indices` has shape (M, k): each token selects k experts. The dense (non-MoE) case is
+k == 1.
+
+Semantics:
 
     for i in range(M):
-        g = group_indices[i]                        # 0 <= g < num_groups
-        output[i] = input[i] @ weights[g]           # [K] @ [K, N] -> [N]
-        if bias is not None:
-            output[i] += bias[g]
+        for j in range(k):
+            g = group_indices[i, j]                 # 0 <= g < num_groups
+            r[i, j] = input[i] @ weights[g]         # [K] @ [K, N] -> [N]
+            if bias is not None:
+                r[i, j] += bias[g]
+
+    if combine_weights is not None:
+        # Fused weighted sum over the k selected experts.
+        output[i] = sum_j combine_weights[i, j] * r[i, j]   # output shape (M, N)
+    else:
+        output[i, j] = r[i, j]                               # output shape (M, k, N)
 
 `weights` and `bias` are shared across all tokens. Empty groups (no token assigned to a
-group) are valid; the corresponding weight matrix is simply unused. Top-k MoE routing is
-expressed by flattening the k selected experts into the token dimension before the op (no
-top-k or routing is built into this op).
+group) are valid; the corresponding weight matrix is simply unused. When `combine_weights`
+is provided, the top-k weighted sum is fused into this op, avoiding both an Expand of
+`input` and a separate ReduceSum over the selected experts.
 )DOC";
 
 ONNX_MS_OPERATOR_SET_SCHEMA(
@@ -1689,8 +1700,8 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
         .SetDoc(GroupedMatMul_ver1_doc)
         .Input(0,
                "input",
-               "Input tensor of shape (..., K). Any rank >= 2; all leading dimensions are token "
-               "dimensions and K is the hidden (contraction) dimension.",
+               "Input tensor of shape (M, K). M is the number of tokens and K is the hidden "
+               "(contraction) dimension.",
                "T")
         .Input(1,
                "weights",
@@ -1698,18 +1709,28 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
                "T")
         .Input(2,
                "group_indices",
-               "Group assignment per token. Shape equals the shape of `input` without its last "
-               "dimension. Each value must be in the range [0, num_groups).",
+               "Group assignment per token of shape (M, k): each of the M tokens selects k "
+               "experts. Use k = 1 for the dense case. Each value must be in the range "
+               "[0, num_groups).",
                "I")
         .Input(3,
+               "combine_weights",
+               "Optional per-selection combine weights of shape (M, k), matching `group_indices`. "
+               "When present, the op returns the weighted sum over the k selected experts "
+               "(output shape (M, N)); when absent, the op returns the per-expert results "
+               "(output shape (M, k, N)).",
+               "T",
+               OpSchema::Optional)
+        .Input(4,
                "bias",
-               "Optional per-group bias of shape (num_groups, N).",
+               "Optional per-group bias of shape (num_groups, N), added before the optional "
+               "combine.",
                "T",
                OpSchema::Optional)
         .Output(0,
                 "output",
-                "Output tensor of shape (..., N): the shape of `input` with its last dimension "
-                "replaced by N.",
+                "Output tensor. Shape is (M, N) when `combine_weights` is provided, otherwise "
+                "(M, k, N).",
                 "T")
         .TypeConstraint("T",
                         {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"},
@@ -1722,19 +1743,25 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
           }
           const auto& input_shape = getInputShape(ctx, 0);
           const auto& weights_shape = getInputShape(ctx, 1);
-          const int input_rank = input_shape.dim_size();
-          if (input_rank < 2) {
-            fail_shape_inference("GroupedMatMul input must have rank >= 2.");
+          if (input_shape.dim_size() != 2) {
+            fail_shape_inference("GroupedMatMul input must have rank 2 (M, K).");
           }
           if (weights_shape.dim_size() != 3) {
             fail_shape_inference("GroupedMatMul weights must have rank 3 (num_groups, K, N).");
           }
-          // Output shape is input shape with the last dim replaced by N (weights dim 2).
+          // combine_weights is input 3; when present the k dimension is reduced away.
+          const bool has_combine = ctx.getNumInputs() > 3 && ctx.hasInput(3);
           ONNX_NAMESPACE::TensorShapeProto output_shape;
-          for (int i = 0; i < input_rank - 1; ++i) {
-            *output_shape.add_dim() = input_shape.dim(i);
+          *output_shape.add_dim() = input_shape.dim(0);  // M
+          if (!has_combine && hasInputShape(ctx, 2)) {
+            const auto& indices_shape = getInputShape(ctx, 2);
+            if (indices_shape.dim_size() == 2) {
+              *output_shape.add_dim() = indices_shape.dim(1);  // k
+            } else {
+              return;  // Cannot infer without a well-formed group_indices shape.
+            }
           }
-          *output_shape.add_dim() = weights_shape.dim(2);
+          *output_shape.add_dim() = weights_shape.dim(2);  // N
           updateOutputShape(ctx, 0, output_shape);
         }));
 

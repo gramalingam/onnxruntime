@@ -44,19 +44,20 @@ Status GroupedMatMul<T>::Compute(OpKernelContext* context) const {
   const Tensor* input = context->Input<Tensor>(0);
   const Tensor* weights = context->Input<Tensor>(1);
   const Tensor* group_indices = context->Input<Tensor>(2);
-  const Tensor* bias = context->Input<Tensor>(3);
+  const Tensor* combine_weights = context->Input<Tensor>(3);
+  const Tensor* bias = context->Input<Tensor>(4);
 
   const auto& input_shape = input->Shape();
   const auto& weights_shape = weights->Shape();
 
-  ORT_RETURN_IF_NOT(input_shape.NumDimensions() >= 2,
-                    "GroupedMatMul: input must have rank >= 2, got rank ", input_shape.NumDimensions());
+  ORT_RETURN_IF_NOT(input_shape.NumDimensions() == 2,
+                    "GroupedMatMul: input must have rank 2 (M, K), got rank ", input_shape.NumDimensions());
   ORT_RETURN_IF_NOT(weights_shape.NumDimensions() == 3,
                     "GroupedMatMul: weights must have rank 3 (num_groups, K, N), got rank ",
                     weights_shape.NumDimensions());
 
-  const int64_t K = input_shape[input_shape.NumDimensions() - 1];
-  const int64_t num_tokens = input_shape.Size() / K;
+  const int64_t M = input_shape[0];
+  const int64_t K = input_shape[1];
   const int64_t num_groups = weights_shape[0];
   const int64_t weights_K = weights_shape[1];
   const int64_t N = weights_shape[2];
@@ -65,9 +66,17 @@ Status GroupedMatMul<T>::Compute(OpKernelContext* context) const {
                     "GroupedMatMul: weights dim 1 (", weights_K, ") must equal input last dim (", K, ").");
 
   const auto& indices_shape = group_indices->Shape();
-  ORT_RETURN_IF_NOT(indices_shape.Size() == num_tokens,
-                    "GroupedMatMul: group_indices must have one entry per token (", num_tokens,
-                    "), got ", indices_shape.Size(), ".");
+  ORT_RETURN_IF_NOT(indices_shape.NumDimensions() == 2 && indices_shape[0] == M,
+                    "GroupedMatMul: group_indices must have shape (M, k) with M = ", M, ", got ",
+                    indices_shape.ToString(), ".");
+  const int64_t k = indices_shape[1];
+  const int64_t num_selections = M * k;
+
+  const bool has_combine = combine_weights != nullptr;
+  if (has_combine) {
+    ORT_RETURN_IF_NOT(combine_weights->Shape() == indices_shape,
+                      "GroupedMatMul: combine_weights must have the same shape as group_indices (M, k).");
+  }
 
   if (bias != nullptr) {
     const auto& bias_shape = bias->Shape();
@@ -75,12 +84,16 @@ Status GroupedMatMul<T>::Compute(OpKernelContext* context) const {
                       "GroupedMatMul: bias must have shape (num_groups, N) = (", num_groups, ", ", N, ").");
   }
 
-  // Output shape: input shape with last dim replaced by N.
-  TensorShapeVector output_dims(input_shape.GetDims().begin(), input_shape.GetDims().end());
-  output_dims[output_dims.size() - 1] = N;
+  // Output shape: (M, N) when combining over k, otherwise (M, k, N).
+  TensorShapeVector output_dims;
+  output_dims.push_back(M);
+  if (!has_combine) {
+    output_dims.push_back(k);
+  }
+  output_dims.push_back(N);
   Tensor* output = context->Output(0, TensorShape(output_dims));
 
-  if (num_tokens == 0 || N == 0) {
+  if (num_selections == 0 || N == 0) {
     return Status::OK();
   }
 
@@ -89,9 +102,9 @@ Status GroupedMatMul<T>::Compute(OpKernelContext* context) const {
   concurrency::ThreadPool* tp = context->GetOperatorThreadPool();
 
   // Convert (if needed) input, weights and bias to float, and prepare a float output buffer.
-  const size_t input_count = static_cast<size_t>(num_tokens * K);
+  const size_t input_count = static_cast<size_t>(M * K);
   const size_t weights_count = static_cast<size_t>(num_groups * K * N);
-  const size_t output_count = static_cast<size_t>(num_tokens * N);
+  const size_t output_count = static_cast<size_t>(output->Shape().Size());
 
   const float* input_float;
   IAllocatorUniquePtr<float> input_float_buffer;
@@ -126,6 +139,18 @@ Status GroupedMatMul<T>::Compute(OpKernelContext* context) const {
     }
   }
 
+  const float* combine_float = nullptr;
+  IAllocatorUniquePtr<float> combine_float_buffer;
+  if (has_combine) {
+    if constexpr (std::is_same_v<T, float>) {
+      combine_float = combine_weights->Data<float>();
+    } else {
+      combine_float_buffer = IAllocator::MakeUniquePtr<float>(allocator, static_cast<size_t>(num_selections));
+      ToFloat<T>(combine_weights->Data<T>(), combine_float_buffer.get(), static_cast<size_t>(num_selections));
+      combine_float = combine_float_buffer.get();
+    }
+  }
+
   float* output_float;
   IAllocatorUniquePtr<float> output_float_buffer;
   if constexpr (std::is_same_v<T, float>) {
@@ -135,37 +160,46 @@ Status GroupedMatMul<T>::Compute(OpKernelContext* context) const {
     output_float = output_float_buffer.get();
   }
 
-  // Bucket tokens by group id (stable order preserves the input token order within a group).
-  const int64_t* indices = group_indices->Data<int64_t>();
-  std::vector<std::vector<int64_t>> group_tokens(static_cast<size_t>(num_groups));
-  for (int64_t i = 0; i < num_tokens; ++i) {
-    const int64_t g = indices[i];
-    ORT_RETURN_IF_NOT(g >= 0 && g < num_groups,
-                      "GroupedMatMul: group index ", g, " at token ", i, " is out of range [0, ", num_groups, ").");
-    group_tokens[static_cast<size_t>(g)].push_back(i);
+  // When combining, results from the k selected experts accumulate into the same output row,
+  // so the output buffer must start zeroed.
+  if (has_combine) {
+    std::fill(output_float, output_float + output_count, 0.0f);
   }
 
-  int64_t max_group_tokens = 0;
-  for (const auto& tokens : group_tokens) {
-    max_group_tokens = std::max(max_group_tokens, static_cast<int64_t>(tokens.size()));
+  // Bucket selections by group id. A "selection" is a (token, expert-slot) pair p in
+  // [0, M*k); the source token row is p / k. Stable order preserves token order in a group.
+  const int64_t* indices = group_indices->Data<int64_t>();
+  std::vector<std::vector<int64_t>> group_selections(static_cast<size_t>(num_groups));
+  for (int64_t p = 0; p < num_selections; ++p) {
+    const int64_t g = indices[p];
+    ORT_RETURN_IF_NOT(g >= 0 && g < num_groups,
+                      "GroupedMatMul: group index ", g, " at selection ", p, " is out of range [0, ",
+                      num_groups, ").");
+    group_selections[static_cast<size_t>(g)].push_back(p);
+  }
+
+  int64_t max_group_selections = 0;
+  for (const auto& sels : group_selections) {
+    max_group_selections = std::max(max_group_selections, static_cast<int64_t>(sels.size()));
   }
 
   // Reusable per-group gather/output buffers.
-  auto gather_buffer = IAllocator::MakeUniquePtr<float>(allocator, static_cast<size_t>(max_group_tokens * K));
-  auto result_buffer = IAllocator::MakeUniquePtr<float>(allocator, static_cast<size_t>(max_group_tokens * N));
+  auto gather_buffer = IAllocator::MakeUniquePtr<float>(allocator, static_cast<size_t>(max_group_selections * K));
+  auto result_buffer = IAllocator::MakeUniquePtr<float>(allocator, static_cast<size_t>(max_group_selections * N));
   float* gathered = gather_buffer.get();
   float* result = result_buffer.get();
 
   for (int64_t g = 0; g < num_groups; ++g) {
-    const auto& tokens = group_tokens[static_cast<size_t>(g)];
-    if (tokens.empty()) {
+    const auto& sels = group_selections[static_cast<size_t>(g)];
+    if (sels.empty()) {
       continue;  // Empty group: weights[g] is unused.
     }
-    const int64_t count = static_cast<int64_t>(tokens.size());
+    const int64_t count = static_cast<int64_t>(sels.size());
 
-    // Gather this group's token rows into a contiguous [count, K] block.
+    // Gather each selection's source token row into a contiguous [count, K] block.
     for (int64_t r = 0; r < count; ++r) {
-      const float* src = input_float + tokens[static_cast<size_t>(r)] * K;
+      const int64_t token = sels[static_cast<size_t>(r)] / k;
+      const float* src = input_float + token * K;
       std::copy(src, src + K, gathered + r * K);
     }
 
@@ -177,17 +211,28 @@ Status GroupedMatMul<T>::Compute(OpKernelContext* context) const {
              1.0f, gathered, static_cast<size_t>(K), weight_g, static_cast<size_t>(N),
              0.0f, result, static_cast<size_t>(N), tp, nullptr);
 
-    // Add bias (if any) and scatter each row back to its original token position.
+    // Add bias (if any) and either scatter each row to its (token, slot) output position
+    // (no combine) or accumulate the combine-weighted result into the token output row.
     const float* bias_g = bias_float ? (bias_float + g * N) : nullptr;
     for (int64_t r = 0; r < count; ++r) {
+      const int64_t p = sels[static_cast<size_t>(r)];
       const float* res_row = result + r * N;
-      float* dst = output_float + tokens[static_cast<size_t>(r)] * N;
-      if (bias_g) {
+      if (has_combine) {
+        const float w = combine_float[p];
+        float* dst = output_float + (p / k) * N;
         for (int64_t j = 0; j < N; ++j) {
-          dst[j] = res_row[j] + bias_g[j];
+          const float v = bias_g ? (res_row[j] + bias_g[j]) : res_row[j];
+          dst[j] += w * v;
         }
       } else {
-        std::copy(res_row, res_row + N, dst);
+        float* dst = output_float + p * N;  // output layout is [M, k, N], row index = p.
+        if (bias_g) {
+          for (int64_t j = 0; j < N; ++j) {
+            dst[j] = res_row[j] + bias_g[j];
+          }
+        } else {
+          std::copy(res_row, res_row + N, dst);
+        }
       }
     }
   }
