@@ -1750,6 +1750,95 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
           updateOutputShape(ctx, 0, output_shape);
         }));
 
+constexpr const char* SwiGLU_ver1_doc = R"DOC(
+SwiGLU (Swish-Gated Linear Unit) gated activation, fused into a single elementwise op.
+
+Given two tensors of the same shape, `gate` (G) and `linear` (L), computes:
+
+    output = G * sigmoid(alpha * G) * L
+
+i.e. a SiLU/Swish activation applied to `gate` (when alpha == 1 the gate activation is
+SiLU(G) = G * sigmoid(G)) multiplied elementwise by `linear`. This is the gated-activation
+cluster of a SwiGLU MLP / MoE feed-forward layer; fusing the sigmoid and the two multiplies
+into one kernel removes two full passes over the (typically large) intermediate tensors.
+
+`gate` and `linear` must have identical shapes; the output has the same shape.
+)DOC";
+
+ONNX_MS_OPERATOR_SET_SCHEMA(
+    SwiGLU, 1,
+    OpSchema()
+        .SetDoc(SwiGLU_ver1_doc)
+        .Attr("alpha",
+              "Scaling factor inside the sigmoid of the Swish gate. Default is 1.0 (SiLU gate).",
+              AttributeProto::FLOAT,
+              1.0f)
+        .Input(0, "gate", "The gated input tensor G.", "T")
+        .Input(1, "linear", "The linear input tensor L, same shape as `gate`.", "T")
+        .Output(0, "output", "Result tensor, same shape as the inputs.", "T")
+        .TypeConstraint("T",
+                        {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"},
+                        "Constrain input and output types to float tensors.")
+        .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
+          propagateElemTypeFromInputToOutput(ctx, 0, 0);
+          if (hasInputShape(ctx, 0)) {
+            propagateShapeFromInputToOutput(ctx, 0, 0);
+          }
+        }));
+
+constexpr const char* RouterTopK_ver1_doc = R"DOC(
+Fused Mixture-of-Experts router top-k selection with renormalization.
+
+Given router `logits` of shape (..., num_experts), selects the top `k` experts per row and
+returns their (renormalized) softmax weights and indices:
+
+    values, indices = TopK(logits, k)          # k largest logits per row, sorted descending
+    weights = Softmax(values)                  # softmax over the k selected logits
+
+Because softmax is monotonic, this is numerically equivalent to renormalizing the top-k of a
+full softmax (`TopK(Softmax(logits))` followed by divide-by-sum), but the softmax runs over
+only k << num_experts elements, avoiding the full-width softmax and its intermediate tensor.
+
+`indices` are int64 and, for ties in logit value, the smaller expert index is selected first
+(matching ONNX TopK with largest=1, sorted=1). Outputs have shape (..., k).
+)DOC";
+
+ONNX_MS_OPERATOR_SET_SCHEMA(
+    RouterTopK, 1,
+    OpSchema()
+        .SetDoc(RouterTopK_ver1_doc)
+        .Attr("k", "Number of experts to select per row. Must satisfy 1 <= k <= num_experts.",
+              AttributeProto::INT)
+        .Input(0, "logits", "Router logits of shape (..., num_experts).", "T")
+        .Output(0, "weights", "Renormalized top-k softmax weights of shape (..., k).", "T")
+        .Output(1, "indices", "Indices of the selected experts of shape (..., k).", "I")
+        .TypeConstraint("T",
+                        {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"},
+                        "Constrain logits and weights types to float tensors.")
+        .TypeConstraint("I", {"tensor(int64)"}, "Constrain index output type to int64 tensors.")
+        .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
+          propagateElemTypeFromInputToOutput(ctx, 0, 0);
+          updateOutputElemType(ctx, 1, ONNX_NAMESPACE::TensorProto::INT64);
+          int64_t k = getAttribute(ctx, "k", -1);
+          if (k < 1) {
+            fail_shape_inference("RouterTopK requires attribute k >= 1.");
+          }
+          if (!hasInputShape(ctx, 0)) {
+            return;
+          }
+          const auto& logits_shape = getInputShape(ctx, 0);
+          if (logits_shape.dim_size() < 1) {
+            fail_shape_inference("RouterTopK logits must have rank >= 1.");
+          }
+          ONNX_NAMESPACE::TensorShapeProto out_shape;
+          for (int i = 0; i < logits_shape.dim_size() - 1; ++i) {
+            *out_shape.add_dim() = logits_shape.dim(i);
+          }
+          out_shape.add_dim()->set_dim_value(k);
+          updateOutputShape(ctx, 0, out_shape);
+          updateOutputShape(ctx, 1, out_shape);
+        }));
+
 
 ONNX_MS_OPERATOR_SET_SCHEMA(SampleOp, 1,
                             OpSchema()
