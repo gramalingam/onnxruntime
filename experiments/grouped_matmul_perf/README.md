@@ -112,3 +112,125 @@ matrix once.
 - **Memory blow-up is the harder limit**: at larger MoE shapes the decomposition's `W_sel`
   tensor exceeds available memory (many GB), so the decomposition cannot run at all while the
   fused op runs comfortably. The `--mem-budget-gb` guard makes this explicit (`OOM-skip`).
+
+---
+
+# MoE fusion microbenchmarks (candidate fusions beyond GroupedMatMul)
+
+`benchmark_moe_fusions.py` measures the two non-GEMM op clusters that remain in a standard
+top-k MoE feed-forward layer after the grouped GEMMs are handled by `GroupedMatMul`. These are
+the fusion candidates identified in the pre-implementation analysis. Each cluster is timed *in
+isolation* to quantify the headroom a dedicated fused kernel could recover. The harness uses
+only standard ONNX ops plus `com.microsoft.QuickGelu` (which equals SiLU at `alpha=1`), so it
+runs against a **stock** ONNX Runtime build — it does **not** need the GroupedMatMul op.
+
+## How to run
+
+```bash
+python benchmark_moe_fusions.py --providers cpu                 # both candidates
+python benchmark_moe_fusions.py --bench swiglu --dtype float16
+python benchmark_moe_fusions.py --bench router --csv router.csv
+python benchmark_moe_fusions.py --providers cuda               # on a GPU host
+```
+
+## Candidate A — SwiGLU gated activation `Mul(SiLU(g), u)`
+
+This touches the layer's largest intermediates: two `[T, F]` tensors (`T` = token·expert-slot
+rows, `F` = FFN inner dim). Three numerically-equivalent-in-math variants bracket the fusion
+win:
+
+- `unfused`   : `Sigmoid(g) → Mul(g,·) → Mul(·,u)` — 3 elementwise passes (naive graph).
+- `quickgelu` : `QuickGelu(g,alpha=1) → Mul(·,u)` — 2 passes (SiLU as one contrib op).
+- `fused_lb`  : `Mul(g,u)` — 1 pass; a **lower bound** for a single fused SwiGLU kernel (same
+  memory traffic, minus the cheap sigmoid arithmetic).
+
+`unfused/lb` is the bandwidth headroom a fused gated-activation kernel (or a GroupedMatMul
+activation epilogue) targets.
+
+## Candidate B — Router `Softmax → TopK (→ renormalize)`
+
+Softmax is monotonic, so `TopK(Softmax(logits))` selects the same experts as `TopK(logits)`,
+and *renormalized* top-k of a full softmax equals a softmax over just the top-k logits
+(`p_i/Σ_{j∈topk}p_j = e^{l_i}/Σ_{j∈topk}e^{l_j}`). Two equivalent strategies are timed:
+
+- `naive` : `Softmax(logits)[M,E] → TopK(k) → ReduceSum → Div` — full `E`-wide softmax.
+- `fused` : `TopK(logits,k) → Softmax([M,k])` — softmax on `k ≪ E` only.
+
+`E` (#experts) is small, so this is a launch-latency / intermediate-allocation win, not an
+arithmetic one. The harness confirms the two strategies agree (max rel err ≈ 1e-7 fp32).
+
+## Results
+
+Environment: 4-core x86-64 CPU, 15 GiB RAM, stock ONNX Runtime 1.27.0 (CPU EP),
+`ORT_ENABLE_ALL`, 5 warmup + 20 timed iterations. Latency = mean ms/`Run`.
+
+### Candidate A — SwiGLU, CPU
+
+**float32**
+
+| case         |    T |     F | unfused ms | quickgelu ms | fused_lb ms | unfused/lb | qg/lb |
+|--------------|-----:|------:|-----------:|-------------:|------------:|-----------:|------:|
+| small        |  512 |  2048 |     0.4642 |       0.4673 |      0.2351 |      1.97x | 1.99x |
+| mixtral-ffn  | 1024 | 14336 |    10.8825 |      10.9013 |      6.1769 |      1.76x | 1.76x |
+| deepseek-ffn | 2048 |  1408 |     1.8996 |       1.9792 |      0.8079 |      2.35x | 2.45x |
+| wide         | 1024 |  8192 |     5.9711 |       6.0188 |      3.4434 |      1.73x | 1.75x |
+| many-tokens  | 8192 |  4096 |    25.4093 |      25.3144 |     14.5151 |      1.75x | 1.74x |
+
+**float16**
+
+| case         | unfused ms | quickgelu ms | fused_lb ms | unfused/lb | qg/lb |
+|--------------|-----------:|-------------:|------------:|-----------:|------:|
+| small        |     1.0048 |       0.7839 |      0.5676 |      1.77x | 1.38x |
+| mixtral-ffn  |    28.1380 |      21.6397 |     16.9777 |      1.66x | 1.27x |
+| deepseek-ffn |     4.3555 |       2.8420 |      2.2594 |      1.93x | 1.26x |
+| wide         |    15.1434 |      11.5234 |      9.5571 |      1.58x | 1.21x |
+| many-tokens  |    63.7327 |      47.9868 |     38.1889 |      1.67x | 1.26x |
+
+### Candidate B — Router, CPU
+
+**float32**
+
+| case          |    M |   E | k | naive ms | fused ms | speedup | max rel err |
+|---------------|-----:|----:|--:|---------:|---------:|--------:|------------:|
+| mixtral       | 4096 |   8 | 2 |   0.3869 |   0.3280 |   1.18x |   1.2e-07   |
+| deepseek      | 4096 |  64 | 6 |   1.2939 |   1.1491 |   1.13x |   1.1e-07   |
+| switch-many   | 4096 | 128 | 1 |   0.5844 |   0.3433 |   1.70x |   0.0       |
+| large-experts | 8192 | 256 | 8 |   5.6638 |   4.7160 |   1.20x |   1.4e-07   |
+| small-batch   |  512 |  32 | 4 |   0.1277 |   0.1195 |   1.07x |   7.4e-08   |
+
+**float16**
+
+| case          | naive ms | fused ms | speedup |
+|---------------|---------:|---------:|--------:|
+| mixtral       |   0.5716 |   0.4939 |   1.16x |
+| deepseek      |   1.3857 |   1.2248 |   1.13x |
+| switch-many   |   0.7896 |   0.4152 |   1.90x |
+| large-experts |   6.3966 |   5.0442 |   1.27x |
+| small-batch   |   0.1820 |   0.1624 |   1.12x |
+
+Raw CSVs: `results_moe_fusions_cpu_fp32.csv`, `results_moe_fusions_cpu_fp16.csv`.
+
+## Conclusions
+
+- **SwiGLU fusion is the bigger lever.** Collapsing `Sigmoid+Mul+Mul` to a single fused pass
+  is worth **~1.6–2.4×** on the gated-activation cluster on CPU, and that cluster operates on
+  the layer's largest `[T, F]` tensors — so the absolute time saved is substantial
+  (e.g. mixtral-ffn: ~10.9 → ~6.2 ms). Folding the activation into the GroupedMatMul epilogue
+  (so the `[T, F]` activations never round-trip to memory) would capture at least this much and
+  likely more. The `fused_lb` column is a conservative lower bound (single `Mul`), so a real
+  fused SiLU-gate kernel lands between `quickgelu` and `fused_lb`.
+- **`QuickGelu` already recovers part of the win in fp16** (SiLU in one op: ~1.2–1.4× over the
+  naive 3-op form), but in fp32 the ORT CPU EP already runs the 3-op form about as fast as the
+  2-op form — the remaining gap to `fused_lb` is the memory-traffic headroom, which only a true
+  gate-fusion (one pass) closes.
+- **Router fusion is a smaller, cheaper win: ~1.1–1.3×** in the typical few-expert case, rising
+  to **~1.7–1.9×** for the single-expert / many-expert `switch-many` case where skipping the
+  full `[M, E]` softmax matters most. It is numerically identical to the standard renormalized
+  top-k router (max rel err ≈ 1e-7 fp32). Because the tensors are tiny, most of the benefit is
+  from removing kernel launches and the `[M, E]` intermediate — expected to matter more on GPU
+  (launch-latency-bound) than the modest CPU numbers here suggest.
+- **Priority order confirmed:** SwiGLU/gated-activation fusion first (largest absolute saving,
+  operates on the biggest tensors), router `Softmax+TopK` fusion second (cheap to implement,
+  best on GPU / high-expert-count configs).
+- **CUDA** was not measured (no GPU in this environment); the harness supports `--providers
+  cuda`. The relative wins should grow on GPU, where both clusters are bandwidth-/launch-bound.
