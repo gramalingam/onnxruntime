@@ -35,8 +35,7 @@ Status GroupedMatMul<T>::ComputeInternal(OpKernelContext* context) const {
   const Tensor* input = context->Input<Tensor>(0);
   const Tensor* weights = context->Input<Tensor>(1);
   const Tensor* group_indices = context->Input<Tensor>(2);
-  const Tensor* combine_weights = context->Input<Tensor>(3);
-  const Tensor* bias = context->Input<Tensor>(4);
+  const Tensor* bias = context->Input<Tensor>(3);
 
   const auto& input_shape = input->Shape();
   const auto& weights_shape = weights->Shape();
@@ -63,24 +62,16 @@ Status GroupedMatMul<T>::ComputeInternal(OpKernelContext* context) const {
   const int64_t k = indices_shape[1];
   const int64_t num_selections = M * k;
 
-  const bool has_combine = combine_weights != nullptr;
-  if (has_combine) {
-    ORT_RETURN_IF_NOT(combine_weights->Shape() == indices_shape,
-                      "GroupedMatMul: combine_weights must have the same shape as group_indices (M, k).");
-  }
-
   if (bias != nullptr) {
     const auto& bias_shape = bias->Shape();
     ORT_RETURN_IF_NOT(bias_shape.NumDimensions() == 2 && bias_shape[0] == num_groups && bias_shape[1] == N,
                       "GroupedMatMul: bias must have shape (num_groups, N) = (", num_groups, ", ", N, ").");
   }
 
-  // Output shape: (M, N) when combining over k, otherwise (M, k, N).
+  // Output shape is always (M, k, N): the per-expert results.
   TensorShapeVector output_dims;
   output_dims.push_back(M);
-  if (!has_combine) {
-    output_dims.push_back(k);
-  }
+  output_dims.push_back(k);
   output_dims.push_back(N);
   Tensor* output = context->Output(0, TensorShape(output_dims));
 
@@ -176,21 +167,10 @@ Status GroupedMatMul<T>::ComputeInternal(OpKernelContext* context) const {
 
   const CudaT* bias_data = bias ? reinterpret_cast<const CudaT*>(bias->Data<T>()) : nullptr;
 
-  if (has_combine) {
-    // Scatter per-expert results (with bias) into selection order [M, k, N], then reduce over
-    // the k selected experts with the combine weights into the [M, N] output.
-    auto per_expert = GetScratchBuffer<CudaT>(static_cast<size_t>(num_selections * N), context->GetComputeStream());
-    LaunchGroupedMatMulScatter<CudaT>(stream, permuted_output.get(), row_map.get(), group_ids.get(),
-                                      bias_data, per_expert.get(), num_selections, N);
-    LaunchGroupedMatMulCombine<CudaT>(stream, per_expert.get(),
-                                      reinterpret_cast<const CudaT*>(combine_weights->Data<T>()),
-                                      reinterpret_cast<CudaT*>(output->MutableData<T>()), M, k, N);
-  } else {
-    // Scatter per-expert results (with bias) directly into the [M, k, N] output.
-    LaunchGroupedMatMulScatter<CudaT>(stream, permuted_output.get(), row_map.get(), group_ids.get(),
-                                      bias_data, reinterpret_cast<CudaT*>(output->MutableData<T>()),
-                                      num_selections, N);
-  }
+  // Scatter per-expert results (with bias) directly into the [M, k, N] output.
+  LaunchGroupedMatMulScatter<CudaT>(stream, permuted_output.get(), row_map.get(), group_ids.get(),
+                                    bias_data, reinterpret_cast<CudaT*>(output->MutableData<T>()),
+                                    num_selections, N);
 
   return Status::OK();
 }

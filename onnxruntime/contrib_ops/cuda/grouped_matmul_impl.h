@@ -26,13 +26,6 @@ void LaunchGroupedMatMulScatter(cudaStream_t stream, const T* permuted, const in
                                 const int64_t* group_ids, const T* bias, T* result,
                                 int64_t num_selections, int64_t N);
 
-// Reduces the per-expert results [M, k, N] into the combined output [M, N] using the
-// per-selection combine weights [M, k]:
-//   output[i, n] = sum_j combine_weights[i, j] * per_expert[i, j, n]
-template <typename T>
-void LaunchGroupedMatMulCombine(cudaStream_t stream, const T* per_expert, const T* combine_weights,
-                                T* output, int64_t M, int64_t k, int64_t N);
-
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime

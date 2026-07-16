@@ -46,26 +46,6 @@ __global__ void GroupedMatMulScatterKernel(const T* permuted, const int64_t* row
   result[row_map[p] * N + n] = value;
 }
 
-// Combine: output[i * N + n] = sum_j combine_weights[i * k + j] * per_expert[(i * k + j) * N + n]
-template <typename T>
-__global__ void GroupedMatMulCombineKernel(const T* per_expert, const T* combine_weights,
-                                           T* output, int64_t M, int64_t k, int64_t N) {
-  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = M * N;
-  if (idx >= total) {
-    return;
-  }
-  const int64_t i = idx / N;
-  const int64_t n = idx % N;
-  float acc = 0.0f;
-  for (int64_t j = 0; j < k; ++j) {
-    const int64_t sel = i * k + j;
-    acc += static_cast<float>(combine_weights[sel]) *
-           static_cast<float>(per_expert[sel * N + n]);
-  }
-  output[idx] = static_cast<T>(acc);
-}
-
 template <typename T>
 void LaunchGroupedMatMulGather(cudaStream_t stream, const T* input, const int64_t* row_map,
                                T* permuted, int64_t num_selections, int64_t K, int64_t k) {
@@ -93,26 +73,11 @@ void LaunchGroupedMatMulScatter(cudaStream_t stream, const T* permuted, const in
       permuted, row_map, group_ids, bias, result, num_selections, N);
 }
 
-template <typename T>
-void LaunchGroupedMatMulCombine(cudaStream_t stream, const T* per_expert, const T* combine_weights,
-                                T* output, int64_t M, int64_t k, int64_t N) {
-  const int64_t total = M * N;
-  if (total == 0) {
-    return;
-  }
-  constexpr int kThreadsPerBlock = GridDim::maxThreadsPerBlock;
-  const int blocks = static_cast<int>((total + kThreadsPerBlock - 1) / kThreadsPerBlock);
-  GroupedMatMulCombineKernel<T><<<blocks, kThreadsPerBlock, 0, stream>>>(
-      per_expert, combine_weights, output, M, k, N);
-}
-
 #define INSTANTIATE_GROUPED_MATMUL_LAUNCHERS(T)                                                   \
   template void LaunchGroupedMatMulGather<T>(cudaStream_t, const T*, const int64_t*, T*,          \
                                              int64_t, int64_t, int64_t);                          \
   template void LaunchGroupedMatMulScatter<T>(cudaStream_t, const T*, const int64_t*,             \
-                                              const int64_t*, const T*, T*, int64_t, int64_t);    \
-  template void LaunchGroupedMatMulCombine<T>(cudaStream_t, const T*, const T*, T*,               \
-                                              int64_t, int64_t, int64_t);
+                                              const int64_t*, const T*, T*, int64_t, int64_t);
 
 INSTANTIATE_GROUPED_MATMUL_LAUNCHERS(float)
 INSTANTIATE_GROUPED_MATMUL_LAUNCHERS(half)

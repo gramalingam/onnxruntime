@@ -9,9 +9,8 @@ namespace onnxruntime {
 namespace contrib {
 
 // GroupedMatMul: each token (row of `input`) is multiplied by k weight matrices selected
-// from a stack of `num_groups` matrices via `group_indices` (shape [M, k]). When optional
-// `combine_weights` is provided, the k results are combined into a weighted sum. See
-// docs/GroupedMatMul.md for the full specification.
+// from a stack of `num_groups` matrices via `group_indices` (shape [M, k]), producing the
+// per-expert results (shape [M, k, N]). See docs/GroupedMatMul.md for the full specification.
 template <typename T>
 class GroupedMatMul final : public OpKernel {
  public:

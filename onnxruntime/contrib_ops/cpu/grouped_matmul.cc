@@ -44,8 +44,7 @@ Status GroupedMatMul<T>::Compute(OpKernelContext* context) const {
   const Tensor* input = context->Input<Tensor>(0);
   const Tensor* weights = context->Input<Tensor>(1);
   const Tensor* group_indices = context->Input<Tensor>(2);
-  const Tensor* combine_weights = context->Input<Tensor>(3);
-  const Tensor* bias = context->Input<Tensor>(4);
+  const Tensor* bias = context->Input<Tensor>(3);
 
   const auto& input_shape = input->Shape();
   const auto& weights_shape = weights->Shape();
@@ -72,24 +71,16 @@ Status GroupedMatMul<T>::Compute(OpKernelContext* context) const {
   const int64_t k = indices_shape[1];
   const int64_t num_selections = M * k;
 
-  const bool has_combine = combine_weights != nullptr;
-  if (has_combine) {
-    ORT_RETURN_IF_NOT(combine_weights->Shape() == indices_shape,
-                      "GroupedMatMul: combine_weights must have the same shape as group_indices (M, k).");
-  }
-
   if (bias != nullptr) {
     const auto& bias_shape = bias->Shape();
     ORT_RETURN_IF_NOT(bias_shape.NumDimensions() == 2 && bias_shape[0] == num_groups && bias_shape[1] == N,
                       "GroupedMatMul: bias must have shape (num_groups, N) = (", num_groups, ", ", N, ").");
   }
 
-  // Output shape: (M, N) when combining over k, otherwise (M, k, N).
+  // Output shape is always (M, k, N): the per-expert results.
   TensorShapeVector output_dims;
   output_dims.push_back(M);
-  if (!has_combine) {
-    output_dims.push_back(k);
-  }
+  output_dims.push_back(k);
   output_dims.push_back(N);
   Tensor* output = context->Output(0, TensorShape(output_dims));
 
@@ -139,18 +130,6 @@ Status GroupedMatMul<T>::Compute(OpKernelContext* context) const {
     }
   }
 
-  const float* combine_float = nullptr;
-  IAllocatorUniquePtr<float> combine_float_buffer;
-  if (has_combine) {
-    if constexpr (std::is_same_v<T, float>) {
-      combine_float = combine_weights->Data<float>();
-    } else {
-      combine_float_buffer = IAllocator::MakeUniquePtr<float>(allocator, static_cast<size_t>(num_selections));
-      ToFloat<T>(combine_weights->Data<T>(), combine_float_buffer.get(), static_cast<size_t>(num_selections));
-      combine_float = combine_float_buffer.get();
-    }
-  }
-
   float* output_float;
   IAllocatorUniquePtr<float> output_float_buffer;
   if constexpr (std::is_same_v<T, float>) {
@@ -158,12 +137,6 @@ Status GroupedMatMul<T>::Compute(OpKernelContext* context) const {
   } else {
     output_float_buffer = IAllocator::MakeUniquePtr<float>(allocator, output_count);
     output_float = output_float_buffer.get();
-  }
-
-  // When combining, results from the k selected experts accumulate into the same output row,
-  // so the output buffer must start zeroed.
-  if (has_combine) {
-    std::fill(output_float, output_float + output_count, 0.0f);
   }
 
   // Bucket selections by group id. A "selection" is a (token, expert-slot) pair p in
@@ -211,28 +184,18 @@ Status GroupedMatMul<T>::Compute(OpKernelContext* context) const {
              1.0f, gathered, static_cast<size_t>(K), weight_g, static_cast<size_t>(N),
              0.0f, result, static_cast<size_t>(N), tp, nullptr);
 
-    // Add bias (if any) and either scatter each row to its (token, slot) output position
-    // (no combine) or accumulate the combine-weighted result into the token output row.
+    // Add bias (if any) and scatter each row to its (token, slot) output position.
     const float* bias_g = bias_float ? (bias_float + g * N) : nullptr;
     for (int64_t r = 0; r < count; ++r) {
       const int64_t p = sels[static_cast<size_t>(r)];
       const float* res_row = result + r * N;
-      if (has_combine) {
-        const float w = combine_float[p];
-        float* dst = output_float + (p / k) * N;
+      float* dst = output_float + p * N;  // output layout is [M, k, N], row index = p.
+      if (bias_g) {
         for (int64_t j = 0; j < N; ++j) {
-          const float v = bias_g ? (res_row[j] + bias_g[j]) : res_row[j];
-          dst[j] += w * v;
+          dst[j] = res_row[j] + bias_g[j];
         }
       } else {
-        float* dst = output_float + p * N;  // output layout is [M, k, N], row index = p.
-        if (bias_g) {
-          for (int64_t j = 0; j < N; ++j) {
-            dst[j] = res_row[j] + bias_g[j];
-          }
-        } else {
-          std::copy(res_row, res_row + N, dst);
-        }
+        std::copy(res_row, res_row + N, dst);
       }
     }
   }
