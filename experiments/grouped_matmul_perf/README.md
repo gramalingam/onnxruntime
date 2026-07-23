@@ -234,3 +234,75 @@ Raw CSVs: `results_moe_fusions_cpu_fp32.csv`, `results_moe_fusions_cpu_fp16.csv`
   best on GPU / high-expert-count configs).
 - **CUDA** was not measured (no GPU in this environment); the harness supports `--providers
   cuda`. The relative wins should grow on GPU, where both clusters are bandwidth-/launch-bound.
+
+---
+
+# MoE layer: fused `com.microsoft.MoE` vs. `GroupedMatMul`-based expansion
+
+`benchmark_moe_vs_grouped.py` implements a full standard top-k MoE feed-forward layer **two
+ways** and times them against each other, to quantify the perf gap between the complex
+all-in-one MoE fusion and the simpler `GroupedMatMul`-based decomposition:
+
+- **FUSED** — a single `com.microsoft.MoE` node (routing + both grouped GEMMs + activation +
+  router-weighted combine in one kernel).
+- **EXPANDED** — the `docs/GroupedMatMul.md` "Typical MoE usage" recipe:
+  `router (Softmax+TopK | RouterTopK)` → `GroupedMatMul` (FC1) → activation →
+  `GroupedMatMul` (FC2) → `Mul` + `ReduceSum` router-weighted combine.
+
+## How to run
+
+```bash
+# Requires an ORT build from this branch (has GroupedMatMul / SwiGLU / RouterTopK).
+# Run from OUTSIDE the repo root so the local onnxruntime/ source doesn't shadow the package.
+python benchmark_moe_vs_grouped.py --providers cpu --csv results_moe_vs_grouped_cpu_fp32.csv
+python benchmark_moe_vs_grouped.py --swiglu-impl fused-op        # expanded side uses com.microsoft.SwiGLU
+python benchmark_moe_vs_grouped.py --router-impl routertopk      # expanded router uses com.microsoft.RouterTopK
+python benchmark_moe_vs_grouped.py --providers cuda --dtype float16   # on a GPU host
+```
+
+The harness builds one FUSED and one EXPANDED model per case, warms up, times `iters` runs,
+and reports mean latency, `expanded/fused` speedup, and the **max relative error** between the
+two outputs (a correctness cross-check; the two are numerically equivalent).
+
+## Correctness (why the two agree)
+
+- `com.microsoft.MoE` takes **router logits** in `router_probs` and softmaxes internally, so
+  both graphs are fed the same logits.
+- `normalize_routing_weights=1` renormalizes the top-k weights — identical to `RouterTopK`
+  (softmax over the top-k logits) and to `Softmax → TopK → Div-by-sum`. The harness keeps the
+  fused and expanded routers consistent (and forces `normalize=1` when `--router-impl
+  routertopk`).
+- **Weight layout is transposed between the two ops** and the harness handles it: MoE
+  `fc1_experts_weights` `(E, fc1_out, hidden)` (applied `x @ W.T`) vs. GroupedMatMul `weights`
+  `(E, hidden, fc1_out)` (applied `x @ W`); similarly for FC2. One shared set of expert weights
+  is generated and the transposed variant fed to whichever graph needs it.
+- The `_rel_err` cross-check has been validated offline against a NumPy reference of the
+  expanded graph: it matches the fused MoE CPU kernel to **~1e-7 (fp32)** for `silu`, `gelu`,
+  and `swiglu`, with and without bias and renormalization.
+
+## SwiGLU handling (which form each run uses)
+
+SwiGLU cases exercise the CPU-supported **interleaved** layout (`swiglu_fusion=1`): the FC1
+output is `2 * inter_size` wide with rows laid out `[gate0, linear0, gate1, linear1, …]`, and
+the activation is `gate * sigmoid(alpha * gate) * (linear + beta)`.
+
+- The **FUSED** side always uses the MoE op's built-in SwiGLU (`swiglu_fusion=1`).
+- The **EXPANDED** side's SwiGLU form is selected with `--swiglu-impl`:
+  - `expanded` (default): the standard `Sigmoid + Mul + Mul` graph on the de-interleaved
+    gate/linear tensors — the **"expanded form of SwiGLU"**.
+  - `fused-op`: the new fused `com.microsoft.SwiGLU` op — the **"proposed SwiGLU fused op"**.
+
+Every run prints the active `swiglu-impl` and `router-impl` in the report header and records
+them in the CSV, so it is always unambiguous which SwiGLU form produced a given number.
+
+## Device / dtype note
+
+**CPU is float32-only** for this comparison: the fused `MoE` fp16 CPU kernel is compiled but
+not registered, so an fp16 MoE node has no CPU kernel. `GroupedMatMul` / `SwiGLU` / `RouterTopK`
+do have fp16 CPU kernels, but since the fused side can't run fp16 on CPU the default CPU dtype
+is float32. `--dtype float16` is intended for the CUDA path (MoE has fp16/bf16 CUDA kernels).
+
+## Results
+
+Not yet collected in this environment (no branch build present here yet). Run the commands
+above once an ORT build from this branch is available; `--csv` writes the raw numbers.
