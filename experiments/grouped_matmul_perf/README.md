@@ -302,6 +302,12 @@ serialization, so `--mem-budget-gb` remains the single knob to tune per box; the
 is a conservative fit for a ~15 GiB box (peak ≈ 2× budget) and lets the previously-crashing
 `decode-silu` / `mixtral-silu` (3.5 GiB) cases run.
 
+The external-data side files are written per case into a fresh `tempfile.mkdtemp()` directory
+(the model plus one `.bin` per weight tensor) and the whole directory is removed in a
+`try/finally` after that model is timed, so no multi-GiB scratch files are left behind — but the
+run does need free space in the system temp location equal to one weight layout while a case
+runs. Set `TMP`/`TMPDIR` to a roomy volume if the default temp drive is small.
+
 ## Correctness (why the two agree)
 
 - `com.microsoft.MoE` takes **router logits** in `router_probs` and softmaxes internally, so
