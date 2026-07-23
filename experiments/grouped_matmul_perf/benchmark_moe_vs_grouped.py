@@ -69,7 +69,10 @@ two layouts are large and identical in size regardless of M -- e.g. a Mixtral-sw
 ~5.25 GiB per layout in fp32. To fit modest boxes this harness (1) builds and times the fused
 model to completion, frees it, then builds and times the expanded model, so only ONE weight
 layout is resident at a time, and (2) applies ``--mem-budget-gb``: any case whose single-layout
-weight footprint exceeds the budget is reported as ``OOM-skip`` instead of crashing.
+weight footprint exceeds the budget is reported as ``OOM-skip`` instead of crashing. Because
+these multi-GiB layouts exceed protobuf's ~2 GiB single-message limit, each model is serialized
+with ONNX external data (weights in a side file) and the session is created from that file path;
+``model.SerializeToString()`` would otherwise raise on the >=2 GiB cases.
 
 Usage
 -----
@@ -84,6 +87,7 @@ Usage
 import argparse
 import json
 import os
+import shutil
 import tempfile
 import time
 
@@ -151,16 +155,36 @@ def _const(name, np_array):
     )
 
 
-def _raw_const(name, np_array):
-    """Large constant baked as raw bytes. ``tolist()`` on billion-element weight tensors is
-    pathologically slow, so weights go straight to ``raw_data`` via ``tobytes()``."""
-    return helper.make_tensor(
-        name=name,
-        data_type=onnx.helper.np_dtype_to_tensor_dtype(np_array.dtype),
-        dims=np_array.shape,
-        vals=np_array.tobytes(),
-        raw=True,
-    )
+def _raw_const(name, np_array, ext_dir):
+    """Large constant stored as ONNX **external data** -- never baked into the proto.
+
+    A single expert-weight tensor for a full MoE layer can exceed protobuf's hard ~2 GiB
+    per-message limit (e.g. a swiglu fc1 of shape (E, K, 2F)). Baking it as ``raw_data`` makes
+    ``make_tensor(raw=True)`` / ``graph.initializer.extend`` / ``SerializeToString`` raise
+    ``google.protobuf.message.EncodeError``. Instead we write the bytes to ``ext_dir/<name>.bin``
+    and reference them from a tiny ``EXTERNAL`` TensorProto, so the ModelProto stays small and ORT
+    memory-maps the weights. The model MUST be saved into ``ext_dir`` for the relative location to
+    resolve. ``tolist()`` on billion-element tensors is pathologically slow, so we use raw bytes.
+    """
+    contiguous = np.ascontiguousarray(np_array)
+    rel_location = f"{name}.bin"
+    with open(os.path.join(ext_dir, rel_location), "wb") as data_file:
+        data_file.write(contiguous.tobytes())
+
+    tensor = TensorProto()
+    tensor.name = name
+    tensor.data_type = onnx.helper.np_dtype_to_tensor_dtype(contiguous.dtype)
+    tensor.dims.extend(contiguous.shape)
+    tensor.data_location = TensorProto.EXTERNAL
+    # Populate external_data entries directly: onnx.set_external_data() requires a pre-existing
+    # raw_data field, which we deliberately never create (that is the whole point -- keep the
+    # bytes out of the proto).
+    for key, value in (("location", rel_location), ("offset", "0"),
+                       ("length", str(contiguous.nbytes))):
+        entry = tensor.external_data.add()
+        entry.key = key
+        entry.value = value
+    return tensor
 
 
 def _make_model(nodes, inputs, outputs, initializers, opsets=None):
@@ -220,7 +244,7 @@ def weight_bytes(K, F, E, activation, itemsize):
 
 def build_fused_moe_model(M, K, F, E, k, activation, elem_type, np_dtype,
                           fc1_w, fc2_w, fc1_b, fc2_b,
-                          normalize, activation_alpha, activation_beta, swiglu_limit):
+                          normalize, activation_alpha, activation_beta, swiglu_limit, ext_dir):
     is_swiglu = activation == "swiglu"
     fc1_out = _fc1_out(F, activation)
     inputs = [
@@ -228,19 +252,19 @@ def build_fused_moe_model(M, K, F, E, k, activation, elem_type, np_dtype,
         helper.make_tensor_value_info("router_logits", elem_type, [M, E]),
     ]
     initializers = [
-        _raw_const("fc1_experts_weights", fc1_w),
-        _raw_const("fc2_experts_weights", fc2_w),
+        _raw_const("fc1_experts_weights", fc1_w, ext_dir),
+        _raw_const("fc2_experts_weights", fc2_w, ext_dir),
     ]
 
     node_inputs = ["input", "router_logits", "fc1_experts_weights"]
     if fc1_b is not None:
-        initializers.append(_raw_const("fc1_experts_bias", fc1_b))
+        initializers.append(_raw_const("fc1_experts_bias", fc1_b, ext_dir))
         node_inputs.append("fc1_experts_bias")
     else:
         node_inputs.append("")  # optional fc1_experts_bias absent
     node_inputs.append("fc2_experts_weights")
     if fc2_b is not None:
-        initializers.append(_raw_const("fc2_experts_bias", fc2_b))
+        initializers.append(_raw_const("fc2_experts_bias", fc2_b, ext_dir))
         node_inputs.append("fc2_experts_bias")
 
     attrs = dict(
@@ -379,7 +403,7 @@ def _swiglu_nodes(swiglu_impl, gate_name, linear_name, out_name, np_dtype,
 def build_expanded_model(M, K, F, E, k, activation, elem_type, np_dtype,
                          fc1_w, fc2_w, fc1_b, fc2_b,
                          normalize, router_impl, swiglu_impl,
-                         activation_alpha, activation_beta, swiglu_limit):
+                         activation_alpha, activation_beta, swiglu_limit, ext_dir):
     is_swiglu = activation == "swiglu"
     fc1_out = _fc1_out(F, activation)
 
@@ -388,8 +412,8 @@ def build_expanded_model(M, K, F, E, k, activation, elem_type, np_dtype,
         helper.make_tensor_value_info("router_logits", elem_type, [M, E]),
     ]
     initializers = [
-        _raw_const("fc1_gmm_weights", fc1_w),  # (E, K, fc1_out)
-        _raw_const("fc2_gmm_weights", fc2_w),  # (E, F, K)
+        _raw_const("fc1_gmm_weights", fc1_w, ext_dir),  # (E, K, fc1_out)
+        _raw_const("fc2_gmm_weights", fc2_w, ext_dir),  # (E, F, K)
         _const("shape_Mk_F", np.array([M * k, F], dtype=np.int64)),
         _const("shape_Mk_1", np.array([M * k, 1], dtype=np.int64)),
         _const("shape_M_k_K", np.array([M, k, K], dtype=np.int64)),
@@ -397,9 +421,9 @@ def build_expanded_model(M, K, F, E, k, activation, elem_type, np_dtype,
         _const("neg1", np.array([-1], dtype=np.int64)),
     ]
     if fc1_b is not None:
-        initializers.append(_raw_const("fc1_gmm_bias", fc1_b))
+        initializers.append(_raw_const("fc1_gmm_bias", fc1_b, ext_dir))
     if fc2_b is not None:
-        initializers.append(_raw_const("fc2_gmm_bias", fc2_b))
+        initializers.append(_raw_const("fc2_gmm_bias", fc2_b, ext_dir))
     nodes = []
 
     # --- Router: produce val [M,k] and idx [M,k] int64 ---
@@ -483,9 +507,9 @@ def _session_options(intra_op_threads, profile_prefix=None):
     return so
 
 
-def time_model(model_bytes, feeds, provider, warmup, iters, intra_op_threads):
+def time_model(model_source, feeds, provider, warmup, iters, intra_op_threads):
     so = _session_options(intra_op_threads)
-    sess = ort.InferenceSession(model_bytes, so, providers=_provider_list(provider))
+    sess = ort.InferenceSession(model_source, so, providers=_provider_list(provider))
     if provider == "cuda" and "CUDAExecutionProvider" not in sess.get_providers():
         raise RuntimeError("CUDAExecutionProvider not available in this ORT build")
     out_names = [o.name for o in sess.get_outputs()]
@@ -500,7 +524,7 @@ def time_model(model_bytes, feeds, provider, warmup, iters, intra_op_threads):
     return np.array(times), result[0]
 
 
-def profile_breakdown(model_bytes, feeds, provider, warmup, iters, intra_op_threads):
+def profile_breakdown(model_source, feeds, provider, warmup, iters, intra_op_threads):
     """Run with ORT profiling on and aggregate per-op-type kernel time (microseconds).
 
     Returns a list of (op_type, count, total_us) sorted by total_us descending, which attributes
@@ -508,7 +532,7 @@ def profile_breakdown(model_bytes, feeds, provider, warmup, iters, intra_op_thre
     """
     so = _session_options(intra_op_threads, profile_prefix=os.path.join(
         tempfile.gettempdir(), "ort_moe_prof"))
-    sess = ort.InferenceSession(model_bytes, so, providers=_provider_list(provider))
+    sess = ort.InferenceSession(model_source, so, providers=_provider_list(provider))
     out_names = [o.name for o in sess.get_outputs()]
     for _ in range(max(1, warmup)):
         sess.run(out_names, feeds)
@@ -560,40 +584,53 @@ def run_one_model(kind, M, K, F, E, k, activation, elem_type, np_dtype,
     transposed) here and released before the session is created so that the MoE-layout and
     GroupedMatMul-layout copies are never resident simultaneously.
     """
-    moe = make_moe_weights(K, F, E, activation, np_dtype, with_bias)
-    fc1_b = moe.get("fc1_b")
-    fc2_b = moe.get("fc2_b")
+    # Expert weights are written directly to ONNX external data files (see _raw_const): a single
+    # MoE weight tensor can exceed protobuf's hard ~2 GiB per-message limit, so baking it into the
+    # proto would raise google.protobuf.message.EncodeError at graph-build / serialize time. The
+    # weights must live in the same directory as the model file for their relative locations to
+    # resolve, so the temp dir is created up front and passed into the builders.
+    tmp_dir = tempfile.mkdtemp(prefix="ort_moe_model_")
+    try:
+        moe = make_moe_weights(K, F, E, activation, np_dtype, with_bias)
+        fc1_b = moe.get("fc1_b")
+        fc2_b = moe.get("fc2_b")
 
-    if kind == "fused":
-        model = build_fused_moe_model(
-            M, K, F, E, k, activation, elem_type, np_dtype,
-            moe["fc1"], moe["fc2"], fc1_b, fc2_b,
-            normalize, args.activation_alpha, args.activation_beta, args.swiglu_limit)
-        del moe
-    else:
-        # MoE applies x @ W.T (weights (E,out,in)); GroupedMatMul applies x @ W (weights
-        # (E,in,out)). Transposing the last two axes makes GroupedMatMul compute the identical
-        # linear map, so the two graphs are numerically comparable.
-        fc1_t = np.ascontiguousarray(np.swapaxes(moe["fc1"], 1, 2))
-        fc2_t = np.ascontiguousarray(np.swapaxes(moe["fc2"], 1, 2))
-        del moe  # free the MoE-layout source before building the (transposed) proto
-        model = build_expanded_model(
-            M, K, F, E, k, activation, elem_type, np_dtype,
-            fc1_t, fc2_t, fc1_b, fc2_b,
-            normalize, args.router_impl, args.swiglu_impl,
-            args.activation_alpha, args.activation_beta, args.swiglu_limit)
-        del fc1_t, fc2_t
+        if kind == "fused":
+            model = build_fused_moe_model(
+                M, K, F, E, k, activation, elem_type, np_dtype,
+                moe["fc1"], moe["fc2"], fc1_b, fc2_b,
+                normalize, args.activation_alpha, args.activation_beta, args.swiglu_limit,
+                tmp_dir)
+            del moe
+        else:
+            # MoE applies x @ W.T (weights (E,out,in)); GroupedMatMul applies x @ W (weights
+            # (E,in,out)). Transposing the last two axes makes GroupedMatMul compute the identical
+            # linear map, so the two graphs are numerically comparable.
+            fc1_t = np.ascontiguousarray(np.swapaxes(moe["fc1"], 1, 2))
+            fc2_t = np.ascontiguousarray(np.swapaxes(moe["fc2"], 1, 2))
+            del moe  # free the MoE-layout source before building the (transposed) proto
+            model = build_expanded_model(
+                M, K, F, E, k, activation, elem_type, np_dtype,
+                fc1_t, fc2_t, fc1_b, fc2_b,
+                normalize, args.router_impl, args.swiglu_impl,
+                args.activation_alpha, args.activation_beta, args.swiglu_limit,
+                tmp_dir)
+            del fc1_t, fc2_t
 
-    model_bytes = model.SerializeToString()
-    del model  # the serialized bytes are all the session needs
+        # Weights are already external; a plain save writes only the (small) ModelProto, whose
+        # initializers reference the side files written into tmp_dir by _raw_const.
+        model_path = os.path.join(tmp_dir, "model.onnx")
+        onnx.save_model(model, model_path)
+        del model  # the on-disk model + external data files are all the session needs
 
-    times, out = time_model(model_bytes, feeds, provider, args.warmup, args.iters,
-                            args.intra_op_threads)
-    breakdown = None
-    if args.profile:
-        breakdown = profile_breakdown(model_bytes, feeds, provider, args.warmup, args.iters,
-                                      args.intra_op_threads)
-    del model_bytes
+        times, out = time_model(model_path, feeds, provider, args.warmup, args.iters,
+                                args.intra_op_threads)
+        breakdown = None
+        if args.profile:
+            breakdown = profile_breakdown(model_path, feeds, provider, args.warmup, args.iters,
+                                          args.intra_op_threads)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     return times, out, breakdown
 
 
