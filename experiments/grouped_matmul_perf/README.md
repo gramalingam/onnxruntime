@@ -294,6 +294,14 @@ single-layout weight footprint exceeds the budget is reported as `OOM-skip`. Pea
 2× the budget per model. With the default budget the `mixtral-swiglu` / `decode-swiglu` cases
 (~5.25 GiB) OOM-skip; raise `--mem-budget-gb` on a larger box to include them.
 
+These multi-GiB weight layouts exceed protobuf's hard ~2 GiB single-message limit, so each model
+is serialized with **ONNX external data** (weights in a side file) and the session is created
+from that file path — `model.SerializeToString()` would otherwise raise on the ≥2 GiB cases (all
+decode cases, both mixtral, `switch-top1`). With external data the real limiter is host RAM, not
+serialization, so `--mem-budget-gb` remains the single knob to tune per box; the default of 4 GiB
+is a conservative fit for a ~15 GiB box (peak ≈ 2× budget) and lets the previously-crashing
+`decode-silu` / `mixtral-silu` (3.5 GiB) cases run.
+
 ## Correctness (why the two agree)
 
 - `com.microsoft.MoE` takes **router logits** in `router_probs` and softmaxes internally, so
@@ -327,6 +335,12 @@ the activation is `gate * sigmoid(alpha * gate) * (linear + beta)`.
 
 Every run prints the active `swiglu-impl` and `router-impl` in the report header and records
 them in the CSV, so it is always unambiguous which SwiGLU form produced a given number.
+
+> Note: on the expanded side the interleaved FC1 output is de-interleaved with `Reshape` +
+> `Split` + `Squeeze` before the activation. Those ops (and the `Reshape`/`Unsqueeze` around FC2
+> and the combine) show up in the `--profile` per-op breakdown, so part of the expanded-vs-fused
+> gap on SwiGLU cases is this layout bookkeeping rather than GEMM time — read the breakdown with
+> that in mind.
 
 ## Device / dtype note
 
