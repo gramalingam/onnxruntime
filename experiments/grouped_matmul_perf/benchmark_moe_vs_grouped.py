@@ -692,7 +692,7 @@ def run_benchmark(args):
           ". Reported ms are MEDIAN over timed iters.\n")
 
     header = (f"{'case':<20}{'act':<8}{'regime':<20}{'prov':<6}{'M':>6}{'K':>6}{'F':>7}{'E':>5}"
-              f"{'k':>3}{'fused_ms':>11}{'exp_ms':>11}{'fused_x':>9}{'max_relerr':>12}{'ok':>4}")
+              f"{'k':>3}{'fused_ms':>11}{'exp_ms':>11}{'fused_speedup':>14}{'max_relerr':>12}{'ok':>4}")
     print(header)
     print("-" * len(header))
 
@@ -707,7 +707,7 @@ def run_benchmark(args):
         for provider in providers:
             if not fits:
                 print(f"{name:<20}{activation:<8}{regime:<20}{provider:<6}{M:>6}{K:>6}{F:>7}"
-                      f"{E:>5}{k:>3}{'OOM-skip':>11}{'-':>11}{'-':>9}"
+                      f"{E:>5}{k:>3}{'OOM-skip':>11}{'-':>11}{'-':>14}"
                       f"{f'>{args.mem_budget_gb}G ({w_gib:.1f}G)':>12}{'-':>4}")
                 rows.append(dict(
                     case=name, activation=activation, regime=regime, provider=provider,
@@ -737,7 +737,7 @@ def run_benchmark(args):
             speedup_str = f"{speedup:.2f}x" if ok else "DIVERGED"
 
             print(f"{name:<20}{activation:<8}{regime:<20}{provider:<6}{M:>6}{K:>6}{F:>7}{E:>5}"
-                  f"{k:>3}{fused_s['median']:>11.3f}{exp_s['median']:>11.3f}{speedup_str:>9}"
+                  f"{k:>3}{fused_s['median']:>11.3f}{exp_s['median']:>11.3f}{speedup_str:>14}"
                   f"{relerr:>12.2e}{('yes' if ok else 'NO'):>4}")
 
             if args.profile:
