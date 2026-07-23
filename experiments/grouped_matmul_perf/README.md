@@ -257,12 +257,42 @@ all-in-one MoE fusion and the simpler `GroupedMatMul`-based decomposition:
 python benchmark_moe_vs_grouped.py --providers cpu --csv results_moe_vs_grouped_cpu_fp32.csv
 python benchmark_moe_vs_grouped.py --swiglu-impl fused-op        # expanded side uses com.microsoft.SwiGLU
 python benchmark_moe_vs_grouped.py --router-impl routertopk      # expanded router uses com.microsoft.RouterTopK
+python benchmark_moe_vs_grouped.py --profile                     # per-op kernel-time breakdown
+python benchmark_moe_vs_grouped.py --intra-op-threads 1          # single-thread comparison
+python benchmark_moe_vs_grouped.py --mem-budget-gb 8             # allow larger weight footprints
 python benchmark_moe_vs_grouped.py --providers cuda --dtype float16   # on a GPU host
 ```
 
-The harness builds one FUSED and one EXPANDED model per case, warms up, times `iters` runs,
-and reports mean latency, `expanded/fused` speedup, and the **max relative error** between the
-two outputs (a correctness cross-check; the two are numerically equivalent).
+The harness builds one FUSED and one EXPANDED model per case, warms up (`--warmup`, default 5),
+times `--iters` runs (default 30), and reports **median** latency for each side, the
+`expanded/fused` speedup (`fused_x`), and the **max relative error** between the two outputs (a
+hard correctness gate — see below). The CSV additionally records mean/median/min/std for both
+sides, the pinned thread count, and the per-case weight footprint.
+
+## Reading the report
+
+- **`regime`** labels each case: `decode/launch-bound` (M=1 — dominated by dispatch/launch
+  overhead, *not* compute), `decode-batch` (small M), or `prefill/compute`. The M=4096/8192
+  `prefill-*` cases are compute-bound anchors: if the gap shrinks there it is overhead-bound; if
+  it persists the fused GEMM path is fundamentally faster. Anchors grow *activation* memory, not
+  weight memory.
+- **`--profile`** enables ORT profiling and prints a per-op kernel-time breakdown for each side,
+  so the gap can be attributed to a mechanism (op-dispatch overhead vs. intermediate
+  reshape/round-trips vs. GEMM efficiency) instead of a single black-box ratio.
+- **Threads**: the intra-op thread count is pinned with `--intra-op-threads` (default: ORT's
+  automatic count) and printed in the header and CSV, so numbers are reproducible.
+
+## Memory
+
+Expert weights are baked as **raw-bytes ONNX initializers** (production-representative; neither
+the MoE nor the GroupedMatMul CPU kernel implements `PrePack`, so there is no prepack asymmetry).
+The two weight layouts are large and identical in size regardless of M — a Mixtral-swiglu layer
+is ~5.25 GiB per layout in fp32. To fit modest boxes the harness (1) builds+times the fused
+model to completion, frees it, then builds+times the expanded model, so **only one weight layout
+is resident at a time**, and (2) applies `--mem-budget-gb` (default 4): any case whose
+single-layout weight footprint exceeds the budget is reported as `OOM-skip`. Peak RSS is roughly
+2× the budget per model. With the default budget the `mixtral-swiglu` / `decode-swiglu` cases
+(~5.25 GiB) OOM-skip; raise `--mem-budget-gb` on a larger box to include them.
 
 ## Correctness (why the two agree)
 
@@ -276,9 +306,12 @@ two outputs (a correctness cross-check; the two are numerically equivalent).
   `fc1_experts_weights` `(E, fc1_out, hidden)` (applied `x @ W.T`) vs. GroupedMatMul `weights`
   `(E, hidden, fc1_out)` (applied `x @ W`); similarly for FC2. One shared set of expert weights
   is generated and the transposed variant fed to whichever graph needs it.
-- The `_rel_err` cross-check has been validated offline against a NumPy reference of the
-  expanded graph: it matches the fused MoE CPU kernel to **~1e-7 (fp32)** for `silu`, `gelu`,
-  and `swiglu`, with and without bias and renormalization.
+- The `_rel_err` cross-check is a **hard gate**: the default tolerance is `1e-4` (fp32) /
+  `5e-2` (fp16), well above the observed **~1e-7 (fp32)** agreement. `--strict` (default **on**)
+  raises on divergence; `--no-strict` downgrades it to a warning. A divergent run reports
+  `DIVERGED` instead of a (meaningless) speedup, so a broken configuration can never advertise a
+  bogus number. Validated offline against a NumPy reference of the expanded graph for `silu`,
+  `gelu`, and `swiglu`, with and without bias and renormalization.
 
 ## SwiGLU handling (which form each run uses)
 
