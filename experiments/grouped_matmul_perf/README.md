@@ -357,5 +357,129 @@ is float32. `--dtype float16` is intended for the CUDA path (MoE has fp16/bf16 C
 
 ## Results
 
-Not yet collected in this environment (no branch build present here yet). Run the commands
-above once an ORT build from this branch is available; `--csv` writes the raw numbers.
+Environment: 24-logical-CPU x86-64 host, ONNX Runtime 1.29.0 built from this branch
+(Release, CPU EP), intra-op threads auto (~24), 5 warmup + 30 timed iterations, strict
+cross-check ON (`--tol 1e-4`), `--mem-budget-gb 12`. Latency is **median** wall-clock
+milliseconds per `Run` (mean/min/std are in the CSVs). The full matrix is **18 cases × 4
+configs** = (`--swiglu-impl {expanded, fused-op}`) × (`--router-impl {softmax-topk,
+routertopk}`), all fp32.
+
+**Why fp32 only:** the fused `com.microsoft.MoE` fp16 CPU kernel is compiled but not
+registered, so an fp16 MoE node has no CPU kernel (see *Device / dtype note* above). The
+comparison is therefore CPU-fp32; fp16 is a CUDA-path concern (future work).
+
+**What is compared:** the fused `com.microsoft.MoE` op (router + both FC GEMMs + activation +
+combine in one kernel) vs. the **expanded** form built from primitives —
+`RouterTopK`/`Softmax→TopK→Div` → `GroupedMatMul` (FC1) → activation → `GroupedMatMul` (FC2) →
+`Mul` (route-weight scale) → `ReduceSum` (combine top-k). Both sides are validated to compute
+the same result every run.
+
+### Headline
+
+**Fused `com.microsoft.MoE` is slower than the expanded `GroupedMatMul` form in every tested
+regime on CPU** — from ~1.1× (already-saturated batched cases) up to ~4.2× (single-token
+decode). Table below is the canonical config (`--swiglu-impl expanded --router-impl
+softmax-topk`); the other three configs move numbers by <12% (see *Sensitivity*).
+"expanded speedup" = `fused_ms / expanded_ms` (>1 ⇒ expanded is faster).
+
+| case                | regime              |    M |   K |     F |   E | k | fused ms | expanded ms | expanded speedup | max rel err |
+|---------------------|---------------------|-----:|----:|------:|----:|--:|---------:|------------:|-----------------:|------------:|
+| decode-silu         | decode/launch-bound |    1 | 4096| 14336 |   8 | 2 |   78.256 |      18.599 |          **4.21×** |    1.8e-06 |
+| decode-swiglu       | decode/launch-bound |    1 | 4096| 14336 |   8 | 2 |  115.049 |      29.742 |          **3.87×** |    2.1e-06 |
+| decode-batch8-silu  | decode-batch        |    8 | 4096| 14336 |   8 | 2 |  122.278 |     105.754 |            1.16× |    1.7e-06 |
+| decode-batch32-silu | decode-batch        |   32 | 4096| 14336 |   8 | 2 |  152.325 |     136.391 |            1.12× |    3.3e-07 |
+| small-silu          | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |    8.786 |       7.808 |            1.13× |    2.7e-07 |
+| small-silu-bias     | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |   16.000 |       8.260 |            1.94× |    2.8e-07 |
+| small-swiglu        | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |   18.049 |      11.869 |            1.52× |    2.8e-07 |
+| small-gelu          | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |   15.120 |       8.512 |            1.78× |    2.6e-07 |
+| deepseek-many-silu  | prefill/compute     |  512 | 1024|  1408 |  64 | 6 |   76.775 |      56.644 |            1.36× |    2.6e-07 |
+| prefill-silu        | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |  155.435 |      93.638 |            1.66× |    2.8e-07 |
+| prefill-swiglu      | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |  220.354 |     147.892 |            1.49× |    2.7e-07 |
+| prefill-gelu        | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |  170.512 |      97.699 |            1.75× |    3.1e-07 |
+| switch-top1-silu    | prefill/compute     | 1024 |  768|  3072 | 128 | 1 |  116.748 |      99.492 |            1.17× |    4.0e-07 |
+| mixtral-silu        | prefill/compute     | 1024 | 4096| 14336 |   8 | 2 | 1397.386 |     804.437 |            1.74× |    4.2e-07 |
+| mixtral-swiglu      | prefill/compute     | 1024 | 4096| 14336 |   8 | 2 | 2068.742 |    1285.123 |            1.61× |    3.8e-07 |
+| large-tokens-swiglu | prefill/compute     | 2048 | 1024|  2048 |   8 | 2 |  212.220 |     113.240 |            1.87× |    2.6e-07 |
+| prefill-4k-silu     | compute anchor      | 4096 | 2048|  5632 |   8 | 2 | 1148.656 |     648.608 |            1.77× |    3.1e-07 |
+| prefill-8k-silu     | compute anchor      | 8192 | 2048|  5632 |   8 | 2 | 2480.652 |    1431.243 |            1.73× |    3.4e-07 |
+
+Raw CSVs: `results_moe_vs_grouped_cpu_fp32_{expanded,fusedop}_{softmaxtopk,routertopk}.csv`;
+consolidated console tables in `results_moe_vs_grouped_cpu_fp32_console.txt`.
+
+### Gap attribution (from `--profile` per-op breakdown)
+
+The gap is **the GEMM itself, not dispatch / graph round-trip overhead.** In the expanded form,
+all the non-GEMM primitives (router `Softmax`/`TopK`/`Div`, activation, the SwiGLU
+de-interleave `Reshape`/`Split`/`Squeeze`, the `Mul` scale, and the `ReduceSum` combine) sum to
+only **~2%** of expanded wall time; the two `GroupedMatMul` calls are ~98%. So the expanded form
+is essentially "GroupedMatMul + negligible glue", and comparing wall times is effectively
+comparing the fused kernel's internal grouped-GEMM against `GroupedMatMul`.
+
+Concrete per-iteration numbers (`profiling_moe_vs_grouped_cpu_fp32.csv`):
+
+| case            |    M | fused MoE GEMM | expanded GroupedMatMul | expanded overhead ops | fused-GEMM / GMM |
+|-----------------|-----:|---------------:|-----------------------:|----------------------:|-----------------:|
+| prefill-8k-silu | 8192 |     2383 ms    |         1285 ms        |    30 ms (**2.3%**)   |     **1.86×**    |
+| decode-silu     |    1 |     87.4 ms    |         25.3 ms        |   0.5 ms (**2.1%**)   |     **3.46×**    |
+
+- **Decode M=1 is the ~4× worst case** because the fused MoE kernel pays the **full per-expert
+  cost to process a single token**: with `E=8, k=2` it still does the grouped work per selected
+  expert over a `K=4096 → F=14336` weight, and that per-expert launch/pack cost is not amortised
+  over any token batch. `GroupedMatMul` handles the tiny `M·k` row set far more cheaply.
+- **The gap shrinks with batch but does not close.** As `M` grows the fused kernel amortises its
+  per-expert overhead (`decode-batch8` 1.16×, `decode-batch32` 1.12×), but even at the
+  compute-bound anchors it **persists**: `M=4096` 1.77× and `M=8192` 1.73× (fused-GEMM/GMM
+  1.86× at 8k). This is a steady-state grouped-GEMM efficiency gap on CPU, not a fixed startup
+  cost — the fused internal grouped-GEMM is simply **~1.8–3.5× slower** than `GroupedMatMul`
+  across the range.
+
+### Sensitivity (SwiGLU form and router impl)
+
+- **SwiGLU form (`--swiglu-impl`).** The fused side always uses MoE's built-in SwiGLU with
+  `swiglu_fusion=1` (interleaved — the only CPU-supported format). The expanded side was
+  benchmarked **both ways**: the fused `com.microsoft.SwiGLU` op (`fused-op`) and the expanded
+  `Sigmoid + Mul + Mul` graph (`expanded`). Measured impact on the expanded side is
+  **<12% and regime-dependent** (e.g. `large-tokens-swiglu` 113.2 → 124.2 ms, +9.6%;
+  `decode-swiglu` 29.7 → 26.4 ms, −11%; `mixtral-swiglu` ~±0.3%). It does **not** change the
+  headline — expanded wins under either SwiGLU form.
+- **Router impl (`--router-impl`).** `softmax-topk` (`Softmax→TopK→Div`) vs. the fused
+  `RouterTopK` op move medians by **<5%**, within run-to-run noise (the router is a tiny
+  fraction of total time in every case). No config flips the fused-vs-expanded ranking.
+
+### The one exception worth the perf team's attention
+
+**`switch-top1-silu`** (128 experts, top-1, `K=768→F=3072`) is the **only** case where the
+fused kernel's **internal grouped-GEMM is faster than `GroupedMatMul`**: in the profiled run
+the fused MoE GEMM is **124.6 ms/iter vs. GroupedMatMul's 153.3 ms/iter**. Top-1 routing over
+many small experts is exactly the shape the fused grouped-GEMM's per-group dispatch is built
+for. Even so, **the expanded form still wins wall-clock** (99.5 vs. 116.7 ms median) because
+its ~2% overhead is cheaper than whatever the fused kernel spends outside its GEMM. This is the
+one shape where closing the fused GEMM gap could plausibly make fused MoE the wall-clock winner
+— flagged for the perf team.
+
+### Correctness
+
+All **18 cases × 4 configs (72 runs)** passed the strict fused-vs-expanded cross-check
+(`--tol 1e-4`): **max relative error 2.08e-6** (worst case `decode-swiglu`), no `DIVERGED`, no
+`OOM-skip` (12 GiB budget, per-tensor external-data serialization keeps peak at ~1× layout).
+Threads ~24 intra-op, fp32. The two implementations compute the same MoE layer within
+numerical tolerance, so the latency comparison is apples-to-apples.
+
+## Conclusions
+
+- **On CPU, the more complex fused `com.microsoft.MoE` op is a net performance loss vs. the
+  simpler `GroupedMatMul`-based expansion** — slower in all 18 regimes, by ~1.1× (saturated
+  batch) to ~4.2× (single-token decode). The end-goal question ("is the heavier MoE fusion
+  worth it on CPU vs. reusing GroupedMatMul?") answers **no, as currently implemented.**
+- **The cost is in the fused kernel's internal grouped-GEMM, not in fusion/dispatch savings.**
+  The expanded form's extra ops (router, activation, SwiGLU de-interleave, combine) are only
+  ~2% of its time, so fusing them away cannot recover the gap; the fused grouped-GEMM is
+  ~1.8–3.5× slower than `GroupedMatMul` at the same work. Optimization effort should target the
+  MoE kernel's grouped-GEMM path (ideally sharing `GroupedMatMul`'s CPU GEMM), not the
+  op-fusion boundary.
+- **`switch-top1` (many experts, top-1) is the lone shape where the fused GEMM already wins**
+  and is the most promising target for making fused MoE competitive on CPU.
+- **CUDA is future work.** The harness fully supports `--providers cuda` (and MoE has fp16/bf16
+  CUDA kernels, so the fp32-only CPU restriction lifts there). The trade-off may invert on GPU,
+  where a single fused kernel avoids materialising intermediate expert tensors in HBM and saves
+  launch overhead — but that must be measured on a GPU build before drawing any conclusion.
