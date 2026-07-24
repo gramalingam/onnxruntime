@@ -571,3 +571,29 @@ valid comparisons at every `M`.
   benchmark-metric artifact (a global-max relative error dominated by one row's benign
   CPU-vs-CUDA `TopK` tie-break, not a kernel bug) — see *CUDA, float16* above for the full
   explanation and the `_rel_err_robust` fix. All 18 cases now pass `--strict`.
+
+## Future work / TODO
+
+- **[ ] Optimize `GroupedMatMul` CUDA to close the fused-vs-expanded gap: dispatch all groups as
+  a single grouped-GEMM kernel launch, not a per-group `cublasGemmHelper` loop.** Comparing
+  `com.microsoft.MoE`'s CUDA GEMM1/GEMM2 (`contrib_ops/cuda/llm/moe_gemm/`) against
+  `GroupedMatMul` (`contrib_ops/cuda/grouped_matmul.cc`) shows a real implementation difference,
+  not just op-fusion:
+  - **MoE's GEMM1/GEMM2** each issue **one** `cutlass::gemm::device::GemmGrouped` kernel launch
+    that covers *all* `E` experts, using CUTLASS's `GroupScheduleMode::kDeviceOnly` to schedule
+    threadblocks across experts dynamically from **device-side** per-expert row-count offsets
+    (`expert_first_token_offset`) — no host round-trip.
+  - **`GroupedMatMul`** instead (a) copies `group_indices` device→host and does a blocking
+    `cudaStreamSynchronize` to build the group permutation/offsets on the **host**, then (b) loops
+    over groups on the host issuing **one separate `cublasGemmHelper` call (kernel launch) per
+    non-empty group** (`E` launches instead of 1).
+  - This costs: a synchronous pipeline stall every call (the D→H copy + sync), `E` separate
+    kernel-launch overheads instead of 1, and no cross-expert SM-occupancy balancing within a
+    single grid — especially wasteful when group sizes are small/uneven.
+  - **Proposed fix:** rework `GroupedMatMul` to compute the permutation/offsets on-device
+    (eliminate the D→H sync) and dispatch through a true grouped-GEMM kernel — either reuse the
+    `MoeGemmRunner`/CUTLASS grouped-GEMM machinery already vendored in this repo
+    (`contrib_ops/cuda/llm/moe_gemm/`), or a custom kernel with equivalent device-side scheduling.
+  - This is the most likely lever to make the expanded (`GroupedMatMul`-based) CUDA fp16 path
+    competitive with (or faster than) the fused `MoE` op, rather than consistently slower as
+    measured above.
