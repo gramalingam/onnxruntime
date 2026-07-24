@@ -79,7 +79,7 @@ Status GroupedMatMul<T>::ComputeInternal(OpKernelContext* context) const {
     return Status::OK();
   }
 
-  cudaStream_t stream = static_cast<cudaStream_t>(GetComputeStream(context));
+  cudaStream_t stream = Stream(context);
 
   // Copy group indices to host to build the per-group permutation. This is a small
   // (num_selections) transfer and lets us sort/bucket without a device radix sort.
