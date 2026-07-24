@@ -597,3 +597,52 @@ valid comparisons at every `M`.
   - This is the most likely lever to make the expanded (`GroupedMatMul`-based) CUDA fp16 path
     competitive with (or faster than) the fused `MoE` op, rather than consistently slower as
     measured above.
+
+  **Update: prototyped and benchmarked (see below). Result: not a clear win at these problem
+  sizes — kept as an opt-in alternative, not a replacement, of the existing cuBLAS-loop path.**
+
+  - **Implementation** (`contrib_ops/cuda/grouped_matmul_cutlass_gemm.h`/`.cu`): reuses
+    `MoeGemmRunner<CudaT,CudaT,CudaT>::moeGemmBiasAct()` (the same CUTLASS grouped-GEMM machinery
+    behind `com.microsoft.MoE`'s GEMM1/GEMM2) with `ActivationType::Identity`, fed the *same*
+    gathered/group-contiguous buffers `grouped_matmul.cc` already builds for the cuBLAS loop (only
+    one extra small H2D upload is added: the cumulative per-group row-count array CUTLASS expects
+    as `total_tokens_including_expert`). Bias is still added by the existing scatter kernel in
+    both paths, so the two implementations differ *only* in the GEMM-execution strategy, keeping
+    gather/scatter/permutation logic identical. Selectable at runtime via
+    `ORT_GROUPED_MATMUL_CUDA_IMPL=cutlass` (default/unset/any other value keeps the original
+    cuBLAS-loop path unchanged) — both implementations are kept side by side for benchmarking, per
+    `docs/GroupedMatMul.md`'s general-purpose design goals (see the "clear-cut?" discussion below).
+  - **Correctness:** verified bit-identical (`max_abs=0`) against the cuBLAS path across 8 cases
+    spanning float32/float16, with/without bias, non-uniform/odd M-K-N-`num_groups`-`k`, an
+    all-groups-non-power-of-2 case likely to leave some groups empty, and an `M=1` edge case.
+  - **Performance** (`benchmark_grouped_matmul_cutlass_vs_cublas.py`, fp16, bias on, A100,
+    `results_cutlass_vs_cublas_cuda_fp16.csv`):
+
+    | case              | M    | k | K    | N    | G  | cublas (ms) | cutlass (ms) | speedup |
+    |-------------------|------|---|------|------|----|-------------|--------------|---------|
+    | tiny              | 256  | 1 | 512  | 512  | 8  | 0.469       | 1.010        | 0.46x   |
+    | small-dense       | 512  | 1 | 768  | 768  | 8  | 1.143       | 1.679        | 0.68x   |
+    | small-top2        | 512  | 2 | 512  | 512  | 16 | 1.525       | 1.705        | 0.89x   |
+    | medium-dense      | 1024 | 1 | 768  | 768  | 16 | 2.717       | 2.479        | 1.10x   |
+    | medium-top2       | 512  | 2 | 768  | 768  | 32 | 3.847       | 3.805        | 1.01x   |
+    | large-tokens      | 2048 | 1 | 512  | 512  | 32 | 2.900       | 2.905        | 1.00x   |
+    | large-top2        | 2048 | 2 | 768  | 768  | 32 | 4.386       | 4.306        | 1.02x   |
+    | wide-hidden       | 256  | 2 | 1024 | 1024 | 8  | 2.213       | 2.355        | 0.94x   |
+    | many-experts      | 512  | 1 | 512  | 512  | 64 | 3.285       | 3.574        | 0.92x   |
+    | many-experts-top2 | 512  | 2 | 512  | 512  | 64 | 3.797       | 3.968        | 0.96x   |
+
+    Takeaways:
+    - **No case shows a decisive win.** Small problems (`tiny`, `small-dense`) are *slower* under
+      CUTLASS (0.46x-0.68x): the fixed per-call overhead of constructing a `MoeGemmRunner`,
+      querying `getConfigs(sm)`, and the extra H2D copy outweighs the savings from launching one
+      kernel instead of a few, when each cuBLAS GEMM is already tiny.
+    - Larger/many-group cases are roughly a wash (0.9x-1.1x), not the outsized win the "E launches
+      vs. 1" argument alone would predict. The D→H sync + per-group launch overhead this was meant
+      to eliminate is evidently already small relative to GEMM compute time at these sizes on
+      A100; conversely, unlike `com.microsoft.MoE`'s runner (which profiles multiple tactics and
+      picks the fastest per shape via `mGemmProfiler`), this prototype always takes
+      `getAmpereConfigs(sm)[0]` with **no tactic tuning**, likely leaving real performance on the
+      table for the CUTLASS path that a profiler-driven config search would recover.
+    - Conclusion: the cuBLAS-loop path remains the better default. The CUTLASS path is kept as an
+      explicit opt-in for further experimentation (e.g. adding tactic profiling/caching, or
+      testing shapes/hardware where per-launch overhead dominates more), not as a replacement.

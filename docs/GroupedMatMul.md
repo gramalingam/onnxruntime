@@ -123,6 +123,15 @@ is a `(token, expert-slot)` pair `p` in `[0, M*k)`; its source token row is `p /
 - **CUDA**: selections are stable-sorted by group index; each selection's source token row is
   gathered into group-contiguous order; each non-empty group runs one cuBLAS GEMM; results
   (plus optional bias) are scattered back to the `[M, k, N]` output in selection order.
+  An alternate, opt-in GEMM-execution strategy is also available, selected at runtime via the
+  `ORT_GROUPED_MATMUL_CUDA_IMPL` environment variable (default/unset: `cublas`, the strategy
+  above): `cutlass` instead dispatches all groups through a single CUTLASS grouped-GEMM kernel
+  launch (`contrib_ops/cuda/grouped_matmul_cutlass_gemm.h`/`.cu`, reusing the `MoeGemmRunner`
+  machinery that backs `com.microsoft.MoE`'s GEMM1/GEMM2), keeping the same gather/scatter steps.
+  This is a benchmarking-only switch kept for A/B comparison, not a general-purpose recommendation
+  — see `experiments/grouped_matmul_perf/README.md`'s "Future work" section for measured results
+  (currently a wash or slower than the default at the sizes tested, since it has no tactic-tuning
+  profiler yet).
 
 ## Design notes
 

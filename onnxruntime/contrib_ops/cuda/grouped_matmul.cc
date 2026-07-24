@@ -5,6 +5,7 @@
 
 #include <vector>
 
+#include "contrib_ops/cuda/grouped_matmul_cutlass_gemm.h"
 #include "contrib_ops/cuda/grouped_matmul_impl.h"
 #include "core/providers/cuda/cuda_common.h"
 #include "core/providers/cuda/cuda_type_conversion.h"
@@ -134,35 +135,49 @@ Status GroupedMatMul<T>::ComputeInternal(OpKernelContext* context) const {
   LaunchGroupedMatMulGather<CudaT>(stream, reinterpret_cast<const CudaT*>(input->Data<T>()),
                                    row_map.get(), permuted_input.get(), num_selections, K, k);
 
-  // One dense GEMM per non-empty group.
-  const CudaT alpha = ToCudaType<T>::FromFloat(1.0f);
-  const CudaT beta = ToCudaType<T>::FromFloat(0.0f);
-  const auto& device_prop = GetDeviceProp();
   const CudaT* weights_data = reinterpret_cast<const CudaT*>(weights->Data<T>());
 
-  for (int64_t g = 0; g < num_groups; ++g) {
-    const int64_t count = group_counts[static_cast<size_t>(g)];
-    if (count == 0) {
-      continue;  // Empty group: weights[g] is unused.
-    }
-    const int64_t offset = group_offsets[static_cast<size_t>(g)];
-    const CudaT* a = permuted_input.get() + offset * K;  // [count, K] row-major
-    const CudaT* w = weights_data + g * K * N;           // [K, N] row-major
-    CudaT* c = permuted_output.get() + offset * N;       // [count, N] row-major
+  if (UseCutlassGroupedMatMulGemm()) {
+    // Single-launch CUTLASS grouped-GEMM path (benchmarking-only, opt-in via
+    // ORT_GROUPED_MATMUL_CUDA_IMPL=cutlass): reuses the MoeGemmRunner machinery that backs
+    // com.microsoft.MoE's GEMM1/GEMM2, avoiding the host round-trip and per-group kernel launches
+    // of the cuBLAS loop below. See grouped_matmul_cutlass_gemm.h for details.
+    auto group_offsets_end = GetScratchBuffer<int64_t>(static_cast<size_t>(num_groups), context->GetComputeStream());
+    CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(group_offsets_end.get(), group_offsets.data() + 1,
+                                         static_cast<size_t>(num_groups) * sizeof(int64_t),
+                                         cudaMemcpyHostToDevice, stream));
+    LaunchGroupedMatMulCutlassGemm<CudaT>(stream, permuted_input.get(), weights_data, group_offsets_end.get(),
+                                          permuted_output.get(), num_selections, K, N, num_groups);
+  } else {
+    // Default: one dense cuBLAS GEMM per non-empty group.
+    const CudaT alpha = ToCudaType<T>::FromFloat(1.0f);
+    const CudaT beta = ToCudaType<T>::FromFloat(0.0f);
+    const auto& device_prop = GetDeviceProp();
 
-    // ORT tensors are row-major, cuBLAS is column-major, so swap the operands: compute
-    // C^T = W^T * A^T which cuBLAS sees as an (N x count) = (N x K) * (K x count) product.
-    CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
-        GetCublasHandle(context),
-        CUBLAS_OP_N, CUBLAS_OP_N,
-        static_cast<int>(N), static_cast<int>(count), static_cast<int>(K),
-        &alpha,
-        w, static_cast<int>(N),
-        a, static_cast<int>(K),
-        &beta,
-        c, static_cast<int>(N),
-        device_prop,
-        UseTF32()));
+    for (int64_t g = 0; g < num_groups; ++g) {
+      const int64_t count = group_counts[static_cast<size_t>(g)];
+      if (count == 0) {
+        continue;  // Empty group: weights[g] is unused.
+      }
+      const int64_t offset = group_offsets[static_cast<size_t>(g)];
+      const CudaT* a = permuted_input.get() + offset * K;  // [count, K] row-major
+      const CudaT* w = weights_data + g * K * N;           // [K, N] row-major
+      CudaT* c = permuted_output.get() + offset * N;       // [count, N] row-major
+
+      // ORT tensors are row-major, cuBLAS is column-major, so swap the operands: compute
+      // C^T = W^T * A^T which cuBLAS sees as an (N x count) = (N x K) * (K x count) product.
+      CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
+          GetCublasHandle(context),
+          CUBLAS_OP_N, CUBLAS_OP_N,
+          static_cast<int>(N), static_cast<int>(count), static_cast<int>(K),
+          &alpha,
+          w, static_cast<int>(N),
+          a, static_cast<int>(K),
+          &beta,
+          c, static_cast<int>(N),
+          device_prop,
+          UseTF32()));
+    }
   }
 
   const CudaT* bias_data = bias ? reinterpret_cast<const CudaT*>(bias->Data<T>()) : nullptr;
