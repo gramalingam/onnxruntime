@@ -1,0 +1,28 @@
+onnxruntime 1.29.0; providers available: ['CUDAExecutionProvider', 'CPUExecutionProvider']
+dtype=float16 bias=False normalize=1 router-impl=softmax-topk swiglu-impl=expanded intra-op-threads=auto(~96)
+warmup=5 iters=30 strict=True mem-budget=4.0 GiB profile=False
+SwiGLU: fused MoE uses swiglu_fusion=1 (interleaved); expanded uses 'expanded' (Sigmoid+Mul+Mul). Reported ms are MEDIAN over timed iters.
+
+case                act     regime              prov       M     K      F    E  k   fused_ms     exp_ms fused_speedup  max_relerr  ok
+-------------------------------------------------------------------------------------------------------------------------------------
+decode-silu         silu    decode/launch-bound cuda       1  4096  14336    8  2      0.410      0.507         1.24x    7.72e-04 yes
+decode-swiglu       swiglu  decode/launch-bound cuda       1  4096  14336    8  2      0.540      0.660         1.22x    1.12e-03 yes
+decode-batch8-silu  silu    decode-batch        cuda       8  4096  14336    8  2      1.213      1.526         1.26x    1.16e-03 yes
+decode-batch32-silu silu    decode-batch        cuda      32  4096  14336    8  2      1.266      1.589         1.26x    1.18e-03 yes
+small-silu          silu    prefill/compute     cuda     128  1024   2048    8  2      0.204      0.505         2.48x    8.95e-04 yes
+small-silu-bias     silu    prefill/compute     cuda     128  1024   2048    8  2      0.211      0.510         2.41x    9.07e-04 yes
+small-swiglu        swiglu  prefill/compute     cuda     128  1024   2048    8  2      0.241      0.532         2.21x    1.17e-03 yes
+small-gelu          gelu    prefill/compute     cuda     128  1024   2048    8  2      0.204      0.538         2.63x    8.60e-04 yes
+prefill-silu        silu    prefill/compute     cuda     512  2048   5632    8  2      0.872      1.429         1.64x    9.99e-04 yes
+prefill-swiglu      swiglu  prefill/compute     cuda     512  2048   5632    8  2      1.076      1.706         1.59x    1.09e-03 yes
+prefill-gelu        gelu    prefill/compute     cuda     512  2048   5632    8  2      0.891      1.578         1.77x    9.48e-04 yes
+mixtral-silu        silu    prefill/compute     cuda    1024  4096  14336    8  2      4.195      5.850         1.39x    1.14e-03 yes
+mixtral-swiglu      swiglu  prefill/compute     cuda    1024  4096  14336    8  2      5.760      6.689         1.16x    1.03e-03 yes
+deepseek-many-silu  silu    prefill/compute     cuda     512  1024   1408   64  6      0.650      2.256         3.47x    8.64e-04 yes
+switch-top1-silu    silu    prefill/compute     cuda    1024   768   3072  128  1      1.152      3.804         3.30x    6.49e-04 yes
+large-tokens-swiglu swiglu  prefill/compute     cuda    2048  1024   2048    8  2      1.106      1.948         1.76x    1.05e-03 yes
+prefill-4k-silu     silu    prefill/compute     cuda    4096  2048   5632    8  2      5.136      7.679         1.50x    9.62e-04 yes
+    [INFO] prefill-4k-silu: 1 row(s) took a different (but individually valid) top-k routing decision -- a near-tie in the softmax(router_logits) below fp16 precision, broken differently by CPU/CUDA TopK. Excluded from the 99th-percentile rel err (9.622e-04); raw max rel err over all rows was 5.492e-01.
+prefill-8k-silu     silu    prefill/compute     cuda    8192  2048   5632    8  2     14.687     14.586         0.99x    1.23e-03 yes
+
+Wrote /tmp/results_cuda_fp16.csv
