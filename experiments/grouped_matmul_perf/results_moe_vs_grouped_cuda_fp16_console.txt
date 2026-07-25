@@ -1,28 +1,117 @@
+[0;93m2026-07-25 18:55:04.129096579 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:55:04.129124071 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:55:04.129129531 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:55:04.129137836 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:55:04.129142675 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:56:50.720113002 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:56:50.720141505 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:56:50.720146835 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:56:50.720152245 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:56:50.720157264 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:58:02.861846836 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:58:02.861870701 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:58:02.861875850 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:58:02.861880720 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:58:02.861885508 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:15.033062104 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:15.033085828 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:15.033091419 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:15.033096268 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:15.033101117 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:18.550617276 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:18.550648715 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:18.550655297 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:18.550660747 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:18.550665777 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:21.197687466 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:21.197711812 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:21.197716951 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:21.197722051 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:21.197726880 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:24.972833018 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:24.972857683 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:24.972862893 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:24.972867882 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:24.972872822 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:27.653745271 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:27.653768664 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:27.653773794 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:27.653778723 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:27.653783873 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:40.934412166 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:40.934435650 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:40.934440799 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:40.934445829 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 18:59:40.934450738 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:00:01.205712447 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:00:01.205736111 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:00:01.205741501 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:00:01.205746520 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:00:01.205751450 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:00:14.664879902 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:00:14.664904718 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:00:14.664910008 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:00:14.664916901 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:00:14.664921950 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:01:27.004623733 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:01:27.004647517 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:01:27.004652606 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:01:27.004657406 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:01:27.004662174 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:03:14.885674569 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:03:14.885696239 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:03:14.885701599 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:03:14.885706709 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:03:14.885711658 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:03:28.857134054 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:03:28.857158850 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:03:28.857163980 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:03:28.857168869 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:03:28.857173668 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:09.074239817 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:09.074262049 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:09.074267219 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:09.074272128 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:09.074276967 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:13.606505240 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:13.606528183 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:13.606533373 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:13.606538332 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:13.606543311 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:27.764871822 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:27.764894163 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:27.764899293 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:27.764904332 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:27.764909231 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:43.503731674 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'neg1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:43.503756020 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_M_k_K'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:43.503761410 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_1'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:43.503766409 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'shape_Mk_F'. It is not used by any node and should be removed from the model.[m
+[0;93m2026-07-25 19:04:43.503771248 [W:onnxruntime:, graph.cc:5566 CleanUnusedInitializersAndNodeArgs] Removing initializer 'combine_axis'. It is not used by any node and should be removed from the model.[m
 onnxruntime 1.29.0; providers available: ['CUDAExecutionProvider', 'CPUExecutionProvider']
-dtype=float16 bias=False normalize=1 router-impl=softmax-topk swiglu-impl=expanded intra-op-threads=auto(~96)
+dtype=float16 bias=False normalize=1 router-impl=routertopk swiglu-impl=expanded intra-op-threads=auto(~96)
 warmup=5 iters=30 strict=True mem-budget=4.0 GiB profile=False
 SwiGLU: fused MoE uses swiglu_fusion=1 (interleaved); expanded uses 'expanded' (Sigmoid+Mul+Mul). Reported ms are MEDIAN over timed iters.
 
-case                act     regime              prov       M     K      F    E  k   fused_ms     exp_ms fused_speedup  max_relerr  ok
--------------------------------------------------------------------------------------------------------------------------------------
-decode-silu         silu    decode/launch-bound cuda       1  4096  14336    8  2      0.410      0.507         1.24x    7.72e-04 yes
-decode-swiglu       swiglu  decode/launch-bound cuda       1  4096  14336    8  2      0.540      0.660         1.22x    1.12e-03 yes
-decode-batch8-silu  silu    decode-batch        cuda       8  4096  14336    8  2      1.213      1.526         1.26x    1.16e-03 yes
-decode-batch32-silu silu    decode-batch        cuda      32  4096  14336    8  2      1.266      1.589         1.26x    1.18e-03 yes
-small-silu          silu    prefill/compute     cuda     128  1024   2048    8  2      0.204      0.505         2.48x    8.95e-04 yes
-small-silu-bias     silu    prefill/compute     cuda     128  1024   2048    8  2      0.211      0.510         2.41x    9.07e-04 yes
-small-swiglu        swiglu  prefill/compute     cuda     128  1024   2048    8  2      0.241      0.532         2.21x    1.17e-03 yes
-small-gelu          gelu    prefill/compute     cuda     128  1024   2048    8  2      0.204      0.538         2.63x    8.60e-04 yes
-prefill-silu        silu    prefill/compute     cuda     512  2048   5632    8  2      0.872      1.429         1.64x    9.99e-04 yes
-prefill-swiglu      swiglu  prefill/compute     cuda     512  2048   5632    8  2      1.076      1.706         1.59x    1.09e-03 yes
-prefill-gelu        gelu    prefill/compute     cuda     512  2048   5632    8  2      0.891      1.578         1.77x    9.48e-04 yes
-mixtral-silu        silu    prefill/compute     cuda    1024  4096  14336    8  2      4.195      5.850         1.39x    1.14e-03 yes
-mixtral-swiglu      swiglu  prefill/compute     cuda    1024  4096  14336    8  2      5.760      6.689         1.16x    1.03e-03 yes
-deepseek-many-silu  silu    prefill/compute     cuda     512  1024   1408   64  6      0.650      2.256         3.47x    8.64e-04 yes
-switch-top1-silu    silu    prefill/compute     cuda    1024   768   3072  128  1      1.152      3.804         3.30x    6.49e-04 yes
-large-tokens-swiglu swiglu  prefill/compute     cuda    2048  1024   2048    8  2      1.106      1.948         1.76x    1.05e-03 yes
-prefill-4k-silu     silu    prefill/compute     cuda    4096  2048   5632    8  2      5.136      7.679         1.50x    9.62e-04 yes
-    [INFO] prefill-4k-silu: 1 row(s) took a different (but individually valid) top-k routing decision -- a near-tie in the softmax(router_logits) below fp16 precision, broken differently by CPU/CUDA TopK. Excluded from the 99th-percentile rel err (9.622e-04); raw max rel err over all rows was 5.492e-01.
-prefill-8k-silu     silu    prefill/compute     cuda    8192  2048   5632    8  2     14.687     14.586         0.99x    1.23e-03 yes
+case                act     regime              prov       M     K      F    E  k   fused_ms     exp_ms fused_speedup  max_relerr  ok   expFR_ms  FR_speedup   FR_relerr FR_ok
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+decode-silu         silu    decode/launch-bound cuda       1  4096  14336    8  2      0.410      0.487         1.19x    7.72e-04 yes      0.500       1.22x    7.72e-04   yes
+decode-swiglu       swiglu  decode/launch-bound cuda       1  4096  14336    8  2      0.539      0.638         1.18x    1.12e-03 yes      0.653       1.21x    1.12e-03   yes
+decode-batch8-silu  silu    decode-batch        cuda       8  4096  14336    8  2      1.230      1.508         1.23x    7.85e-04 yes      1.491       1.21x    7.85e-04   yes
+decode-batch32-silu silu    decode-batch        cuda      32  4096  14336    8  2      1.272      1.573         1.24x    1.18e-03 yes      1.539       1.21x    1.09e-03   yes
+small-silu          silu    prefill/compute     cuda     128  1024   2048    8  2      0.193      0.481         2.49x    8.95e-04 yes      0.423       2.19x    8.95e-04   yes
+small-silu-bias     silu    prefill/compute     cuda     128  1024   2048    8  2      0.201      0.480         2.39x    9.07e-04 yes      0.422       2.10x    9.07e-04   yes
+small-swiglu        swiglu  prefill/compute     cuda     128  1024   2048    8  2      0.230      0.506         2.20x    1.17e-03 yes      0.448       1.95x    1.17e-03   yes
+small-gelu          gelu    prefill/compute     cuda     128  1024   2048    8  2      0.194      0.513         2.64x    8.60e-04 yes      0.457       2.36x    8.60e-04   yes
+prefill-silu        silu    prefill/compute     cuda     512  2048   5632    8  2      0.852      1.343         1.58x    9.99e-04 yes      1.188       1.39x    9.80e-04   yes
+prefill-swiglu      swiglu  prefill/compute     cuda     512  2048   5632    8  2      1.066      1.606         1.51x    1.09e-03 yes      1.462       1.37x    8.21e-04   yes
+prefill-gelu        gelu    prefill/compute     cuda     512  2048   5632    8  2      0.822      1.489         1.81x    9.48e-04 yes      1.342       1.63x    6.32e-04   yes
+mixtral-silu        silu    prefill/compute     cuda    1024  4096  14336    8  2      4.047      5.347         1.32x    1.14e-03 yes      5.087       1.26x    1.14e-03   yes
+mixtral-swiglu      swiglu  prefill/compute     cuda    1024  4096  14336    8  2      5.532      7.024         1.27x    1.03e-03 yes      6.547       1.18x    1.03e-03   yes
+deepseek-many-silu  silu    prefill/compute     cuda     512  1024   1408   64  6      0.608      2.260         3.72x    8.64e-04 yes      2.127       3.50x    8.64e-04   yes
+switch-top1-silu    silu    prefill/compute     cuda    1024   768   3072  128  1      1.132      3.746         3.31x    6.49e-04 yes      3.576       3.16x    6.49e-04   yes
+large-tokens-swiglu swiglu  prefill/compute     cuda    2048  1024   2048    8  2      0.986      1.615         1.64x    1.05e-03 yes      1.538       1.56x    1.05e-03   yes
+prefill-4k-silu     silu    prefill/compute     cuda    4096  2048   5632    8  2      4.713      7.003         1.49x    9.62e-04 yes      6.289       1.33x    8.02e-04   yes
+prefill-8k-silu     silu    prefill/compute     cuda    8192  2048   5632    8  2     10.537     13.610         1.29x    9.20e-04 yes     11.821       1.12x    9.20e-04   yes
 
-Wrote /tmp/results_cuda_fp16.csv
+Wrote results_moe_vs_grouped_cuda_fp16_verified.csv

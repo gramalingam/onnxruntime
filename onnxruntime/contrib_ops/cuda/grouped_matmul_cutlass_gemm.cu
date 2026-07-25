@@ -6,8 +6,11 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
+#include <cstdlib>
+#include <string>
+
 #include "core/common/float16.h"
-#include "core/platform/env_var_utils.h"
 #include "contrib_ops/cuda/llm/common/cuda_runtime_utils.h"
 #include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_kernels.h"
 
@@ -17,9 +20,44 @@ namespace cuda {
 
 bool UseCutlassGroupedMatMulGemm() {
   // Read once per call: this is a benchmarking-only flag, not a hot-path check, so there is no
-  // need to cache the parsed value.
-  const std::string impl = ParseEnvironmentVariableWithDefault<std::string>("ORT_GROUPED_MATMUL_CUDA_IMPL", "cublas");
-  return impl == "cutlass";
+  // need to cache the parsed value. Uses std::getenv (rather than
+  // onnxruntime::ParseEnvironmentVariableWithDefault / Env::Default()) because this file is
+  // compiled into the CUDA provider shared library (onnxruntime_providers_cuda), where the
+  // internal onnxruntime::Env::Default() symbol is not exported -- calling it directly (without
+  // routing through the SHARED_PROVIDER host bridge) causes an undefined-symbol failure when the
+  // provider library is dlopen'd at runtime.
+  const char* impl = std::getenv("ORT_GROUPED_MATMUL_CUDA_IMPL");
+  return impl != nullptr && std::string(impl) == "cutlass";
+}
+
+// Transposes `weights` from GroupedMatMul's own row-major [num_groups, K, N] layout into
+// row-major [num_groups, N, K] -- the layout CUTLASS's MoeGemmRunner expects for its B operand
+// (equivalently column-major [K, N]; see the layout note in grouped_matmul_cutlass_gemm.h). One
+// block per (group, output-feature-tile); straightforward (non-tiled-shared-memory) transpose
+// since this is a benchmarking-only, opt-in path rather than a hot loop.
+template <typename T>
+__global__ void TransposeGroupedWeightsKernel(const T* weights, T* weights_t, int64_t K, int64_t N) {
+  const int64_t g = blockIdx.y;
+  const T* src = weights + g * K * N;
+  T* dst = weights_t + g * K * N;
+  for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < K * N; idx += gridDim.x * blockDim.x) {
+    const int64_t k = idx / N;
+    const int64_t n = idx % N;
+    dst[n * K + k] = src[idx];
+  }
+}
+
+template <typename T>
+void LaunchTransposeGroupedWeights(cudaStream_t stream, const T* weights, T* weights_t, int64_t num_groups,
+                                   int64_t K, int64_t N) {
+  if (num_groups == 0 || K == 0 || N == 0) {
+    return;
+  }
+  constexpr int kThreadsPerBlock = 256;
+  const int64_t total = K * N;
+  const int blocks_x = static_cast<int>(std::min<int64_t>((total + kThreadsPerBlock - 1) / kThreadsPerBlock, 65535));
+  const dim3 grid(static_cast<unsigned int>(blocks_x), static_cast<unsigned int>(num_groups));
+  TransposeGroupedWeightsKernel<T><<<grid, kThreadsPerBlock, 0, stream>>>(weights, weights_t, K, N);
 }
 
 namespace {
@@ -30,6 +68,9 @@ namespace {
 // the BFloat16 registration) to __nv_bfloat16 via reinterpret_cast, since the two types share the
 // same 16-bit layout, exactly as other reinterpret_cast<const CudaT*> uses already do in
 // grouped_matmul.cc for MLFloat16/half.
+//
+// `weights` must already be in CUTLASS's expected [num_groups, N, K] row-major layout (i.e. the
+// caller has run LaunchTransposeGroupedWeights first) -- this function does not transpose.
 template <typename CutlassT>
 void RunGroupedMatMulCutlassGemm(cudaStream_t stream, const CutlassT* permuted_input, const CutlassT* weights,
                                  const int64_t* group_offsets_end, CutlassT* permuted_output,
@@ -85,16 +126,17 @@ void RunGroupedMatMulCutlassGemm(cudaStream_t stream, const CutlassT* permuted_i
 
 template <typename T>
 void LaunchGroupedMatMulCutlassGemm(cudaStream_t stream, const T* permuted_input, const T* weights,
-                                    const int64_t* group_offsets_end, T* permuted_output,
+                                    T* weight_scratch, const int64_t* group_offsets_end, T* permuted_output,
                                     int64_t num_selections, int64_t K, int64_t N, int64_t num_groups) {
-  RunGroupedMatMulCutlassGemm<T>(stream, permuted_input, weights, group_offsets_end, permuted_output,
+  LaunchTransposeGroupedWeights<T>(stream, weights, weight_scratch, num_groups, K, N);
+  RunGroupedMatMulCutlassGemm<T>(stream, permuted_input, weight_scratch, group_offsets_end, permuted_output,
                                  num_selections, K, N, num_groups);
 }
 
-template void LaunchGroupedMatMulCutlassGemm<float>(cudaStream_t, const float*, const float*, const int64_t*,
-                                                     float*, int64_t, int64_t, int64_t, int64_t);
-template void LaunchGroupedMatMulCutlassGemm<half>(cudaStream_t, const half*, const half*, const int64_t*, half*,
-                                                    int64_t, int64_t, int64_t, int64_t);
+template void LaunchGroupedMatMulCutlassGemm<float>(cudaStream_t, const float*, const float*, float*,
+                                                     const int64_t*, float*, int64_t, int64_t, int64_t, int64_t);
+template void LaunchGroupedMatMulCutlassGemm<half>(cudaStream_t, const half*, const half*, half*, const int64_t*,
+                                                    half*, int64_t, int64_t, int64_t, int64_t);
 
 // GroupedMatMul's BFloat16 CUDA kernel registration uses onnxruntime::cuda::ToCudaType<BFloat16>,
 // whose MappedType is onnxruntime::BFloat16 itself (not __nv_bfloat16). Bridge the two here via
@@ -102,10 +144,13 @@ template void LaunchGroupedMatMulCutlassGemm<half>(cudaStream_t, const half*, co
 template <>
 void LaunchGroupedMatMulCutlassGemm<onnxruntime::BFloat16>(
     cudaStream_t stream, const onnxruntime::BFloat16* permuted_input, const onnxruntime::BFloat16* weights,
-    const int64_t* group_offsets_end, onnxruntime::BFloat16* permuted_output, int64_t num_selections, int64_t K,
-    int64_t N, int64_t num_groups) {
+    onnxruntime::BFloat16* weight_scratch, const int64_t* group_offsets_end,
+    onnxruntime::BFloat16* permuted_output, int64_t num_selections, int64_t K, int64_t N, int64_t num_groups) {
+  LaunchTransposeGroupedWeights<__nv_bfloat16>(stream, reinterpret_cast<const __nv_bfloat16*>(weights),
+                                               reinterpret_cast<__nv_bfloat16*>(weight_scratch), num_groups, K, N);
   RunGroupedMatMulCutlassGemm<__nv_bfloat16>(
-      stream, reinterpret_cast<const __nv_bfloat16*>(permuted_input), reinterpret_cast<const __nv_bfloat16*>(weights),
+      stream, reinterpret_cast<const __nv_bfloat16*>(permuted_input),
+      reinterpret_cast<const __nv_bfloat16*>(weight_scratch),
       group_offsets_end, reinterpret_cast<__nv_bfloat16*>(permuted_output), num_selections, K, N, num_groups);
 }
 

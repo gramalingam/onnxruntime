@@ -646,3 +646,124 @@ valid comparisons at every `M`.
     - Conclusion: the cuBLAS-loop path remains the better default. The CUTLASS path is kept as an
       explicit opt-in for further experimentation (e.g. adding tactic profiling/caching, or
       testing shapes/hardware where per-launch overhead dominates more), not as a replacement.
+
+  - **Correction (post-hoc): the "verified bit-identical" CUTLASS-vs-cuBLAS claim above was a
+    false positive.** A separate, unrelated bug (below) caused the CUDA execution provider to
+    silently fail to load in every session that linked `grouped_matmul_cutlass_gemm.cu`, so every
+    "CUDA" run in that comparison had actually fallen back to CPU (`CUTLASS` and `cuBLAS`
+    "results" were both really the CPU reference — hence "bit-identical"). After fixing the load
+    bug, re-testing on genuinely-running CUDA uncovered a **real** CUTLASS weight-layout bug (both
+    now fixed) — see the two bug write-ups under *`GroupedMatMulReduceSum`* below, which affect
+    this op too since both share `grouped_matmul_cutlass_gemm.cu`. The perf table above (which only
+    compares relative wall-clock, not correctness) is unaffected and still stands.
+
+# `GroupedMatMulReduceSum`: fusing the down-projection GEMM with the router-weighted combine
+
+## Motivation
+
+In an expanded (non-fused) MoE layer, the final step is: per-expert down-projection GEMM
+(`GroupedMatMul`, one row per selected token-expert pair) followed by a router-weighted
+`ReduceSum` that combines each token's `k` expert outputs (weighted by that expert's router
+probability) back down to one row per token. `GroupedMatMulReduceSum` is a new contrib op that
+fuses these two steps into one CUDA kernel launch, avoiding materializing the full
+`[M, k, hidden_size]` intermediate in global memory.
+
+- **Schema** (`contrib_defs.cc`): inputs `input [M, k, K]` (per-selection rows, already gathered),
+  `weights [num_groups, K, N]`, `group_indices [M, k]` (int64), `combine_weights [M, k]`
+  (router weights); output `output [M, N]` = `sum_j combine_weights[i,j] * (input[i,j] @
+  weights[group_indices[i,j]])`.
+- **CPU kernel** (`contrib_ops/cpu/grouped_matmul_reduce_sum.{h,cc}`): straightforward reference
+  loop, used as the correctness oracle.
+- **CUDA kernel** (`contrib_ops/cuda/grouped_matmul_reduce_sum.{h,cc}` +
+  `grouped_matmul_reduce_sum_impl.{h,cu}`): gathers/permutes rows into group-contiguous order,
+  runs the per-group GEMM (cuBLAS loop by default, or the same single-launch CUTLASS grouped-GEMM
+  path as `GroupedMatMul` when `ORT_GROUPED_MATMUL_CUDA_IMPL=cutlass` is set — see below), then a
+  finalize kernel that applies `combine_weights` and reduces the `k` selections per token in one
+  pass, writing directly to the `[M, N]` output (no `[M, k, N]` intermediate ever touches HBM).
+
+## Bugs found and fixed while validating this op
+
+Both were latent, pre-existing issues in this session's CUTLASS grouped-GEMM integration
+(`grouped_matmul_cutlass_gemm.cu`), shared by `GroupedMatMul` and `GroupedMatMulReduceSum` — not
+introduced by this fused op, but only surfaced once its correctness tests were run for real.
+
+1. **CUDA EP silent-fallback (build/link bug, not a kernel bug).**
+   `grouped_matmul_cutlass_gemm.cu` `#include`d `core/platform/env_var_utils.h` directly (to read
+   an `ORT_GROUPED_MATMUL_CUDA_IMPL` env-var override) without first including
+   `core/providers/shared_library/provider_api.h`. Without that include defining the
+   `SHARED_PROVIDER` macro, `ParseEnvironmentVariableWithDefault` compiles a direct call to
+   `onnxruntime::Env::Default()` — a **local/hidden** symbol in the provider-bridge build (only
+   the C API surface is exported via the linker version script) — instead of routing through
+   `g_host->Env__Default()`. This produces an **undefined-symbol error at `dlopen` time** for
+   `libonnxruntime_providers_cuda.so`, silently and permanently disabling the CUDA EP for the
+   whole process (ORT's provider registration swallows the load failure and just leaves CUDA out
+   of `get_available_providers()`). **Every "CUDA" correctness/perf run in this session prior to
+   this fix that touched this file was actually running on CPU fallback** — including the
+   `test_cutlass_vs_cublas_correctness.py` "bit-identical" result noted above. **Fix:** replaced
+   the `env_var_utils.h`/`ParseEnvironmentVariableWithDefault` usage with a plain `std::getenv`
+   check (this is a simple benchmarking-only flag, not worth the provider-bridge machinery).
+   **Lesson for future correctness tests:** any test that requests a specific EP via
+   `providers=[...]` must assert `sess.get_providers()` actually contains it — a silent fallback to
+   CPU is indistinguishable from a real pass when CPU is also the reference implementation.
+2. **CUTLASS weight-layout bug (real correctness bug, only visible once CUDA genuinely ran).**
+   `GroupedMatMul`/`GroupedMatMulReduceSum`'s own schema documents weights as row-major
+   `[num_groups, K, N]`, but CUTLASS's `MoeGemmRunner` (the same machinery behind
+   `com.microsoft.MoE`'s GEMM1/GEMM2) expects the weight operand in row-major `[num_groups, N, K]`
+   (MoE's own native, output-dim-major convention) — the CUTLASS integration was passing the
+   `[K, N]`-layout buffer straight through without transposing, producing garbage. **Fix:** added
+   `TransposeGroupedWeightsKernel`/`LaunchTransposeGroupedWeights` (a small per-group transpose
+   kernel) and a caller-allocated `weight_scratch` buffer, transposed once per call before handing
+   off to CUTLASS.
+
+After both fixes, `GroupedMatMulReduceSum`'s CUTLASS path (`ORT_GROUPED_MATMUL_CUDA_IMPL=cutlass`)
+passes all toy correctness cases (fp32/fp16, with/without bias) genuinely on CUDA, matching the
+cuBLAS path. **Known remaining limitation** (shared with `GroupedMatMul`, not investigated
+further since the CUTLASS path is an opt-in benchmarking switch off by default): the underlying
+CUTLASS SIMT (fp32) kernel produces incorrect results for pathological tiny shapes where *both* K
+and N are simultaneously non-tile-aligned (e.g. `K=33, N=29` together — either alone paired with a
+tile-aligned partner is fine). Verified correct at all realistic MoE scales tested (`K`/`N` from
+512 to 4096, matching real `hidden_size`/`inter_size` values, which are always round).
+
+## Performance: expanded MoE with this fusion vs. all-in-one `com.microsoft.MoE`
+
+`benchmark_moe_vs_grouped.py --providers cuda --dtype float16 --fused-reduce --router-impl
+routertopk`, same 18 cases/environment as the *CUDA, float16* section above (A100, ORT built from
+this branch, cuBLAS default GEMM path — i.e. `ORT_GROUPED_MATMUL_CUDA_IMPL` unset). Median ms per
+`Run`, `FR` = expanded MoE with `GroupedMatMul`+`ReduceSum` replaced by the fused
+`GroupedMatMulReduceSum` op. Raw CSV: `results_moe_vs_grouped_cuda_fp16.csv`; console log:
+`results_moe_vs_grouped_cuda_fp16_console.txt`.
+
+| case                | M    | K    | F     | E   | k | fused ms | expanded ms | expanded+FR ms | fused_speedup | FR_speedup |
+|---------------------|-----:|-----:|------:|----:|--:|---------:|------------:|---------------:|--------------:|-----------:|
+| decode-silu         |    1 | 4096 | 14336 |   8 | 2 |    0.410 |       0.487 |           0.500 |          1.19 |       1.22 |
+| decode-swiglu       |    1 | 4096 | 14336 |   8 | 2 |    0.539 |       0.638 |           0.653 |          1.18 |       1.21 |
+| decode-batch8-silu  |    8 | 4096 | 14336 |   8 | 2 |    1.230 |       1.508 |           1.491 |          1.23 |       1.21 |
+| decode-batch32-silu |   32 | 4096 | 14336 |   8 | 2 |    1.272 |       1.573 |           1.539 |          1.24 |       1.21 |
+| small-silu          |  128 | 1024 |  2048 |   8 | 2 |    0.193 |       0.481 |           0.423 |          2.49 |       2.19 |
+| small-silu-bias     |  128 | 1024 |  2048 |   8 | 2 |    0.201 |       0.480 |           0.422 |          2.39 |       2.10 |
+| small-swiglu        |  128 | 1024 |  2048 |   8 | 2 |    0.230 |       0.506 |           0.448 |          2.20 |       1.95 |
+| small-gelu          |  128 | 1024 |  2048 |   8 | 2 |    0.194 |       0.513 |           0.457 |          2.64 |       2.36 |
+| prefill-silu        |  512 | 2048 |  5632 |   8 | 2 |    0.852 |       1.343 |           1.188 |          1.58 |       1.39 |
+| prefill-swiglu      |  512 | 2048 |  5632 |   8 | 2 |    1.066 |       1.606 |           1.462 |          1.51 |       1.37 |
+| prefill-gelu        |  512 | 2048 |  5632 |   8 | 2 |    0.822 |       1.489 |           1.342 |          1.81 |       1.63 |
+| mixtral-silu        | 1024 | 4096 | 14336 |   8 | 2 |    4.047 |       5.347 |           5.087 |          1.32 |       1.26 |
+| mixtral-swiglu      | 1024 | 4096 | 14336 |   8 | 2 |    5.532 |       7.024 |           6.547 |          1.27 |       1.18 |
+| deepseek-many-silu  |  512 | 1024 |  1408 |  64 | 6 |    0.608 |       2.260 |           2.127 |          3.72 |       3.50 |
+| switch-top1-silu    | 1024 |  768 |  3072 | 128 | 1 |    1.132 |       3.746 |           3.576 |          3.31 |       3.16 |
+| large-tokens-swiglu | 2048 | 1024 |  2048 |   8 | 2 |    0.986 |       1.615 |           1.538 |          1.64 |       1.56 |
+| prefill-4k-silu     | 4096 | 2048 |  5632 |   8 | 2 |    4.713 |       7.003 |           6.289 |          1.49 |       1.33 |
+| prefill-8k-silu     | 8192 | 2048 |  5632 |   8 | 2 |   10.537 |      13.610 |          11.821 |          1.29 |       1.12 |
+
+All 18 cases pass correctness (`--strict`, row-wise 99th-percentile relative error, same metric
+as the *CUDA, float16* section above; `FR_relerr` column in the CSV, max 1.18e-3).
+
+**Takeaway: the fusion is a real, consistent partial win, but doesn't close the gap to the
+all-in-one fused `MoE` op.** `expanded+FR` is faster than plain `expanded` in every one of the 18
+cases (up to ~13% faster, e.g. `prefill-silu` 1.343→1.188ms, `prefill-4k-silu` 7.003→6.289ms), but
+`fused_speedup` (all-in-one `MoE` vs. plain expanded) is always larger than `FR_speedup` (all-in-one
+`MoE` vs. expanded+`GroupedMatMulReduceSum`) — i.e. fusing away the combine step recovers only part
+of the gap to `com.microsoft.MoE`, not all of it. This is consistent with the earlier finding that
+most of the gap is in the GEMM execution strategy itself (single grouped-GEMM launch vs. per-group
+cuBLAS loop), not in the surrounding elementwise/reduction ops — fusing the combine step helps
+(fewer kernel launches, no `[M,k,N]` HBM round-trip) but the dominant cost remains the GEMM
+dispatch strategy discussed in *Future work / TODO* above.

@@ -103,6 +103,9 @@ class CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, MoE);
 class CUDA_MS_OP_TYPED_CLASS_NAME(1, float, GroupedMatMul);
 class CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, GroupedMatMul);
 class CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, GroupedMatMul);
+class CUDA_MS_OP_TYPED_CLASS_NAME(1, float, GroupedMatMulReduceSum);
+class CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, GroupedMatMulReduceSum);
+class CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, GroupedMatMulReduceSum);
 class CUDA_MS_OP_TYPED_CLASS_NAME(1, float, SwiGLU);
 class CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, SwiGLU);
 class CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, SwiGLU);
@@ -373,6 +376,9 @@ Status RegisterCudaContribKernels(KernelRegistry& kernel_registry) {
       BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, float, GroupedMatMul)>,
       BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, GroupedMatMul)>,
       BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, GroupedMatMul)>,
+      BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, float, GroupedMatMulReduceSum)>,
+      BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, GroupedMatMulReduceSum)>,
+      BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, GroupedMatMulReduceSum)>,
       BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, float, SwiGLU)>,
       BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, SwiGLU)>,
       BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, SwiGLU)>,

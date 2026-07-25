@@ -407,7 +407,8 @@ def _swiglu_nodes(swiglu_impl, gate_name, linear_name, out_name, np_dtype,
 def build_expanded_model(M, K, F, E, k, activation, elem_type, np_dtype,
                          fc1_w, fc2_w, fc1_b, fc2_b,
                          normalize, router_impl, swiglu_impl,
-                         activation_alpha, activation_beta, swiglu_limit, ext_dir):
+                         activation_alpha, activation_beta, swiglu_limit, ext_dir,
+                         fused_reduce=False):
     is_swiglu = activation == "swiglu"
     fc1_out = _fc1_out(F, activation)
 
@@ -464,22 +465,33 @@ def build_expanded_model(M, K, F, E, k, activation, elem_type, np_dtype,
         nodes += act_nodes
         initializers += act_inits
 
-    # --- FC2 (down projection): GroupedMatMul over [M*k, F] with idx_flat [M*k, 1] ---
-    nodes.append(helper.make_node("Reshape", ["act", "shape_Mk_F"], ["act_flat"]))
-    nodes.append(helper.make_node("Reshape", ["idx", "shape_Mk_1"], ["idx_flat"]))
-    fc2_gmm_inputs = ["act_flat", "fc2_gmm_weights", "idx_flat"]
-    if fc2_b is not None:
-        # MoE fc2 bias is (E, K); GroupedMatMul bias (E, N=K). Same.
-        fc2_gmm_inputs.append("fc2_gmm_bias")
-    nodes.append(helper.make_node("GroupedMatMul", fc2_gmm_inputs, ["down_flat"],
-                                  domain="com.microsoft"))  # [M*k, 1, K]
-    nodes.append(helper.make_node("Reshape", ["down_flat", "shape_M_k_K"], ["down"]))  # [M, k, K]
+    if fused_reduce:
+        # --- FC2 + combine fused: com.microsoft.GroupedMatMulReduceSum takes "act" [M,k,F]
+        # directly (one distinct row per (token, expert-slot) selection -- no reshape needed)
+        # and produces the router-weighted-summed [M, K] output in a single op, replacing
+        # GroupedMatMul + Reshape + Mul + ReduceSum below.
+        fc2_fused_inputs = ["act", "fc2_gmm_weights", "idx", "val"]
+        if fc2_b is not None:
+            fc2_fused_inputs.append("fc2_gmm_bias")
+        nodes.append(helper.make_node("GroupedMatMulReduceSum", fc2_fused_inputs, ["output"],
+                                      domain="com.microsoft"))
+    else:
+        # --- FC2 (down projection): GroupedMatMul over [M*k, F] with idx_flat [M*k, 1] ---
+        nodes.append(helper.make_node("Reshape", ["act", "shape_Mk_F"], ["act_flat"]))
+        nodes.append(helper.make_node("Reshape", ["idx", "shape_Mk_1"], ["idx_flat"]))
+        fc2_gmm_inputs = ["act_flat", "fc2_gmm_weights", "idx_flat"]
+        if fc2_b is not None:
+            # MoE fc2 bias is (E, K); GroupedMatMul bias (E, N=K). Same.
+            fc2_gmm_inputs.append("fc2_gmm_bias")
+        nodes.append(helper.make_node("GroupedMatMul", fc2_gmm_inputs, ["down_flat"],
+                                      domain="com.microsoft"))  # [M*k, 1, K]
+        nodes.append(helper.make_node("Reshape", ["down_flat", "shape_M_k_K"], ["down"]))  # [M, k, K]
 
-    # --- Combine: router-weighted sum over the k expert slots -> [M, K] ---
-    nodes.append(helper.make_node("Unsqueeze", ["val", "neg1"], ["val_u"]))  # [M, k, 1]
-    nodes.append(helper.make_node("Mul", ["down", "val_u"], ["down_weighted"]))
-    nodes.append(helper.make_node("ReduceSum", ["down_weighted", "combine_axis"], ["output"],
-                                  keepdims=0))  # [M, K]
+        # --- Combine: router-weighted sum over the k expert slots -> [M, K] ---
+        nodes.append(helper.make_node("Unsqueeze", ["val", "neg1"], ["val_u"]))  # [M, k, 1]
+        nodes.append(helper.make_node("Mul", ["down", "val_u"], ["down_weighted"]))
+        nodes.append(helper.make_node("ReduceSum", ["down_weighted", "combine_axis"], ["output"],
+                                      keepdims=0))  # [M, K]
 
     output = helper.make_tensor_value_info("output", elem_type, [M, K])
     return _make_model(nodes, inputs, [output], initializers)
@@ -618,9 +630,10 @@ def run_one_model(kind, M, K, F, E, k, activation, elem_type, np_dtype,
                   feeds, provider, args, normalize, with_bias):
     """Generate weights, build the graph, time it, optionally profile it; free everything.
 
-    ``kind`` is "fused" or "expanded". Weights are generated (and, for the expanded model,
-    transposed) here and released before the session is created so that the MoE-layout and
-    GroupedMatMul-layout copies are never resident simultaneously.
+    ``kind`` is "fused", "expanded", or "expanded_fused_reduce" (FC2 + combine fused into a
+    single com.microsoft.GroupedMatMulReduceSum node). Weights are generated (and, for the
+    expanded models, transposed) here and released before the session is created so that the
+    MoE-layout and GroupedMatMul-layout copies are never resident simultaneously.
     """
     # Expert weights are written directly to ONNX external data files (see _raw_const): a single
     # MoE weight tensor can exceed protobuf's hard ~2 GiB per-message limit, so baking it into the
@@ -652,7 +665,7 @@ def run_one_model(kind, M, K, F, E, k, activation, elem_type, np_dtype,
                 fc1_t, fc2_t, fc1_b, fc2_b,
                 normalize, args.router_impl, args.swiglu_impl,
                 args.activation_alpha, args.activation_beta, args.swiglu_limit,
-                tmp_dir)
+                tmp_dir, fused_reduce=(kind == "expanded_fused_reduce"))
             del fc1_t, fc2_t
 
         # Weights are already external; a plain save writes only the (small) ModelProto, whose
@@ -731,6 +744,8 @@ def run_benchmark(args):
 
     header = (f"{'case':<20}{'act':<8}{'regime':<20}{'prov':<6}{'M':>6}{'K':>6}{'F':>7}{'E':>5}"
               f"{'k':>3}{'fused_ms':>11}{'exp_ms':>11}{'fused_speedup':>14}{'max_relerr':>12}{'ok':>4}")
+    if args.fused_reduce:
+        header += f"{'expFR_ms':>11}{'FR_speedup':>12}{'FR_relerr':>12}{'FR_ok':>6}"
     print(header)
     print("-" * len(header))
 
@@ -774,15 +789,34 @@ def run_benchmark(args):
             speedup = exp_s["median"] / fused_s["median"] if ok else float("nan")
             speedup_str = f"{speedup:.2f}x" if ok else "DIVERGED"
 
-            print(f"{name:<20}{activation:<8}{regime:<20}{provider:<6}{M:>6}{K:>6}{F:>7}{E:>5}"
-                  f"{k:>3}{fused_s['median']:>11.3f}{exp_s['median']:>11.3f}{speedup_str:>14}"
-                  f"{relerr:>12.2e}{('yes' if ok else 'NO'):>4}")
+            line = (f"{name:<20}{activation:<8}{regime:<20}{provider:<6}{M:>6}{K:>6}{F:>7}{E:>5}"
+                    f"{k:>3}{fused_s['median']:>11.3f}{exp_s['median']:>11.3f}{speedup_str:>14}"
+                    f"{relerr:>12.2e}{('yes' if ok else 'NO'):>4}")
+
+            fr_s = fr_out = fr_bd = None
+            fr_speedup = fr_relerr = None
+            fr_ok = None
+            if args.fused_reduce:
+                fr_t, fr_out, fr_bd = run_one_model(
+                    "expanded_fused_reduce", M, K, F, E, k, activation, elem_type, np_dtype,
+                    feeds, provider, args, normalize, with_bias)
+                fr_s = _stats_ms(fr_t)
+                fr_relerr, fr_relerr_max, fr_num_outlier_rows = _rel_err_robust(fr_out, fused_out)
+                fr_ok = fr_relerr <= tol
+                fr_speedup = fr_s["median"] / fused_s["median"] if fr_ok else float("nan")
+                fr_speedup_str = f"{fr_speedup:.2f}x" if fr_ok else "DIVERGED"
+                line += (f"{fr_s['median']:>11.3f}{fr_speedup_str:>12}{fr_relerr:>12.2e}"
+                        f"{('yes' if fr_ok else 'NO'):>6}")
+
+            print(line)
 
             if args.profile:
                 if fused_bd:
                     _print_breakdown("fused", fused_bd, fused_s["mean"])
                 if exp_bd:
                     _print_breakdown("expanded", exp_bd, exp_s["mean"])
+                if fr_bd:
+                    _print_breakdown("expanded_fused_reduce", fr_bd, fr_s["mean"])
 
             if num_outlier_rows:
                 print(f"    [INFO] {name}: {num_outlier_rows} row(s) took a different (but "
@@ -798,7 +832,15 @@ def run_benchmark(args):
                     raise AssertionError(
                         f"{name}: rel err {relerr:.3e} > tol {tol:.1e} (strict mode)")
 
-            rows.append(dict(
+            if args.fused_reduce and not fr_ok:
+                print(f"    [WARN] {name}: expanded_fused_reduce 99th-pct rel err {fr_relerr:.3e} "
+                      f"exceeds tol {tol:.1e} vs. fused MoE -- speedup suppressed.")
+                if args.strict:
+                    raise AssertionError(
+                        f"{name}: expanded_fused_reduce rel err {fr_relerr:.3e} > tol {tol:.1e} "
+                        f"(strict mode)")
+
+            row = dict(
                 case=name, activation=activation, regime=regime, provider=provider,
                 M=M, K=K, F=F, num_experts=E, k=k, weight_gib=w_gib, skipped="",
                 fused_median_ms=fused_s["median"], fused_mean_ms=fused_s["mean"],
@@ -807,7 +849,17 @@ def run_benchmark(args):
                 expanded_min_ms=exp_s["min"], expanded_std_ms=exp_s["std"],
                 fused_speedup=(speedup if ok else None), max_relerr=relerr, ok=ok,
                 threads=threads_reported, router_impl=args.router_impl,
-                swiglu_impl=args.swiglu_impl, normalize=int(normalize)))
+                swiglu_impl=args.swiglu_impl, normalize=int(normalize))
+            if args.fused_reduce:
+                row.update(
+                    expanded_fused_reduce_median_ms=fr_s["median"],
+                    expanded_fused_reduce_mean_ms=fr_s["mean"],
+                    expanded_fused_reduce_min_ms=fr_s["min"],
+                    expanded_fused_reduce_std_ms=fr_s["std"],
+                    expanded_fused_reduce_speedup=(fr_speedup if fr_ok else None),
+                    expanded_fused_reduce_max_relerr=fr_relerr,
+                    expanded_fused_reduce_ok=fr_ok)
+            rows.append(row)
 
     if args.csv and rows:
         import csv
@@ -864,6 +916,12 @@ def parse_args():
                    help="Raise if fused and expanded disagree beyond tolerance (default ON).")
     p.add_argument("--no-strict", dest="strict", action="store_false",
                    help="Report divergence as a warning instead of raising.")
+    p.add_argument("--fused-reduce", action="store_true",
+                   help="Also run a third variant: 'expanded' with FC2 (down-projection) + the "
+                        "router-weighted combine fused into a single com.microsoft."
+                        "GroupedMatMulReduceSum node (replacing GroupedMatMul + Reshape + Mul + "
+                        "ReduceSum), and compare it against the fused MoE op alongside the "
+                        "plain 'expanded' baseline.")
     p.add_argument("--csv", default=None, help="Optional path to write results as CSV.")
     args = p.parse_args()
     args.cases = DEFAULT_CASES

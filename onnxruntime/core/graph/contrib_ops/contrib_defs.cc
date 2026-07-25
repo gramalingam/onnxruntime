@@ -1750,6 +1750,92 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
           updateOutputShape(ctx, 0, output_shape);
         }));
 
+constexpr const char* GroupedMatMulReduceSum_ver1_doc = R"DOC(
+Grouped matrix multiplication fused with a per-token weighted combine (Mul + ReduceSum) over
+the expert-selection axis. This fuses GroupedMatMul with the router-weighted-sum pattern used
+for an MoE down-projection (see the "Typical MoE usage" section of docs/GroupedMatMul.md):
+
+    d   = GroupedMatMul(input_flat, weights, group_indices_flat, bias)  # [M*k, 1, N]
+    d   = Reshape(d, [M, k, N])
+    out = ReduceSum(d * Unsqueeze(combine_weights, -1), axis=1)         # [M, N]
+
+Unlike GroupedMatMul's own row-reuse semantics (a single up-projection input row shared across
+its k selected experts), the down-projection's per-slot inputs already differ across the k
+experts of a token (each is the activation of a *different* expert's up-projection). `input`
+therefore has shape (M, k, K): one distinct row per (token, expert-slot) pair, exactly the
+already-reshaped tensor a real MoE down-projection feeds into GroupedMatMul. Semantics:
+
+    for i in range(M):
+        acc = zeros(N)
+        for j in range(k):
+            g = group_indices[i, j]                 # 0 <= g < num_groups
+            r = input[i, j] @ weights[g]             # [K] @ [K, N] -> [N]
+            if bias is not None:
+                r += bias[g]
+            acc += combine_weights[i, j] * r
+        output[i] = acc                              # output shape (M, N)
+
+`weights` and `bias` are shared across all tokens. Empty groups (no selection assigned to a
+group) are valid; the corresponding weight matrix is simply unused.
+)DOC";
+
+ONNX_MS_OPERATOR_SET_SCHEMA(
+    GroupedMatMulReduceSum, 1,
+    OpSchema()
+        .SetDoc(GroupedMatMulReduceSum_ver1_doc)
+        .Input(0,
+               "input",
+               "Input tensor of shape (M, k, K): a distinct row per (token, expert-slot) pair. "
+               "M is the number of tokens, k is the number of experts selected per token, and K "
+               "is the hidden (contraction) dimension.",
+               "T")
+        .Input(1,
+               "weights",
+               "Weight tensor of shape (num_groups, K, N). One K x N weight matrix per group.",
+               "T")
+        .Input(2,
+               "group_indices",
+               "Group assignment per (token, expert-slot) pair, of shape (M, k). Each value "
+               "must be in the range [0, num_groups).",
+               "I")
+        .Input(3,
+               "combine_weights",
+               "Per-selection weight applied before the reduce-sum combine, of shape (M, k), "
+               "e.g. the (optionally renormalized) top-k router probabilities.",
+               "T")
+        .Input(4,
+               "bias",
+               "Optional per-group bias of shape (num_groups, N), added to each selected "
+               "expert result before combining.",
+               "T",
+               OpSchema::Optional)
+        .Output(0,
+                "output",
+                "Combined output tensor of shape (M, N).",
+                "T")
+        .TypeConstraint("T",
+                        {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"},
+                        "Constrain input and output types to float tensors.")
+        .TypeConstraint("I", {"tensor(int64)"}, "Constrain group index type to int64 tensors.")
+        .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
+          propagateElemTypeFromInputToOutput(ctx, 0, 0);
+          if (!hasInputShape(ctx, 0) || !hasInputShape(ctx, 1)) {
+            return;
+          }
+          const auto& input_shape = getInputShape(ctx, 0);
+          const auto& weights_shape = getInputShape(ctx, 1);
+          if (input_shape.dim_size() != 3) {
+            fail_shape_inference("GroupedMatMulReduceSum input must have rank 3 (M, k, K).");
+          }
+          if (weights_shape.dim_size() != 3) {
+            fail_shape_inference("GroupedMatMulReduceSum weights must have rank 3 (num_groups, K, N).");
+          }
+          ONNX_NAMESPACE::TensorShapeProto output_shape;
+          *output_shape.add_dim() = input_shape.dim(0);    // M
+          *output_shape.add_dim() = weights_shape.dim(2);  // N
+          updateOutputShape(ctx, 0, output_shape);
+        }));
+
 constexpr const char* SwiGLU_ver1_doc = R"DOC(
 SwiGLU (Swish-Gated Linear Unit) gated activation, fused into a single elementwise op.
 
