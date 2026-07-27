@@ -10,8 +10,13 @@
     configs.
 - **Full MoE layer: fused `com.microsoft.MoE` vs. `GroupedMatMul`-based expansion**
   (`benchmark_moe_vs_grouped.py`):
-  - **CPU (fp32)**: expanded wins every case (fused is 0.24x–0.90x of expanded speed) — the
-    all-in-one MoE fusion is a **net loss on CPU**.
+  - **CPU (fp32), 24-core host**: expanded wins every case (fused is 0.24x–0.90x of expanded
+    speed). **But this ranking is not a stable property of the two kernels** — on a 96-core host
+    it flips (fused wins) because `GroupedMatMul`'s CPU kernel hands each per-group GEMM the
+    *full, uncapped* thread pool while fused `MoE` caps expert-level parallelism at 8; the
+    uncapped strategy over-parallelizes small per-group GEMMs and regresses ~2.5x from 24→96
+    threads. This is a fixable bug in `GroupedMatMul`, not evidence the fused op is inherently
+    better on CPU (see *The CPU ranking is not fixed* below).
   - **CUDA (fp16)**: ranking flips — **fused MoE wins every case (1.18x–3.72x)**, biggest wins for
     many-expert/low-top-k configs. The gap is in core grouped-GEMM execution, not surrounding glue.
 - **`GroupedMatMul` CUDA GEMM-dispatch investigation**:
@@ -480,6 +485,55 @@ and `GroupedMatMul`. Fusing the glue away cannot recover a gap that the glue doe
   **persists**: `prefill-4k` 0.56 and `prefill-8k` 0.58 (fused ~1.7–1.8× slower on wall-clock).
   This is a steady-state grouped-GEMM efficiency gap on CPU, not a fixed startup cost.
 
+### The CPU ranking is not fixed — it is driven by an uncapped-threads bug in `GroupedMatMul`
+
+The headline table above (24-logical-CPU host) is **not a stable property of the two kernels** —
+it flips on a higher-core-count machine, and the root cause is a concrete threading defect in
+`GroupedMatMul`'s CPU kernel, not an inherent GEMM-efficiency gap.
+
+**The two kernels parallelize along opposite axes:**
+- **Fused `MoE`** (`moe_cpu.cc`) parallelizes **across experts** — `TrySimpleParallelFor` over
+  `num_expert_threads = min(active_experts, max_threads, 8)` (hard-capped at **8**) — but each
+  per-expert GEMM is then called via `ComputeGEMM` → `MlasGemm(..., /*threadpool=*/nullptr, ...)`,
+  i.e. **single-threaded**. Total parallelism is capped at 8 regardless of machine size.
+- **`GroupedMatMul`** (`grouped_matmul.cc`) does **not** parallelize across groups (a plain
+  serial `for` loop) — but hands **each per-group GEMM the full thread pool**
+  (`MlasGemm(..., tp, ...)`, uncapped). Total per-GEMM parallelism scales with however many
+  threads ORT has, with no upper bound.
+
+**On a 96-core host, re-running two representative cases (pinned intra-op threads, `--providers
+cpu`) shows the expanded (`GroupedMatMul`) side regresses sharply as thread count rises, while
+fused `MoE` is essentially flat:**
+
+| case              | E   | rows/group (avg) | exp_ms @ 24 threads | exp_ms @ ~96 threads (auto) | fused_ms @ 24 threads | fused_ms @ ~96 threads |
+|-------------------|----:|------------------:|---------------------:|-----------------------------:|------------------------:|-------------------------:|
+| mixtral-silu      |   8 |                256 |               518.0  |                      1290.9  |                  850.1  |                   881.3  |
+| switch-top1-silu  | 128 |                  8 |               116.2  |                       295.8  |                   79.9  |                    81.2  |
+
+*(Preliminary — a single run each on a shared, non-isolated 96-core host, not averaged over
+multiple trials; the ~2.5x direction and magnitude are large enough to be confident of the
+qualitative effect, but the exact numbers should be treated as indicative, not final.)*
+
+`GroupedMatMul`'s wall-clock time for the *same* GEMM work gets **~2.5x worse** going from 24 to
+~96 threads, while `MoE`'s is flat (as expected — it never uses more than 8 threads total). The
+effect is worst exactly where the per-group row count is smallest (`switch-top1`, ~8 rows/group):
+handing an 8-row-by-4096/768-wide GEMM to ~96 threads is almost pure scheduling/synchronization
+overhead with essentially no compute to parallelize.
+
+**Conclusion: the CPU headline ranking (expanded wins) is an artifact of the specific host's core
+count, not a fair comparison of the two kernels' GEMM efficiency.** On the 24-core host used for
+the headline table, `GroupedMatMul`'s uncapped-thread GEMMs happen to land in a reasonable regime
+and it wins; on a 96-core host the same uncapped strategy over-parallelizes small per-group GEMMs
+and it loses badly to fused `MoE`, whose 8-thread cap (a real limitation on its own, just not the
+one exposed here) incidentally protects it from this failure mode. **This is a genuine,
+fixable bug in `GroupedMatMul`'s CPU kernel** (missing a cap on GEMM thread count relative to
+per-group row count — e.g. don't hand a GEMM more threads than rows, or more generally scale
+per-GEMM thread count to problem size), **not evidence that the fused-op approach is
+fundamentally superior on CPU.** Once fixed, re-running the full sweep above (ideally on a
+range of core counts) is needed before drawing a real conclusion about which CPU kernel is
+faster — the current headline table should be read as "expanded wins on a 24-core host with
+today's un-capped `GroupedMatMul` kernel," not as a general result.
+
 ### Sensitivity (SwiGLU form and router impl)
 
 - **SwiGLU form (`--swiglu-impl`).** The fused side always uses MoE's built-in SwiGLU with
@@ -700,6 +754,20 @@ valid comparisons at every `M`.
     results at the time to be wrong is now fixed too — see the two bug write-ups under
     *`GroupedMatMulReduceSum`* below, which affect this op too since both share
     `grouped_matmul_cutlass_gemm.cu`.
+
+- **[ ] Fix `GroupedMatMul` CPU kernel's uncapped per-GEMM thread count.** As detailed in *The
+  CPU ranking is not fixed* (in the "MoE layer" section above), `grouped_matmul.cc` hands each
+  per-group `MlasGemm` call the full intra-op thread pool with no relation to how many rows are
+  in that group, unlike fused `MoE`'s CPU kernel which caps expert-level parallelism at 8. This
+  is directly responsible for the CPU expanded-vs-fused ranking flipping between a 24-core host
+  (expanded wins) and a 96-core host (fused wins, because `GroupedMatMul` over-parallelizes small
+  per-group GEMMs and regresses ~2.5x). **Proposed fix:** scale the thread count passed to each
+  per-group `MlasGemm` call to that group's row count (e.g. cap it so each thread gets a minimum
+  number of rows, or reuse `concurrency::ThreadPool::DegreeOfParallelism` bounded by
+  `count`/some minimum-rows-per-thread heuristic), rather than always passing the full `tp`.
+  This should stabilize `GroupedMatMul`'s CPU performance across core counts and is a
+  prerequisite for any credible CPU expanded-vs-fused comparison — the current headline CPU
+  table should not be treated as a general result until this is fixed and the sweep re-run.
 
 # `GroupedMatMulReduceSum`: fusing the down-projection GEMM with the router-weighted combine
 
