@@ -18,7 +18,7 @@
   - Root cause of the CUDA gap: `GroupedMatMul`'s per-group `cublasGemmHelper` loop (with a
     device→host sync) vs. MoE's single CUTLASS grouped-GEMM launch.
   - Prototyped a CUTLASS-based alternative for `GroupedMatMul`
-    (`ORT_GROUPED_MATMUL_CUDA_IMPL=cutlass`): **not a clear win** at tested sizes (0.46x–1.10x vs.
+    (`ORT_GROUPED_MATMUL_CUDA_IMPL=cutlass`): **not a clear win** at tested sizes (0.52x–1.29x vs.
     cuBLAS) — kept as an opt-in, not the default.
   - Along the way, found and fixed two bugs: (1) a **CUDA EP silent-fallback** build/link bug that
     had every earlier "CUDA" run in this investigation secretly executing on CPU; (2) a real
@@ -645,31 +645,33 @@ valid comparisons at every `M`.
     `ORT_GROUPED_MATMUL_CUDA_IMPL=cutlass` (default/unset/any other value keeps the original
     cuBLAS-loop path unchanged) — both implementations are kept side by side for benchmarking, per
     `docs/GroupedMatMul.md`'s general-purpose design goals (see the "clear-cut?" discussion below).
-  - **Correctness:** verified bit-identical (`max_abs=0`) against the cuBLAS path across 8 cases
-    spanning float32/float16, with/without bias, non-uniform/odd M-K-N-`num_groups`-`k`, an
-    all-groups-non-power-of-2 case likely to leave some groups empty, and an `M=1` edge case.
+  - **Correctness (re-verified, see *Correction* below for why this was re-run):** small,
+    expected relative error vs. cuBLAS (max ~4.8e-4 fp16, well within fp16 GEMM tolerance from
+    different tensor-core algorithms/accumulation order) — **not** bit-identical. See the fresh
+    *Performance* table below, now collected with genuinely-running CUDA and both bugs fixed
+    (the `max_relerr` column comes from the same run as the timings).
   - **Performance** (`benchmark_grouped_matmul_cutlass_vs_cublas.py`, fp16, bias on, A100,
     `results_cutlass_vs_cublas_cuda_fp16.csv`):
 
-    | case              | M    | k | K    | N    | G  | cublas (ms) | cutlass (ms) | speedup |
-    |-------------------|------|---|------|------|----|-------------|--------------|---------|
-    | large-top2        | 2048 | 2 | 768  | 768  | 32 | 4.386       | 4.306        | 1.02x   |
-    | medium-top2       | 512  | 2 | 768  | 768  | 32 | 3.847       | 3.805        | 1.01x   |
-    | many-experts-top2 | 512  | 2 | 512  | 512  | 64 | 3.797       | 3.968        | 0.96x   |
-    | many-experts      | 512  | 1 | 512  | 512  | 64 | 3.285       | 3.574        | 0.92x   |
-    | large-tokens      | 2048 | 1 | 512  | 512  | 32 | 2.900       | 2.905        | 1.00x   |
-    | medium-dense      | 1024 | 1 | 768  | 768  | 16 | 2.717       | 2.479        | 1.10x   |
-    | wide-hidden       | 256  | 2 | 1024 | 1024 |  8 | 2.213       | 2.355        | 0.94x   |
-    | small-top2        | 512  | 2 | 512  | 512  | 16 | 1.525       | 1.705        | 0.89x   |
-    | small-dense       | 512  | 1 | 768  | 768  |  8 | 1.143       | 1.679        | 0.68x   |
-    | tiny              | 256  | 1 | 512  | 512  |  8 | 0.469       | 1.010        | 0.46x   |
+    | case              | M    | k | K    | N    | G  | cublas (ms) | cutlass (ms) | speedup | max rel err |
+    |-------------------|------|---|------|------|----|-------------|--------------|---------|------------:|
+    | large-top2        | 2048 | 2 | 768  | 768  | 32 | 6.015       | 6.300        | 0.95x   |    4.6e-04 |
+    | large-tokens      | 2048 | 1 | 512  | 512  | 32 | 4.285       | 3.311        | 1.29x   |    0.0     |
+    | many-experts      | 512  | 1 | 512  | 512  | 64 | 4.197       | 4.818        | 0.87x   |    2.9e-04 |
+    | medium-top2       | 512  | 2 | 768  | 768  | 32 | 3.972       | 4.090        | 0.97x   |    4.7e-04 |
+    | many-experts-top2 | 512  | 2 | 512  | 512  | 64 | 3.592       | 3.490        | 1.03x   |    3.0e-04 |
+    | medium-dense      | 1024 | 1 | 768  | 768  | 16 | 2.959       | 2.536        | 1.17x   |    4.3e-04 |
+    | wide-hidden       | 256  | 2 | 1024 | 1024 |  8 | 1.882       | 2.011        | 0.94x   |    3.6e-04 |
+    | small-top2        | 512  | 2 | 512  | 512  | 16 | 1.352       | 1.470        | 0.92x   |    0.0     |
+    | small-dense       | 512  | 1 | 768  | 768  |  8 | 0.899       | 1.517        | 0.59x   |    4.8e-04 |
+    | tiny              | 256  | 1 | 512  | 512  |  8 | 0.470       | 0.897        | 0.52x   |    0.0     |
 
     Takeaways:
     - **No case shows a decisive win.** Small problems (`tiny`, `small-dense`) are *slower* under
-      CUTLASS (0.46x-0.68x): the fixed per-call overhead of constructing a `MoeGemmRunner`,
+      CUTLASS (0.52x-0.59x): the fixed per-call overhead of constructing a `MoeGemmRunner`,
       querying `getConfigs(sm)`, and the extra H2D copy outweighs the savings from launching one
       kernel instead of a few, when each cuBLAS GEMM is already tiny.
-    - Larger/many-group cases are roughly a wash (0.9x-1.1x), not the outsized win the "E launches
+    - Larger/many-group cases are roughly a wash (0.87x-1.29x), not the outsized win the "E launches
       vs. 1" argument alone would predict. The D→H sync + per-group launch overhead this was meant
       to eliminate is evidently already small relative to GEMM compute time at these sizes on
       A100; conversely, unlike `com.microsoft.MoE`'s runner (which profiles multiple tactics and
@@ -680,15 +682,24 @@ valid comparisons at every `M`.
       explicit opt-in for further experimentation (e.g. adding tactic profiling/caching, or
       testing shapes/hardware where per-launch overhead dominates more), not as a replacement.
 
-  - **Correction (post-hoc): the "verified bit-identical" CUTLASS-vs-cuBLAS claim above was a
-    false positive.** A separate, unrelated bug (below) caused the CUDA execution provider to
-    silently fail to load in every session that linked `grouped_matmul_cutlass_gemm.cu`, so every
-    "CUDA" run in that comparison had actually fallen back to CPU (`CUTLASS` and `cuBLAS`
-    "results" were both really the CPU reference — hence "bit-identical"). After fixing the load
-    bug, re-testing on genuinely-running CUDA uncovered a **real** CUTLASS weight-layout bug (both
-    now fixed) — see the two bug write-ups under *`GroupedMatMulReduceSum`* below, which affect
-    this op too since both share `grouped_matmul_cutlass_gemm.cu`. The perf table above (which only
-    compares relative wall-clock, not correctness) is unaffected and still stands.
+  - **Correction (post-hoc): the original "verified bit-identical" CUTLASS-vs-cuBLAS claim was a
+    false positive, and the original performance numbers above were collected before both bugs
+    below were fixed.** A separate, unrelated bug caused the CUDA execution provider to
+    silently fail to load in every session that linked `grouped_matmul_cutlass_gemm.cu`, so the
+    `test_cutlass_vs_cublas_correctness.py` run backing that claim (which, unlike the perf script
+    above, did not check `sess.get_providers()`) had actually fallen back to CPU (`CUTLASS` and
+    `cuBLAS` "results" were both really the CPU reference — hence "bit-identical"). The perf
+    script above *does* check `sess.get_providers()` and raises if CUDA didn't load, so its
+    relative-timing numbers were plausibly genuine CUDA even before the fix — but its outputs at
+    the time were unvalidated for correctness (the weight-layout bug below was still present, so
+    CUTLASS's numeric results, though timed correctly, were wrong). **The table above has now been
+    re-collected end to end** (timings and `max_relerr`) with both bugs fixed, confirmed to be
+    genuinely running on CUDA with real fp16 GEMM-level agreement (not bit-identical, not a global
+    CPU-fallback artifact) — the qualitative conclusion (no decisive CUTLASS win at these sizes) is
+    unchanged from the original run. The weight-layout bug (below) that caused CUTLASS's numeric
+    results at the time to be wrong is now fixed too — see the two bug write-ups under
+    *`GroupedMatMulReduceSum`* below, which affect this op too since both share
+    `grouped_matmul_cutlass_gemm.cu`.
 
 # `GroupedMatMulReduceSum`: fusing the down-projection GEMM with the router-weighted combine
 
