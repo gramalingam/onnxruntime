@@ -11,12 +11,8 @@
 - **Full MoE layer: fused `com.microsoft.MoE` vs. `GroupedMatMul`-based expansion**
   (`benchmark_moe_vs_grouped.py`):
   - **CPU (fp32), 24-core host**: expanded wins every case (fused is 0.24x–0.90x of expanded
-    speed). **But this ranking is not a stable property of the two kernels** — on a 96-core host
-    it flips (fused wins) because `GroupedMatMul`'s CPU kernel hands each per-group GEMM the
-    *full, uncapped* thread pool while fused `MoE` caps expert-level parallelism at 8; the
-    uncapped strategy over-parallelizes small per-group GEMMs and regresses ~2.5x from 24→96
-    threads. This is a fixable bug in `GroupedMatMul`, not evidence the fused op is inherently
-    better on CPU (see *The CPU ranking is not fixed* below).
+    speed). **But this ranking is not a stable property of the two kernels** — it flips
+    (fused wins) on a 96-core host (see *The CPU ranking is not fixed* below).
   - **CUDA (fp16)**: ranking flips — **fused MoE wins every case (1.18x–3.72x)**, biggest wins for
     many-expert/low-top-k configs. The gap is in core grouped-GEMM execution, not surrounding glue.
 - **`GroupedMatMul` CUDA GEMM-dispatch investigation**:
@@ -879,3 +875,17 @@ most of the gap is in the GEMM execution strategy itself (single grouped-GEMM la
 cuBLAS loop), not in the surrounding elementwise/reduction ops — fusing the combine step helps
 (fewer kernel launches, no `[M,k,N]` HBM round-trip) but the dominant cost remains the GEMM
 dispatch strategy discussed in *Future work / TODO* above.
+
+**What the remaining gap actually is.** `FR_speedup` — `com.microsoft.MoE` is still **1.12x–3.50x**
+faster than `expanded+FR` across the 18 cases (median ≈1.3x), i.e. `expanded+FR` still takes
+roughly **12%–250% longer** than the all-in-one op depending on shape (worst at low-M/many-expert
+cases like `deepseek-many-silu` and `switch-top1-silu`, best at large compute-bound prefill
+cases). That residual is the two `GroupedMatMul` GEMMs' own execution cost — the device→host sync
++ per-group `cublasGemmHelper` launch loop described in *Future work / TODO* — which
+`GroupedMatMulReduceSum` does not touch (it only fuses what comes *after* FC2). Note this gap is
+**not** closed by simply swapping the GEMM backend either: the CUTLASS-based `GroupedMatMul`
+prototype (`ORT_GROUPED_MATMUL_CUDA_IMPL=cutlass`, benchmarked separately above) also failed to
+show a clear win over the cuBLAS loop at these sizes, so a like-for-like GEMM substitution isn't
+enough — closing this gap likely needs the full device-side dispatch rework proposed in *Future
+work / TODO* (device-side per-expert offsets + a single grouped-GEMM launch, à la MoE's
+`kDeviceOnly` CUTLASS scheduling), not just a different GEMM library called the same way.
