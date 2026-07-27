@@ -1,3 +1,36 @@
+# TL;DR
+
+- **`GroupedMatMul` fused op vs. its standard-op decomposition (CPU)**: fused is **~8–21x
+  faster**, and the decomposition also duplicates weights `O(M·k·K·N)`, OOMing at realistic
+  scale. Clear win — never use the decomposition in practice.
+- **MoE component-level fusion candidates, CPU** (`benchmark_moe_fusions.py`):
+  - SwiGLU gated-activation (`Sigmoid+Mul+Mul` → fused): **~1.6–2.4x**, the bigger lever (largest
+    tensors in the layer).
+  - Router `Softmax→TopK` fusion: smaller win, **~1.1–1.9x**, best for low-top-k/many-expert
+    configs.
+- **Full MoE layer: fused `com.microsoft.MoE` vs. `GroupedMatMul`-based expansion**
+  (`benchmark_moe_vs_grouped.py`):
+  - **CPU (fp32)**: expanded wins every case (fused is 0.24x–0.90x of expanded speed) — the
+    all-in-one MoE fusion is a **net loss on CPU**.
+  - **CUDA (fp16)**: ranking flips — **fused MoE wins every case (1.18x–3.72x)**, biggest wins for
+    many-expert/low-top-k configs. The gap is in core grouped-GEMM execution, not surrounding glue.
+- **`GroupedMatMul` CUDA GEMM-dispatch investigation**:
+  - Root cause of the CUDA gap: `GroupedMatMul`'s per-group `cublasGemmHelper` loop (with a
+    device→host sync) vs. MoE's single CUTLASS grouped-GEMM launch.
+  - Prototyped a CUTLASS-based alternative for `GroupedMatMul`
+    (`ORT_GROUPED_MATMUL_CUDA_IMPL=cutlass`): **not a clear win** at tested sizes (0.46x–1.10x vs.
+    cuBLAS) — kept as an opt-in, not the default.
+  - Along the way, found and fixed two bugs: (1) a **CUDA EP silent-fallback** build/link bug that
+    had every earlier "CUDA" run in this investigation secretly executing on CPU; (2) a real
+    **CUTLASS weight-layout bug** (weights need transposing before CUTLASS, MoE's native layout is
+    the transpose of `GroupedMatMul`'s).
+- **New op `GroupedMatMulReduceSum`** (fuses `GroupedMatMul` FC2 + the router-weighted `ReduceSum`
+  combine into one CUDA kernel): validated correct (CPU + CUDA, cuBLAS and CUTLASS paths); on CUDA
+  fp16 gives a consistent **~5–20% speedup over plain expanded MoE**, but doesn't close the full
+  gap to the all-in-one fused `MoE` op.
+
+---
+
 # GroupedMatMul: fused op vs. function-definition expansion — performance
 
 This experiment compares the fused contrib op **`com.microsoft.GroupedMatMul`** against its
@@ -52,40 +85,40 @@ Latency is mean wall-clock milliseconds per `Run`.
 
 | case         |    M | k |    K |    N |  G | fused ms | decomp ms | speedup | max rel err |
 |--------------|-----:|--:|-----:|-----:|---:|---------:|----------:|--------:|------------:|
-| tiny         |  256 | 1 |  512 |  512 |  8 |    1.013 |    16.807 |  16.58x |    4.5e-07  |
-| small-dense  |  512 | 1 |  768 |  768 |  8 |    3.759 |    78.156 |  20.79x |    6.5e-07  |
-| small-top2   |  512 | 2 |  512 |  512 | 16 |    3.559 |    70.970 |  19.94x |    6.1e-07  |
-| medium-dense | 1024 | 1 |  768 |  768 | 16 |    9.475 |   161.765 |  17.07x |    5.8e-07  |
 | medium-top2  |  512 | 2 |  768 |  768 | 32 |    9.839 |   178.145 |  18.11x |    7.0e-07  |
+| medium-dense | 1024 | 1 |  768 |  768 | 16 |    9.475 |   161.765 |  17.07x |    5.8e-07  |
 | large-tokens | 2048 | 1 |  512 |  512 | 32 |    8.652 |   152.460 |  17.62x |    5.3e-07  |
 | wide-hidden  |  256 | 2 | 1024 | 1024 |  8 |    7.917 |   146.166 |  18.46x |    6.1e-07  |
 | many-experts |  512 | 1 |  512 |  512 | 64 |    4.532 |    42.236 |   9.32x |    5.0e-07  |
+| small-dense  |  512 | 1 |  768 |  768 |  8 |    3.759 |    78.156 |  20.79x |    6.5e-07  |
+| small-top2   |  512 | 2 |  512 |  512 | 16 |    3.559 |    70.970 |  19.94x |    6.1e-07  |
+| tiny         |  256 | 1 |  512 |  512 |  8 |    1.013 |    16.807 |  16.58x |    4.5e-07  |
 
 ### CPU, float32 (with bias)
 
 | case         | fused ms | decomp ms | speedup |
 |--------------|---------:|----------:|--------:|
-| tiny         |    1.029 |    16.930 |  16.45x |
-| small-dense  |    3.789 |    78.884 |  20.82x |
-| small-top2   |    3.655 |    71.043 |  19.44x |
-| medium-dense |    8.297 |   161.592 |  19.48x |
 | medium-top2  |   10.255 |   177.944 |  17.35x |
 | large-tokens |    9.340 |   152.366 |  16.31x |
+| medium-dense |    8.297 |   161.592 |  19.48x |
 | wide-hidden  |    8.267 |   149.062 |  18.03x |
 | many-experts |    5.065 |    41.696 |   8.23x |
+| small-dense  |    3.789 |    78.884 |  20.82x |
+| small-top2   |    3.655 |    71.043 |  19.44x |
+| tiny         |    1.029 |    16.930 |  16.45x |
 
 ### CPU, float16 (no bias)
 
 | case         | fused ms | decomp ms | speedup | max rel err |
 |--------------|---------:|----------:|--------:|------------:|
-| tiny         |    1.306 |    16.945 |  12.97x |    2.9e-04  |
-| small-dense  |    4.586 |    81.234 |  17.71x |    4.8e-04  |
-| small-top2   |    4.271 |    72.485 |  16.97x |    2.8e-04  |
-| medium-dense |    9.788 |   169.004 |  17.27x |    4.4e-04  |
 | medium-top2  |   15.022 |   187.968 |  12.51x |    4.8e-04  |
 | large-tokens |   10.814 |   151.038 |  13.97x |    5.4e-04  |
+| medium-dense |    9.788 |   169.004 |  17.27x |    4.4e-04  |
 | wide-hidden  |    9.220 |   153.267 |  16.62x |    3.6e-04  |
 | many-experts |    9.199 |    44.095 |   4.79x |    2.9e-04  |
+| small-dense  |    4.586 |    81.234 |  17.71x |    4.8e-04  |
+| small-top2   |    4.271 |    72.485 |  16.97x |    2.8e-04  |
+| tiny         |    1.306 |    16.945 |  12.97x |    2.9e-04  |
 
 Raw CSVs: `results_cpu_fp32.csv`, `results_cpu_fp32_bias.csv`, `results_cpu_fp16.csv`.
 
@@ -170,21 +203,21 @@ Environment: 4-core x86-64 CPU, 15 GiB RAM, stock ONNX Runtime 1.27.0 (CPU EP),
 
 | case         |    T |     F | unfused ms | quickgelu ms | fused_lb ms | unfused/lb | qg/lb |
 |--------------|-----:|------:|-----------:|-------------:|------------:|-----------:|------:|
-| small        |  512 |  2048 |     0.4642 |       0.4673 |      0.2351 |      1.97x | 1.99x |
-| mixtral-ffn  | 1024 | 14336 |    10.8825 |      10.9013 |      6.1769 |      1.76x | 1.76x |
-| deepseek-ffn | 2048 |  1408 |     1.8996 |       1.9792 |      0.8079 |      2.35x | 2.45x |
-| wide         | 1024 |  8192 |     5.9711 |       6.0188 |      3.4434 |      1.73x | 1.75x |
 | many-tokens  | 8192 |  4096 |    25.4093 |      25.3144 |     14.5151 |      1.75x | 1.74x |
+| mixtral-ffn  | 1024 | 14336 |    10.8825 |      10.9013 |      6.1769 |      1.76x | 1.76x |
+| wide         | 1024 |  8192 |     5.9711 |       6.0188 |      3.4434 |      1.73x | 1.75x |
+| deepseek-ffn | 2048 |  1408 |     1.8996 |       1.9792 |      0.8079 |      2.35x | 2.45x |
+| small        |  512 |  2048 |     0.4642 |       0.4673 |      0.2351 |      1.97x | 1.99x |
 
 **float16**
 
 | case         | unfused ms | quickgelu ms | fused_lb ms | unfused/lb | qg/lb |
 |--------------|-----------:|-------------:|------------:|-----------:|------:|
-| small        |     1.0048 |       0.7839 |      0.5676 |      1.77x | 1.38x |
-| mixtral-ffn  |    28.1380 |      21.6397 |     16.9777 |      1.66x | 1.27x |
-| deepseek-ffn |     4.3555 |       2.8420 |      2.2594 |      1.93x | 1.26x |
-| wide         |    15.1434 |      11.5234 |      9.5571 |      1.58x | 1.21x |
 | many-tokens  |    63.7327 |      47.9868 |     38.1889 |      1.67x | 1.26x |
+| mixtral-ffn  |    28.1380 |      21.6397 |     16.9777 |      1.66x | 1.27x |
+| wide         |    15.1434 |      11.5234 |      9.5571 |      1.58x | 1.21x |
+| deepseek-ffn |     4.3555 |       2.8420 |      2.2594 |      1.93x | 1.26x |
+| small        |     1.0048 |       0.7839 |      0.5676 |      1.77x | 1.38x |
 
 ### Candidate B — Router, CPU
 
@@ -192,20 +225,20 @@ Environment: 4-core x86-64 CPU, 15 GiB RAM, stock ONNX Runtime 1.27.0 (CPU EP),
 
 | case          |    M |   E | k | naive ms | fused ms | speedup | max rel err |
 |---------------|-----:|----:|--:|---------:|---------:|--------:|------------:|
-| mixtral       | 4096 |   8 | 2 |   0.3869 |   0.3280 |   1.18x |   1.2e-07   |
+| large-experts | 8192 | 256 | 8 |   5.6638 |   4.7160 |   1.20x |   1.4e-07   |
 | deepseek      | 4096 |  64 | 6 |   1.2939 |   1.1491 |   1.13x |   1.1e-07   |
 | switch-many   | 4096 | 128 | 1 |   0.5844 |   0.3433 |   1.70x |   0.0       |
-| large-experts | 8192 | 256 | 8 |   5.6638 |   4.7160 |   1.20x |   1.4e-07   |
+| mixtral       | 4096 |   8 | 2 |   0.3869 |   0.3280 |   1.18x |   1.2e-07   |
 | small-batch   |  512 |  32 | 4 |   0.1277 |   0.1195 |   1.07x |   7.4e-08   |
 
 **float16**
 
 | case          | naive ms | fused ms | speedup |
 |---------------|---------:|---------:|--------:|
-| mixtral       |   0.5716 |   0.4939 |   1.16x |
-| deepseek      |   1.3857 |   1.2248 |   1.13x |
-| switch-many   |   0.7896 |   0.4152 |   1.90x |
 | large-experts |   6.3966 |   5.0442 |   1.27x |
+| deepseek      |   1.3857 |   1.2248 |   1.13x |
+| mixtral       |   0.5716 |   0.4939 |   1.16x |
+| switch-many   |   0.7896 |   0.4152 |   1.90x |
 | small-batch   |   0.1820 |   0.1624 |   1.12x |
 
 Raw CSVs: `results_moe_fusions_cpu_fp32.csv`, `results_moe_fusions_cpu_fp16.csv`.
@@ -386,24 +419,24 @@ long as the expanded form.
 
 | case                | regime              |    M |   K |     F |   E | k | fused ms | expanded ms | fused_speedup | max rel err |
 |---------------------|---------------------|-----:|----:|------:|----:|--:|---------:|------------:|--------------:|------------:|
-| decode-silu         | decode/launch-bound |    1 | 4096| 14336 |   8 | 2 |   78.256 |      18.599 |      **0.24** |    1.8e-06 |
-| decode-swiglu       | decode/launch-bound |    1 | 4096| 14336 |   8 | 2 |  115.049 |      29.742 |      **0.26** |    2.1e-06 |
-| decode-batch8-silu  | decode-batch        |    8 | 4096| 14336 |   8 | 2 |  122.278 |     105.754 |          0.86 |    1.7e-06 |
+| prefill-8k-silu     | compute anchor      | 8192 | 2048|  5632 |   8 | 2 | 2480.652 |    1431.243 |          0.58 |    3.4e-07 |
+| mixtral-swiglu      | prefill/compute     | 1024 | 4096| 14336 |   8 | 2 | 2068.742 |    1285.123 |          0.62 |    3.8e-07 |
+| mixtral-silu        | prefill/compute     | 1024 | 4096| 14336 |   8 | 2 | 1397.386 |     804.437 |          0.58 |    4.2e-07 |
+| prefill-4k-silu     | compute anchor      | 4096 | 2048|  5632 |   8 | 2 | 1148.656 |     648.608 |          0.56 |    3.1e-07 |
+| prefill-swiglu      | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |  220.354 |     147.892 |          0.67 |    2.7e-07 |
 | decode-batch32-silu | decode-batch        |   32 | 4096| 14336 |   8 | 2 |  152.325 |     136.391 |          0.90 |    3.3e-07 |
-| small-silu          | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |    8.786 |       7.808 |          0.89 |    2.7e-07 |
-| small-silu-bias     | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |   16.000 |       8.260 |          0.52 |    2.8e-07 |
+| large-tokens-swiglu | prefill/compute     | 2048 | 1024|  2048 |   8 | 2 |  212.220 |     113.240 |          0.53 |    2.6e-07 |
+| decode-batch8-silu  | decode-batch        |    8 | 4096| 14336 |   8 | 2 |  122.278 |     105.754 |          0.86 |    1.7e-06 |
+| switch-top1-silu    | prefill/compute     | 1024 |  768|  3072 | 128 | 1 |  116.748 |      99.492 |          0.85 |    4.0e-07 |
+| prefill-gelu        | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |  170.512 |      97.699 |          0.57 |    3.1e-07 |
+| prefill-silu        | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |  155.435 |      93.638 |          0.60 |    2.8e-07 |
+| deepseek-many-silu  | prefill/compute     |  512 | 1024|  1408 |  64 | 6 |   76.775 |      56.644 |          0.74 |    2.6e-07 |
+| decode-swiglu       | decode/launch-bound |    1 | 4096| 14336 |   8 | 2 |  115.049 |      29.742 |      **0.26** |    2.1e-06 |
+| decode-silu         | decode/launch-bound |    1 | 4096| 14336 |   8 | 2 |   78.256 |      18.599 |      **0.24** |    1.8e-06 |
 | small-swiglu        | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |   18.049 |      11.869 |          0.66 |    2.8e-07 |
 | small-gelu          | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |   15.120 |       8.512 |          0.56 |    2.6e-07 |
-| deepseek-many-silu  | prefill/compute     |  512 | 1024|  1408 |  64 | 6 |   76.775 |      56.644 |          0.74 |    2.6e-07 |
-| prefill-silu        | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |  155.435 |      93.638 |          0.60 |    2.8e-07 |
-| prefill-swiglu      | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |  220.354 |     147.892 |          0.67 |    2.7e-07 |
-| prefill-gelu        | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |  170.512 |      97.699 |          0.57 |    3.1e-07 |
-| switch-top1-silu    | prefill/compute     | 1024 |  768|  3072 | 128 | 1 |  116.748 |      99.492 |          0.85 |    4.0e-07 |
-| mixtral-silu        | prefill/compute     | 1024 | 4096| 14336 |   8 | 2 | 1397.386 |     804.437 |          0.58 |    4.2e-07 |
-| mixtral-swiglu      | prefill/compute     | 1024 | 4096| 14336 |   8 | 2 | 2068.742 |    1285.123 |          0.62 |    3.8e-07 |
-| large-tokens-swiglu | prefill/compute     | 2048 | 1024|  2048 |   8 | 2 |  212.220 |     113.240 |          0.53 |    2.6e-07 |
-| prefill-4k-silu     | compute anchor      | 4096 | 2048|  5632 |   8 | 2 | 1148.656 |     648.608 |          0.56 |    3.1e-07 |
-| prefill-8k-silu     | compute anchor      | 8192 | 2048|  5632 |   8 | 2 | 2480.652 |    1431.243 |          0.58 |    3.4e-07 |
+| small-silu-bias     | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |   16.000 |       8.260 |          0.52 |    2.8e-07 |
+| small-silu          | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |    8.786 |       7.808 |          0.89 |    2.7e-07 |
 
 Raw CSVs: `results_moe_vs_grouped_cpu_fp32_{expanded,fusedop}_{softmaxtopk,routertopk}.csv`;
 consolidated console tables in `results_moe_vs_grouped_cpu_fp32_console.txt`.
@@ -496,24 +529,24 @@ per `Run`. Raw CSV: `results_moe_vs_grouped_cuda_fp16.csv`; console log:
 
 | case                | regime              |    M |   K |     F |   E | k | fused ms | expanded ms | fused_speedup | max rel err |     |
 |---------------------|---------------------|-----:|----:|------:|----:|--:|---------:|------------:|--------------:|------------:|-----|
-| decode-silu         | decode/launch-bound |    1 | 4096| 14336 |   8 | 2 |    0.419 |       0.513 |      **1.22** |    7.7e-04 |     |
-| decode-swiglu       | decode/launch-bound |    1 | 4096| 14336 |   8 | 2 |    0.543 |       0.664 |      **1.22** |    1.1e-03 |     |
-| decode-batch8-silu  | decode-batch        |    8 | 4096| 14336 |   8 | 2 |    1.225 |       1.540 |          1.26 |    1.2e-03 |     |
-| decode-batch32-silu | decode-batch        |   32 | 4096| 14336 |   8 | 2 |    1.301 |       1.620 |          1.24 |    1.2e-03 |     |
-| small-silu          | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |    0.236 |       0.564 |          2.39 |    9.0e-04 |     |
-| small-silu-bias     | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |    0.242 |       0.517 |          2.14 |    9.1e-04 |     |
-| small-swiglu        | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |    0.247 |       0.548 |          2.22 |    1.2e-03 |     |
-| small-gelu          | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |    0.209 |       0.552 |          2.65 |    8.6e-04 |     |
-| prefill-silu        | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |    0.928 |       1.659 |          1.79 |    1.0e-03 |     |
-| prefill-swiglu      | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |    1.276 |       1.911 |          1.50 |    1.1e-03 |     |
-| prefill-gelu        | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |    1.097 |       1.793 |          1.63 |    9.5e-04 |     |
-| deepseek-many-silu  | prefill/compute     |  512 | 1024|  1408 |  64 | 6 |    0.653 |       2.280 |      **3.49** |    8.6e-04 |     |
-| switch-top1-silu    | prefill/compute     | 1024 |  768|  3072 | 128 | 1 |    1.182 |       3.856 |      **3.26** |    6.5e-04 |     |
-| mixtral-silu        | prefill/compute     | 1024 | 4096| 14336 |   8 | 2 |    4.290 |       5.928 |          1.38 |    1.1e-03 |     |
-| mixtral-swiglu      | prefill/compute     | 1024 | 4096| 14336 |   8 | 2 |    5.728 |       7.327 |          1.28 |    1.0e-03 |     |
-| large-tokens-swiglu | prefill/compute     | 2048 | 1024|  2048 |   8 | 2 |    1.117 |       1.951 |          1.75 |    1.1e-03 |     |
-| prefill-4k-silu     | compute anchor      | 4096 | 2048|  5632 |   8 | 2 |    5.195 |       7.603 |          1.46 |    9.6e-04 |     |
 | prefill-8k-silu     | compute anchor      | 8192 | 2048|  5632 |   8 | 2 |   10.530 |      14.426 |          1.37 |    1.2e-03 |     |
+| mixtral-swiglu      | prefill/compute     | 1024 | 4096| 14336 |   8 | 2 |    5.728 |       7.327 |          1.28 |    1.0e-03 |     |
+| prefill-4k-silu     | compute anchor      | 4096 | 2048|  5632 |   8 | 2 |    5.195 |       7.603 |          1.46 |    9.6e-04 |     |
+| mixtral-silu        | prefill/compute     | 1024 | 4096| 14336 |   8 | 2 |    4.290 |       5.928 |          1.38 |    1.1e-03 |     |
+| decode-batch32-silu | decode-batch        |   32 | 4096| 14336 |   8 | 2 |    1.301 |       1.620 |          1.24 |    1.2e-03 |     |
+| prefill-swiglu      | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |    1.276 |       1.911 |          1.50 |    1.1e-03 |     |
+| decode-batch8-silu  | decode-batch        |    8 | 4096| 14336 |   8 | 2 |    1.225 |       1.540 |          1.26 |    1.2e-03 |     |
+| switch-top1-silu    | prefill/compute     | 1024 |  768|  3072 | 128 | 1 |    1.182 |       3.856 |      **3.26** |    6.5e-04 |     |
+| large-tokens-swiglu | prefill/compute     | 2048 | 1024|  2048 |   8 | 2 |    1.117 |       1.951 |          1.75 |    1.1e-03 |     |
+| prefill-gelu        | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |    1.097 |       1.793 |          1.63 |    9.5e-04 |     |
+| prefill-silu        | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |    0.928 |       1.659 |          1.79 |    1.0e-03 |     |
+| deepseek-many-silu  | prefill/compute     |  512 | 1024|  1408 |  64 | 6 |    0.653 |       2.280 |      **3.49** |    8.6e-04 |     |
+| decode-swiglu       | decode/launch-bound |    1 | 4096| 14336 |   8 | 2 |    0.543 |       0.664 |      **1.22** |    1.1e-03 |     |
+| decode-silu         | decode/launch-bound |    1 | 4096| 14336 |   8 | 2 |    0.419 |       0.513 |      **1.22** |    7.7e-04 |     |
+| small-swiglu        | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |    0.247 |       0.548 |          2.22 |    1.2e-03 |     |
+| small-silu-bias     | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |    0.242 |       0.517 |          2.14 |    9.1e-04 |     |
+| small-silu          | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |    0.236 |       0.564 |          2.39 |    9.0e-04 |     |
+| small-gelu          | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |    0.209 |       0.552 |          2.65 |    8.6e-04 |     |
 
 **Headline: for every case, the fused `com.microsoft.MoE` kernel is faster than the expanded
 `GroupedMatMul` form on CUDA fp16** — the opposite ranking from CPU fp32, and consistent across
@@ -620,16 +653,16 @@ valid comparisons at every `M`.
 
     | case              | M    | k | K    | N    | G  | cublas (ms) | cutlass (ms) | speedup |
     |-------------------|------|---|------|------|----|-------------|--------------|---------|
-    | tiny              | 256  | 1 | 512  | 512  | 8  | 0.469       | 1.010        | 0.46x   |
-    | small-dense       | 512  | 1 | 768  | 768  | 8  | 1.143       | 1.679        | 0.68x   |
-    | small-top2        | 512  | 2 | 512  | 512  | 16 | 1.525       | 1.705        | 0.89x   |
-    | medium-dense      | 1024 | 1 | 768  | 768  | 16 | 2.717       | 2.479        | 1.10x   |
-    | medium-top2       | 512  | 2 | 768  | 768  | 32 | 3.847       | 3.805        | 1.01x   |
-    | large-tokens      | 2048 | 1 | 512  | 512  | 32 | 2.900       | 2.905        | 1.00x   |
     | large-top2        | 2048 | 2 | 768  | 768  | 32 | 4.386       | 4.306        | 1.02x   |
-    | wide-hidden       | 256  | 2 | 1024 | 1024 | 8  | 2.213       | 2.355        | 0.94x   |
-    | many-experts      | 512  | 1 | 512  | 512  | 64 | 3.285       | 3.574        | 0.92x   |
+    | medium-top2       | 512  | 2 | 768  | 768  | 32 | 3.847       | 3.805        | 1.01x   |
     | many-experts-top2 | 512  | 2 | 512  | 512  | 64 | 3.797       | 3.968        | 0.96x   |
+    | many-experts      | 512  | 1 | 512  | 512  | 64 | 3.285       | 3.574        | 0.92x   |
+    | large-tokens      | 2048 | 1 | 512  | 512  | 32 | 2.900       | 2.905        | 1.00x   |
+    | medium-dense      | 1024 | 1 | 768  | 768  | 16 | 2.717       | 2.479        | 1.10x   |
+    | wide-hidden       | 256  | 2 | 1024 | 1024 |  8 | 2.213       | 2.355        | 0.94x   |
+    | small-top2        | 512  | 2 | 512  | 512  | 16 | 1.525       | 1.705        | 0.89x   |
+    | small-dense       | 512  | 1 | 768  | 768  |  8 | 1.143       | 1.679        | 0.68x   |
+    | tiny              | 256  | 1 | 512  | 512  |  8 | 0.469       | 1.010        | 0.46x   |
 
     Takeaways:
     - **No case shows a decisive win.** Small problems (`tiny`, `small-dense`) are *slower* under
@@ -735,24 +768,24 @@ this branch, cuBLAS default GEMM path — i.e. `ORT_GROUPED_MATMUL_CUDA_IMPL` un
 
 | case                | M    | K    | F     | E   | k | fused ms | expanded ms | expanded+FR ms | fused_speedup | FR_speedup |
 |---------------------|-----:|-----:|------:|----:|--:|---------:|------------:|---------------:|--------------:|-----------:|
-| decode-silu         |    1 | 4096 | 14336 |   8 | 2 |    0.410 |       0.487 |           0.500 |          1.19 |       1.22 |
-| decode-swiglu       |    1 | 4096 | 14336 |   8 | 2 |    0.539 |       0.638 |           0.653 |          1.18 |       1.21 |
-| decode-batch8-silu  |    8 | 4096 | 14336 |   8 | 2 |    1.230 |       1.508 |           1.491 |          1.23 |       1.21 |
-| decode-batch32-silu |   32 | 4096 | 14336 |   8 | 2 |    1.272 |       1.573 |           1.539 |          1.24 |       1.21 |
-| small-silu          |  128 | 1024 |  2048 |   8 | 2 |    0.193 |       0.481 |           0.423 |          2.49 |       2.19 |
-| small-silu-bias     |  128 | 1024 |  2048 |   8 | 2 |    0.201 |       0.480 |           0.422 |          2.39 |       2.10 |
-| small-swiglu        |  128 | 1024 |  2048 |   8 | 2 |    0.230 |       0.506 |           0.448 |          2.20 |       1.95 |
-| small-gelu          |  128 | 1024 |  2048 |   8 | 2 |    0.194 |       0.513 |           0.457 |          2.64 |       2.36 |
-| prefill-silu        |  512 | 2048 |  5632 |   8 | 2 |    0.852 |       1.343 |           1.188 |          1.58 |       1.39 |
-| prefill-swiglu      |  512 | 2048 |  5632 |   8 | 2 |    1.066 |       1.606 |           1.462 |          1.51 |       1.37 |
-| prefill-gelu        |  512 | 2048 |  5632 |   8 | 2 |    0.822 |       1.489 |           1.342 |          1.81 |       1.63 |
-| mixtral-silu        | 1024 | 4096 | 14336 |   8 | 2 |    4.047 |       5.347 |           5.087 |          1.32 |       1.26 |
-| mixtral-swiglu      | 1024 | 4096 | 14336 |   8 | 2 |    5.532 |       7.024 |           6.547 |          1.27 |       1.18 |
-| deepseek-many-silu  |  512 | 1024 |  1408 |  64 | 6 |    0.608 |       2.260 |           2.127 |          3.72 |       3.50 |
-| switch-top1-silu    | 1024 |  768 |  3072 | 128 | 1 |    1.132 |       3.746 |           3.576 |          3.31 |       3.16 |
-| large-tokens-swiglu | 2048 | 1024 |  2048 |   8 | 2 |    0.986 |       1.615 |           1.538 |          1.64 |       1.56 |
-| prefill-4k-silu     | 4096 | 2048 |  5632 |   8 | 2 |    4.713 |       7.003 |           6.289 |          1.49 |       1.33 |
 | prefill-8k-silu     | 8192 | 2048 |  5632 |   8 | 2 |   10.537 |      13.610 |          11.821 |          1.29 |       1.12 |
+| mixtral-swiglu      | 1024 | 4096 | 14336 |   8 | 2 |    5.532 |       7.024 |           6.547 |          1.27 |       1.18 |
+| prefill-4k-silu     | 4096 | 2048 |  5632 |   8 | 2 |    4.713 |       7.003 |           6.289 |          1.49 |       1.33 |
+| mixtral-silu        | 1024 | 4096 | 14336 |   8 | 2 |    4.047 |       5.347 |           5.087 |          1.32 |       1.26 |
+| decode-batch32-silu |   32 | 4096 | 14336 |   8 | 2 |    1.272 |       1.573 |           1.539 |          1.24 |       1.21 |
+| decode-batch8-silu  |    8 | 4096 | 14336 |   8 | 2 |    1.230 |       1.508 |           1.491 |          1.23 |       1.21 |
+| switch-top1-silu    | 1024 |  768 |  3072 | 128 | 1 |    1.132 |       3.746 |           3.576 |          3.31 |       3.16 |
+| prefill-swiglu      |  512 | 2048 |  5632 |   8 | 2 |    1.066 |       1.606 |           1.462 |          1.51 |       1.37 |
+| large-tokens-swiglu | 2048 | 1024 |  2048 |   8 | 2 |    0.986 |       1.615 |           1.538 |          1.64 |       1.56 |
+| prefill-silu        |  512 | 2048 |  5632 |   8 | 2 |    0.852 |       1.343 |           1.188 |          1.58 |       1.39 |
+| prefill-gelu        |  512 | 2048 |  5632 |   8 | 2 |    0.822 |       1.489 |           1.342 |          1.81 |       1.63 |
+| deepseek-many-silu  |  512 | 1024 |  1408 |  64 | 6 |    0.608 |       2.260 |           2.127 |          3.72 |       3.50 |
+| decode-swiglu       |    1 | 4096 | 14336 |   8 | 2 |    0.539 |       0.638 |           0.653 |          1.18 |       1.21 |
+| decode-silu         |    1 | 4096 | 14336 |   8 | 2 |    0.410 |       0.487 |           0.500 |          1.19 |       1.22 |
+| small-swiglu        |  128 | 1024 |  2048 |   8 | 2 |    0.230 |       0.506 |           0.448 |          2.20 |       1.95 |
+| small-silu-bias     |  128 | 1024 |  2048 |   8 | 2 |    0.201 |       0.480 |           0.422 |          2.39 |       2.10 |
+| small-gelu          |  128 | 1024 |  2048 |   8 | 2 |    0.194 |       0.513 |           0.457 |          2.64 |       2.36 |
+| small-silu          |  128 | 1024 |  2048 |   8 | 2 |    0.193 |       0.481 |           0.423 |          2.49 |       2.19 |
 
 All 18 cases pass correctness (`--strict`, row-wise 99th-percentile relative error, same metric
 as the *CUDA, float16* section above; `FR_relerr` column in the CSV, max 1.18e-3).
