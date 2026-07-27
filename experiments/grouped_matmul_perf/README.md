@@ -21,10 +21,6 @@
   - Prototyped a CUTLASS-based alternative for `GroupedMatMul`
     (`ORT_GROUPED_MATMUL_CUDA_IMPL=cutlass`): **not a clear win** at tested sizes (0.52x–1.29x vs.
     cuBLAS) — kept as an opt-in, not the default.
-  - Along the way, found and fixed two bugs: (1) a **CUDA EP silent-fallback** build/link bug that
-    had every earlier "CUDA" run in this investigation secretly executing on CPU; (2) a real
-    **CUTLASS weight-layout bug** (weights need transposing before CUTLASS, MoE's native layout is
-    the transpose of `GroupedMatMul`'s).
 - **New op `GroupedMatMulReduceSum`** (fuses `GroupedMatMul` FC2 + the router-weighted `ReduceSum`
   combine into one CUDA kernel): validated correct (CPU + CUDA, cuBLAS and CUTLASS paths); on CUDA
   fp16 gives a consistent **~5–20% speedup over plain expanded MoE**, but doesn't close the full
