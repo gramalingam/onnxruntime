@@ -12,7 +12,10 @@
   (`benchmark_moe_vs_grouped.py`):
   - **CPU (fp32), 24-core host**: expanded wins every case (fused is 0.24x–0.90x of expanded
     speed). **But this ranking is not a stable property of the two kernels** — it flips
-    (fused wins) on a 96-core host (see *The CPU ranking is not fixed* below).
+    (fused wins) on a 96-core host, because `GroupedMatMul`'s CPU kernel hands each per-group
+    GEMM the full, uncapped thread pool (vs. fused `MoE`'s capped-at-8 expert parallelism), which
+    over-parallelizes small per-group GEMMs as core count grows — a fixable bug, not evidence the
+    fused op is inherently better on CPU (see *The CPU ranking is not fixed* below).
   - **CUDA (fp16)**: ranking flips — **fused MoE wins every case (1.18x–3.72x)**, biggest wins for
     many-expert/low-top-k configs. The gap is in core grouped-GEMM execution, not surrounding glue.
 - **`GroupedMatMul` CUDA GEMM-dispatch investigation**:
