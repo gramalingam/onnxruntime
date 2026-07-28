@@ -50,6 +50,16 @@ bool UseCutlassGroupedMatMulGemm();
 // scales tested (K/N in the hundreds to low thousands, as used by real models where hidden_size /
 // inter_size are typically multiples of 64/128). See experiments/grouped_matmul_perf/README.md for
 // details; not investigated further since this is an opt-in benchmarking switch, off by default.
+//
+// TACTIC/CONFIG PROFILING: unlike an earlier version of this path (which always used
+// getConfigs(sm)[0]), this now mirrors com.microsoft.MoE's tactic profiler
+// (see llm/moe_gemm/moe_gemm_profiler.{h,cc}): on first use of a given (N, K, num_groups, dtype,
+// M-bucket) combination, every candidate CUTLASS tactic is timed on-device (via CUDA events) and
+// the fastest is cached process-wide for reuse by later calls with a matching shape/M-bucket --
+// see SelectGroupedMatMulGemmConfig in the .cu file. Set
+// ORT_GROUPED_MATMUL_CUTLASS_PROFILE=0 to disable profiling and always use the first tactic
+// instead (matches the old behavior; also the automatic fallback while `stream` is being
+// captured into a CUDA graph, since profiling allocates/syncs and is illegal mid-capture).
 template <typename T>
 void LaunchGroupedMatMulCutlassGemm(cudaStream_t stream, const T* permuted_input, const T* weights,
                                     T* weight_scratch, const int64_t* group_offsets_end, T* permuted_output,
