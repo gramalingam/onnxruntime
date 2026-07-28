@@ -760,26 +760,35 @@ valid comparisons at every `M`.
     *`GroupedMatMulReduceSum`* below, which affect this op too since both share
     `grouped_matmul_cutlass_gemm.cu`.
 
-- **[ ] Investigate CUTLASS grouped-GEMM correctness failures beyond the documented tiny-tile
-  case.** While adding tactic profiling to the CUTLASS path (above), re-running
-  `test_cutlass_vs_cublas_correctness.py` surfaced 3 failing cases with much larger errors than
-  fp16/fp32 rounding would explain: `float32 M=64/K=128/N=256/groups=8` (max_abs≈0.0152,
-  max_rel≈1.29), `float32 M=17/K=33/N=29/groups=6` (max_abs≈25.4, max_rel≈149 — this one matches
-  the already-documented "K and N simultaneously non-tile-aligned" SIMT fp32 limitation noted in
-  `grouped_matmul_cutlass_gemm.h`), and `float16 M=128/K=512/N=512/groups=16` (max_abs≈0.031,
-  max_rel≈0.024). The K=128/N=256 and K=512/N=512 cases are **tile-aligned**, so the existing
-  "tiny non-aligned K&N" explanation does not cover them — the documented limitation is
-  incomplete. Confirmed via `git stash`/rebuild that these 3 failures are **pre-existing**
-  (present identically, down to the exact error magnitudes, on the code before tactic profiling
-  was added) and thus unrelated to tactic selection — likely either a genuine CUTLASS
-  grouped-GEMM kernel bug for certain (M, group-count) combinations, or corruption from this
-  shared A100 box's heavy contention (all 8 GPUs pinned at 100% util / ~90% memory in use by
-  other processes at investigation time — see below). **Proposed next steps:** (1) re-run on an
-  uncontended GPU to rule out contention as the cause; (2) if it reproduces, bisect on `M`,
-  `groups`, and dtype to find the actual failure boundary (current evidence suggests it may
-  correlate with `num_groups` relative to `M`, e.g. many small/uneven per-group row counts,
-  rather than pure tile alignment); (3) update or replace the KNOWN LIMITATION comment in
-  `grouped_matmul_cutlass_gemm.h` once the real boundary is known.
+- **[x] (Resolved by investigation, not a code bug) Re-checked the 3 `test_cutlass_vs_cublas_correctness.py`
+  failures found while adding tactic profiling (above) against a numpy ground truth, not just
+  CUTLASS-vs-cuBLAS agreement — the test itself only compares the two GPU implementations against
+  *each other*, silently assuming cuBLAS is "correct."** That assumption doesn't hold uniformly,
+  and the naive `abs_diff / (abs(ref) + 1e-3)` relative-error metric it uses is the same
+  near-zero-denominator artifact already documented for a different comparison in the
+  `GroupedMatMulReduceSum` section below. Results per case, using a numpy fp32-accumulate
+  reference:
+  - **`float32 M=64/K=128/N=256/groups=8`: not a bug.** CUTLASS actually matches the numpy
+    reference almost exactly (max_abs 3.1e-5, max_rel 1.1e-3) — it's cuBLAS that deviates
+    (max_abs 0.0152), consistent with cuBLAS defaulting to **TF32** tensor-core math for "float32"
+    GEMMs on Ampere (`UseTF32()` in `grouped_matmul.cc`) while this CUTLASS path uses true
+    SIMT fp32. Restricting the relative-error check to `|ref| > 1.0` (avoiding the
+    near-zero-denominator blowup) drops cuBLAS's max relative error to ~1.0%, right in line with
+    TF32's ~10-bit mantissa. The test flagged CUTLASS as "wrong" only because it (wrongly) treated
+    cuBLAS/TF32 as ground truth.
+  - **`float16 M=128/K=512/N=512/groups=16`: not a bug.** CUTLASS and cuBLAS agree with each
+    other exactly; both differ from the numpy reference by up to 13.7% under the naive metric, but
+    that's entirely a near-zero-denominator artifact — restricting to `|ref| > 0.1` (only 436/131072
+    elements excluded) drops the relative error to 0.9%, well within fp16 GEMM tolerance.
+  - **`float32 M=17/K=33/N=29/groups=6`: a real bug**, confirmed against the numpy reference
+    (CUTLASS max_abs 25.4 vs. cuBLAS's 0.0058) — this is the already-documented "K and N
+    simultaneously non-tile-aligned" SIMT fp32 limitation in `grouped_matmul_cutlass_gemm.h`;
+    scope unchanged by this investigation.
+  - **Remaining TODO:** `test_cutlass_vs_cublas_correctness.py` should compare both
+    implementations against an actual (e.g. numpy fp32-accumulate) reference instead of against
+    each other, and use a robust relative-error metric (à la the `_rel_err_robust` fix mentioned
+    below) instead of a fixed `+1e-3` epsilon, so future runs don't require this same
+    per-incident, ground-truth re-derivation to tell a real regression from a metric artifact.
 
 - **[ ] Fix `GroupedMatMul` CPU kernel's uncapped per-GEMM thread count.** As detailed in *The
   CPU ranking is not fixed* (in the "MoE layer" section above), `grouped_matmul.cc` hands each
