@@ -776,6 +776,18 @@ valid comparisons at every `M`.
     near-zero-denominator blowup) drops cuBLAS's max relative error to ~1.0%, right in line with
     TF32's ~10-bit mantissa. The test flagged CUTLASS as "wrong" only because it (wrongly) treated
     cuBLAS/TF32 as ground truth.
+    This is a structural feature gap, not a mismatch in how the two paths *handle* the same
+    option: `UseTF32()` reflects the CUDA EP's session-wide `use_tf32` option (defaults `true`,
+    `cuda_execution_provider_info.h`) and is threaded into the cuBLAS call, but the CUTLASS path
+    never reads that option at all — `MixedGemmArchTraits<float, float, Arch>`
+    (`cutlass_extensions/gemm/kernel/default_fpA_intB_traits.h`) hardcodes
+    `OperatorClass = cutlass::arch::OpClassSimt` for `float`/`float`, with no TF32/`OpClassTensorOp`
+    specialization defined for that type pairing (only `half_t`/`bfloat16_t` get `OpClassTensorOp`
+    there). CUTLASS itself does support TF32 GEMMs in general (via its distinct `tfloat32_t`
+    element type with Ampere `mma.sync` instruction shapes), it's just not wired up in this
+    vendored trait for plain `float`/`float` — so there's currently no way to make the two paths
+    numerically comparable by default; doing so would mean adding a genuine new CUTLASS
+    specialization, not flipping an existing flag.
   - **`float16 M=128/K=512/N=512/groups=16`: not a bug.** CUTLASS and cuBLAS agree with each
     other exactly; both differ from the numpy reference by up to 13.7% under the naive metric, but
     that's entirely a near-zero-denominator artifact — restricting to `|ref| > 0.1` (only 436/131072
