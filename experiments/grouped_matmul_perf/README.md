@@ -731,6 +731,16 @@ valid comparisons at every `M`.
       explicit opt-in for further experimentation (e.g. adding tactic profiling/caching, or
       testing shapes/hardware where per-launch overhead dominates more), not as a replacement.
 
+    **Update: tactic profiling added.** The "no tactic tuning" gap above is now closed:
+    `grouped_matmul_cutlass_gemm.cu` now profiles every candidate CUTLASS tactic on-device (timed
+    via CUDA events) the first time a given `(N, K, num_groups, dtype, M-bucket)` shape is seen,
+    caching the fastest for reuse — mirroring `com.microsoft.MoE`'s `MoeGemmProfiler`. Opt-out via
+    `ORT_GROUPED_MATMUL_CUTLASS_PROFILE=0` (also the automatic fallback during CUDA-graph
+    capture). Re-running the performance table above with profiling enabled is still pending a
+    non-contended GPU (see the correctness-bug TODO immediately below, found while validating
+    this change, for why the shared box's current numbers can't be trusted for a fresh
+    before/after comparison either).
+
   - **Correction (post-hoc): the original "verified bit-identical" CUTLASS-vs-cuBLAS claim was a
     false positive, and the original performance numbers above were collected before both bugs
     below were fixed.** A separate, unrelated bug caused the CUDA execution provider to
@@ -749,6 +759,27 @@ valid comparisons at every `M`.
     results at the time to be wrong is now fixed too — see the two bug write-ups under
     *`GroupedMatMulReduceSum`* below, which affect this op too since both share
     `grouped_matmul_cutlass_gemm.cu`.
+
+- **[ ] Investigate CUTLASS grouped-GEMM correctness failures beyond the documented tiny-tile
+  case.** While adding tactic profiling to the CUTLASS path (above), re-running
+  `test_cutlass_vs_cublas_correctness.py` surfaced 3 failing cases with much larger errors than
+  fp16/fp32 rounding would explain: `float32 M=64/K=128/N=256/groups=8` (max_abs≈0.0152,
+  max_rel≈1.29), `float32 M=17/K=33/N=29/groups=6` (max_abs≈25.4, max_rel≈149 — this one matches
+  the already-documented "K and N simultaneously non-tile-aligned" SIMT fp32 limitation noted in
+  `grouped_matmul_cutlass_gemm.h`), and `float16 M=128/K=512/N=512/groups=16` (max_abs≈0.031,
+  max_rel≈0.024). The K=128/N=256 and K=512/N=512 cases are **tile-aligned**, so the existing
+  "tiny non-aligned K&N" explanation does not cover them — the documented limitation is
+  incomplete. Confirmed via `git stash`/rebuild that these 3 failures are **pre-existing**
+  (present identically, down to the exact error magnitudes, on the code before tactic profiling
+  was added) and thus unrelated to tactic selection — likely either a genuine CUTLASS
+  grouped-GEMM kernel bug for certain (M, group-count) combinations, or corruption from this
+  shared A100 box's heavy contention (all 8 GPUs pinned at 100% util / ~90% memory in use by
+  other processes at investigation time — see below). **Proposed next steps:** (1) re-run on an
+  uncontended GPU to rule out contention as the cause; (2) if it reproduces, bisect on `M`,
+  `groups`, and dtype to find the actual failure boundary (current evidence suggests it may
+  correlate with `num_groups` relative to `M`, e.g. many small/uneven per-group row counts,
+  rather than pure tile alignment); (3) update or replace the KNOWN LIMITATION comment in
+  `grouped_matmul_cutlass_gemm.h` once the real boundary is known.
 
 - **[ ] Fix `GroupedMatMul` CPU kernel's uncapped per-GEMM thread count.** As detailed in *The
   CPU ranking is not fixed* (in the "MoE layer" section above), `grouped_matmul.cc` hands each
