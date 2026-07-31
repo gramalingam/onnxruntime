@@ -3,14 +3,13 @@
 
 #include "gtest/gtest.h"
 
-#include <cstring>
-
 #include "core/common/logging/logging.h"
 #include "core/graph/model.h"
 #include "core/graph/node_attr_utils.h"
 #include "core/optimizer/function_extractor.h"
 #include "core/optimizer/function_extractor_matcher.h"
 #include "core/optimizer/function_extractor_pattern.h"
+#include "onnx/defs/parser.h"
 #include "onnx/defs/function.h"
 #include "test/unittest_util/framework_test_utils.h"
 #include "test/unittest_util/graph_transform_test_builder.h"
@@ -24,8 +23,66 @@ using FunctionProto = ONNX_NAMESPACE::FunctionProto;
 using NodeDef = ONNX_NAMESPACE::FunctionBodyHelper::NodeDef;
 
 constexpr const char* kFunctionDomain = "test.function";
-constexpr int kFunctionOpset = 1;
 constexpr int kOnnxOpset = 13;
+
+FunctionProto ParseFunction(std::string_view source) {
+  const std::string source_string{source};
+  ONNX_NAMESPACE::OnnxParser parser(source_string.c_str());
+  FunctionProto function_proto;
+  const auto status = parser.Parse(function_proto);
+  ORT_ENFORCE(status.IsOK(), "Failed to parse function text: ",
+              status.ErrorMessage());
+  ORT_ENFORCE(parser.EndOfInput(), "Extra unparsed function input.");
+  return function_proto;
+}
+
+ONNX_NAMESPACE::ModelProto ParseModel(std::string_view source) {
+  const std::string source_string{source};
+  ONNX_NAMESPACE::OnnxParser parser(source_string.c_str());
+  ONNX_NAMESPACE::ModelProto model_proto;
+  const auto status = parser.Parse(model_proto);
+  ORT_ENFORCE(status.IsOK(), "Failed to parse model text: ",
+              status.ErrorMessage());
+  ORT_ENFORCE(parser.EndOfInput(), "Extra unparsed model input.");
+  return model_proto;
+}
+
+std::shared_ptr<Model> MakeModelFromText(
+    std::string_view source,
+    gsl::span<const FunctionProto> function_protos = {}) {
+  ONNX_NAMESPACE::ModelProto model_proto = ParseModel(source);
+  for (const FunctionProto& function_proto : function_protos) {
+    model_proto.add_functions()->CopyFrom(function_proto);
+  }
+
+  std::shared_ptr<Model> model;
+  ORT_THROW_IF_ERROR(Model::Load(
+      std::move(model_proto), model, nullptr,
+      DefaultLoggingManager().DefaultLogger()));
+  ORT_ENFORCE(model != nullptr, "Parsed model load returned null.");
+  return model;
+}
+
+std::shared_ptr<Model> MakeModelFromText(
+    std::string_view source,
+    const FunctionProto& function_proto) {
+  const std::vector<FunctionProto> function_protos{function_proto};
+  return MakeModelFromText(source, function_protos);
+}
+
+std::string TensorTypeText(std::string_view element_type,
+                           gsl::span<const int64_t> dimensions) {
+  std::string result{element_type};
+  result += "[";
+  for (size_t i = 0; i < dimensions.size(); ++i) {
+    if (i != 0) {
+      result += ", ";
+    }
+    result += std::to_string(dimensions[i]);
+  }
+  result += "]";
+  return result;
+}
 
 class FunctionExtractorGraphBuilder final : public ::onnxruntime::test::ModelTestBuilder {
  public:
@@ -50,6 +107,9 @@ FunctionProto MakeFunction(std::string name,
                            gsl::span<const NodeDef> node_defs,
                            gsl::span<const std::string> inputs,
                            gsl::span<const std::string> outputs) {
+  // Retained for deliberately malformed protobufs and the generated high-arity
+  // identity-snapshot case, where parsing would either reject the input first
+  // or obscure the protobuf mutation being tested.
   FunctionProto function_proto;
   function_proto.set_domain(kFunctionDomain);
   function_proto.set_name(std::move(name));
@@ -74,53 +134,42 @@ FunctionProto MakeFunction(std::string name,
 }
 
 FunctionProto MakeLinearFunction(std::string name = "Linear") {
-  const std::vector<NodeDef> nodes{
-      {{"sum"}, "Add", {"x", "y"}},
-      {{"out"}, "Relu", {"sum"}},
-  };
-  const std::vector<std::string> inputs{"x", "y"};
-  const std::vector<std::string> outputs{"out"};
-  return MakeFunction(std::move(name), nodes, inputs, outputs);
+  return ParseFunction("<opset_import: [\"\" : 13], domain: \"test.function\">\n" +
+                       name + R"( (x, y) => (out) {
+  sum = Add(x, y)
+  out = Relu(sum)
+})");
 }
 
 FunctionProto MakeLiteralFunction(std::string name = "Literal") {
-  const std::vector<NodeDef> nodes{
-      ONNX_NAMESPACE::FunctionBodyHelper::Const<float>("one", 1.0f),
-      {{"sum"}, "Add", {"x", "one"}},
-      {{"out"}, "Relu", {"sum"}},
-  };
-  const std::vector<std::string> inputs{"x"};
-  const std::vector<std::string> outputs{"out"};
-  return MakeFunction(std::move(name), nodes, inputs, outputs);
+  return ParseFunction("<opset_import: [\"\" : 13], domain: \"test.function\">\n" +
+                       name + R"( (x) => (out) {
+  one = Constant <value = float {1.0}> ()
+  sum = Add(x, one)
+  out = Relu(sum)
+})");
 }
 
-void AddTensorValueInfo(FunctionProto& function_proto,
-                        std::string_view name,
-                        int32_t element_type,
-                        gsl::span<const int64_t> dimensions) {
-  auto& value_info = *function_proto.add_value_info();
-  value_info.set_name(std::string{name});
-  auto& tensor_type = *value_info.mutable_type()->mutable_tensor_type();
-  tensor_type.set_elem_type(element_type);
-  for (const int64_t dimension : dimensions) {
-    tensor_type.mutable_shape()->add_dim()->set_dim_value(dimension);
-  }
+std::shared_ptr<Model> MakeModel(std::vector<FunctionProto> function_protos) {
+  return MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph () => () {
+})",
+      function_protos);
 }
 
-std::unique_ptr<Model> MakeModel(std::vector<FunctionProto> function_protos) {
-  const std::unordered_map<std::string, int> imports{
-      {kOnnxDomain, kOnnxOpset},
-      {kFunctionDomain, kFunctionOpset},
-  };
-  return std::make_unique<Model>(
-      "FunctionExtractorTest", false, ModelMetaData(), PathString(),
-      IOnnxRuntimeOpSchemaRegistryList(), imports,
-      function_protos,
-      DefaultLoggingManager().DefaultLogger());
-}
-
-std::unique_ptr<Model> MakeModel(const FunctionProto& function_proto) {
+std::shared_ptr<Model> MakeModel(const FunctionProto& function_proto) {
   return MakeModel(std::vector<FunctionProto>{function_proto});
+}
+
+std::shared_ptr<Model> MakeLinearTargetModel(const FunctionProto& function_proto) {
+  return MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y) => (float[2] out) {
+  sum = Add(x, y)
+  out = Relu(sum)
+})",
+      function_proto);
 }
 
 size_t CountOp(const Graph& graph, std::string_view domain, std::string_view op_type) {
@@ -184,6 +233,7 @@ void BuildLinearTarget(Graph& graph,
                        NodeArg*& y,
                        NodeArg*& sum,
                        NodeArg*& output) {
+  // Used only to keep the target graph deliberately unresolved.
   FunctionExtractorGraphBuilder builder(graph);
   x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
   y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
@@ -192,46 +242,6 @@ void BuildLinearTarget(Graph& graph,
   builder.AddNode("Add", {x, y}, {sum});
   builder.AddNode("Relu", {sum}, {output});
   builder.SetGraphOutputs();
-}
-
-void AddLinearTarget(FunctionExtractorGraphBuilder& builder,
-                     NodeArg* x,
-                     NodeArg* y,
-                     NodeArg* output) {
-  NodeArg* sum = builder.MakeIntermediate<float>({2});
-  builder.AddNode("Add", {x, y}, {sum});
-  builder.AddNode("Relu", {sum}, {output});
-}
-
-ONNX_NAMESPACE::GraphProto MakeCaptureSubgraph(
-    const std::string& captured_name,
-    const ONNX_NAMESPACE::TypeProto& captured_type,
-    std::string_view op_type = "Identity") {
-  Model subgraph_model("CaptureSubgraph", false, ModelMetaData(), PathString(),
-                       IOnnxRuntimeOpSchemaRegistryList(),
-                       {{kOnnxDomain, kOnnxOpset}}, {},
-                       DefaultLoggingManager().DefaultLogger());
-  Graph& subgraph = subgraph_model.MainGraph();
-  NodeArg& captured = subgraph.GetOrCreateNodeArg(captured_name, &captured_type);
-  subgraph.AddOuterScopeNodeArg(captured_name);
-  NodeArg& output = subgraph.GetOrCreateNodeArg("subgraph_output", &captured_type);
-  subgraph.AddNode("capture", std::string{op_type}, "capture outer-scope value",
-                   {&captured}, {&output});
-  subgraph.SetOutputs({&output});
-  EXPECT_STATUS_OK(subgraph.Resolve());
-  return subgraph.ToGraphProto();
-}
-
-Node& AddCapturingIf(FunctionExtractorGraphBuilder& builder, NodeArg& captured,
-                     std::string_view op_type = "Identity") {
-  NodeArg* condition = builder.MakeInput<bool>({}, std::vector<bool>{true});
-  NodeArg* if_output = builder.MakeOutput<float>({2});
-  Node& if_node = builder.AddNode("If", {condition}, {if_output});
-  const ONNX_NAMESPACE::GraphProto branch =
-      MakeCaptureSubgraph(captured.Name(), *captured.TypeAsProto(), op_type);
-  if_node.AddAttribute("then_branch", branch);
-  if_node.AddAttribute("else_branch", branch);
-  return if_node;
 }
 
 common::Status FailGraphResolve(Graph&, const Graph::ResolveOptions&) {
@@ -282,6 +292,8 @@ TEST_F(FunctionExtractorTest, RejectsInvalidFormalNames) {
 }
 
 TEST_F(FunctionExtractorTest, RejectsInvalidAttributes) {
+  // Duplicate protobuf fields must be constructed directly because the parser
+  // would normalize or reject them before FunctionExtractor sees them.
   FunctionProto duplicate_declaration = MakeLinearFunction("DuplicateAttribute");
   duplicate_declaration.add_attribute("axis");
   duplicate_declaration.add_attribute("axis");
@@ -296,6 +308,7 @@ TEST_F(FunctionExtractorTest, RejectsInvalidAttributes) {
   ExpectConstructionRejected(std::move(duplicate_default));
 
   FunctionProto referenced_attribute = MakeLinearFunction("ReferencedAttribute");
+  // The parser cannot encode both ref_attr_name and its required AttributeProto type.
   auto& attribute = *referenced_attribute.mutable_node(0)->add_attribute();
   attribute.set_name("axis");
   attribute.set_ref_attr_name("axis");
@@ -304,9 +317,12 @@ TEST_F(FunctionExtractorTest, RejectsInvalidAttributes) {
 }
 
 TEST_F(FunctionExtractorTest, RejectsUnusedRequiredFunctionAttribute) {
-  FunctionProto function_proto = MakeLinearFunction("RequiredAttribute");
-  function_proto.add_attribute("axis");
-  ExpectConstructionRejected(std::move(function_proto));
+  ExpectConstructionRejected(ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+RequiredAttribute <axis> (x, y) => (out) {
+  sum = Add(x, y)
+  out = Relu(sum)
+})"));
 }
 
 TEST_F(FunctionExtractorTest, RejectsMalformedDataflow) {
@@ -329,28 +345,32 @@ TEST_F(FunctionExtractorTest, RejectsMalformedDataflow) {
 }
 
 TEST_F(FunctionExtractorTest, RejectsDisconnectedMultiOutputBody) {
-  const std::vector<NodeDef> nodes{
-      {{"left"}, "Add", {"x", "y"}},
-      {{"right"}, "Mul", {"z", "w"}},
-  };
-  ExpectConstructionRejected(
-      MakeFunction("DisconnectedOutputs", nodes,
-                   std::vector<std::string>{"x", "y", "z", "w"},
-                   std::vector<std::string>{"left", "right"}));
+  ExpectConstructionRejected(ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+DisconnectedOutputs (x, y, z, w) => (left, right) {
+  left = Add(x, y)
+  right = Mul(z, w)
+})"));
 }
 
 TEST_F(FunctionExtractorTest, RejectsOutputUnreachableOperations) {
-  const std::vector<std::string> inputs{"x", "y"};
-  const std::vector<std::string> outputs{"out"};
-  const std::vector<std::vector<NodeDef>> invalid_bodies{
-      {{{"out"}, "Add", {"x", "y"}}, {{"after"}, "Relu", {"out"}}},
-      {{{"sum"}, "Add", {"x", "y"}}, {{"out"}, "Relu", {"sum"}}, {{"dead"}, "Mul", {"x", "y"}}},
+  const std::vector<std::string_view> function_sources{
+      R"(<opset_import: ["" : 13], domain: "test.function">
+OutputConsumedInternally (x, y) => (out) {
+  out = Add(x, y)
+  after = Relu(out)
+})",
+      R"(<opset_import: ["" : 13], domain: "test.function">
+DeadOperation (x, y) => (out) {
+  sum = Add(x, y)
+  out = Relu(sum)
+  dead = Mul(x, y)
+})",
   };
 
-  for (size_t i = 0; i < invalid_bodies.size(); ++i) {
-    SCOPED_TRACE(i);
-    ExpectConstructionRejected(MakeFunction("Unreachable" + std::to_string(i),
-                                            invalid_bodies[i], inputs, outputs));
+  for (const std::string_view function_source : function_sources) {
+    SCOPED_TRACE(function_source);
+    ExpectConstructionRejected(ParseFunction(function_source));
   }
 }
 
@@ -367,32 +387,34 @@ TEST_F(FunctionExtractorTest, RejectsConstantFormalOutput) {
 }
 
 TEST_F(FunctionExtractorTest, RejectsSingleOperationPattern) {
-  const std::vector<NodeDef> nodes{{{"out"}, "Relu", {"x"}}};
-  ExpectConstructionRejected(MakeFunction(
-      "Single", nodes, std::vector<std::string>{"x"}, std::vector<std::string>{"out"}));
+  ExpectConstructionRejected(ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+Single (x) => (out) {
+  out = Relu(x)
+})"));
 }
 
 TEST_F(FunctionExtractorTest, RejectsUnsupportedBodyFeatures) {
-  ONNX_NAMESPACE::GraphProto subgraph;
-  subgraph.set_name("body");
-  const std::vector<NodeDef> nodes{
-      {{"branch"}, "If", {"condition"}, {ONNX_NAMESPACE::MakeAttribute("then_branch", subgraph), ONNX_NAMESPACE::MakeAttribute("else_branch", subgraph)}},
-      {{"out"}, "Identity", {"branch"}},
-  };
-  ExpectConstructionRejected(
-      MakeFunction("ControlFlow", nodes, std::vector<std::string>{"condition"},
-                   std::vector<std::string>{"out"}));
+  ExpectConstructionRejected(ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+ControlFlow (condition) => (out) {
+  branch = If(condition) <
+    then_branch = then_body () => () {},
+    else_branch = else_body () => () {}
+  >
+  out = Identity(branch)
+})"));
 }
 
 TEST_F(FunctionExtractorTest, RejectsUnregisteredFunction) {
   FunctionProto function_proto = MakeLinearFunction();
-  Model model("UnregisteredFunction", false, DefaultLoggingManager().DefaultLogger());
-  Graph& graph = model.MainGraph();
-  NodeArg* x;
-  NodeArg* y;
-  NodeArg* sum;
-  NodeArg* output;
-  BuildLinearTarget(graph, x, y, sum, output);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13]>
+agraph (float[2] x, float[2] y) => (float[2] out) {
+  sum = Add(x, y)
+  out = Relu(sum)
+})");
+  Graph& graph = model->MainGraph();
   ASSERT_STATUS_OK(graph.Resolve());
   const size_t original_node_count = graph.NumberOfNodes();
 
@@ -405,15 +427,14 @@ TEST_F(FunctionExtractorTest, RejectsUnregisteredFunction) {
 
 TEST_F(FunctionExtractorTest, RejectsDifferentRegisteredDefinition) {
   const FunctionProto registered_function = MakeLinearFunction();
-  FunctionProto requested_function = MakeLinearFunction();
-  requested_function.mutable_node(0)->set_op_type("Sub");
-  auto model = MakeModel(registered_function);
+  const FunctionProto requested_function = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+Linear (x, y) => (out) {
+  sum = Sub(x, y)
+  out = Relu(sum)
+})");
+  auto model = MakeLinearTargetModel(registered_function);
   Graph& graph = model->MainGraph();
-  NodeArg* x;
-  NodeArg* y;
-  NodeArg* sum;
-  NodeArg* output;
-  BuildLinearTarget(graph, x, y, sum, output);
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(requested_function);
@@ -424,48 +445,39 @@ TEST_F(FunctionExtractorTest, RejectsDifferentRegisteredDefinition) {
 }
 
 TEST_F(FunctionExtractorTest, RejectsContextDependentSchemaFunction) {
-  const std::vector<NodeDef> nodes{
-      {{"scaled"}, "Mul", {"x", "x"}},
-      {{"out"}, "Relu", {"scaled"}},
-  };
-  FunctionProto function_proto =
-      MakeFunction("Celu", nodes, std::vector<std::string>{"x"},
-                   std::vector<std::string>{"out"});
-  function_proto.set_domain(kOnnxDomain);
-
-  Model model("ContextDependentFunction", false, ModelMetaData(), PathString(),
-              IOnnxRuntimeOpSchemaRegistryList(), {{kOnnxDomain, kOnnxOpset}}, {},
-              DefaultLoggingManager().DefaultLogger());
-  ASSERT_STATUS_OK(model.MainGraph().Resolve());
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "">
+Celu (x) => (out) {
+  scaled = Mul(x, x)
+  out = Relu(scaled)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13]>
+agraph () => () {
+})");
+  ASSERT_STATUS_OK(model->MainGraph().Resolve());
   FunctionExtractor extractor(function_proto);
-  const FunctionExtractionResult result = extractor.Extract(model);
+  const FunctionExtractionResult result = extractor.Extract(*model);
   EXPECT_FALSE(result.status.IsOK());
   EXPECT_EQ(result.replacements_applied, 0u);
 }
 
 TEST_F(FunctionExtractorTest, ResolvesNestedLocalFunctionIdentity) {
   const FunctionProto nested_function = MakeLinearFunction("Nested");
-  const std::vector<NodeDef> outer_nodes{
-      {{"nested_out"}, "Nested", {"x", "y"}, {}, kFunctionDomain},
-      {{"out"}, "Identity", {"nested_out"}},
-  };
-  FunctionProto outer_function =
-      MakeFunction("Outer", outer_nodes, std::vector<std::string>{"x", "y"},
-                   std::vector<std::string>{"out"});
-  auto& function_import = *outer_function.add_opset_import();
-  function_import.set_domain(kFunctionDomain);
-  function_import.set_version(kFunctionOpset);
-
-  auto model = MakeModel(std::vector<FunctionProto>{nested_function, outer_function});
+  const FunctionProto outer_function = ParseFunction(
+      R"(<opset_import: ["" : 13, "test.function" : 1], domain: "test.function">
+Outer (x, y) => (out) {
+  nested_out = test.function.Nested(x, y)
+  out = Identity(nested_out)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y) => (float[2] out) {
+  nested_out = test.function.Nested(x, y)
+  out = Identity(nested_out)
+})",
+      std::vector<FunctionProto>{nested_function, outer_function});
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* nested_output = builder.MakeIntermediate<float>({2});
-  NodeArg* output = builder.MakeOutput<float>({2});
-  builder.AddNode("Nested", {x, y}, {nested_output}, kFunctionDomain);
-  builder.AddNode("Identity", {nested_output}, {output});
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(outer_function);
@@ -479,6 +491,7 @@ TEST_F(FunctionExtractorTest, RejectsUnresolvedTargetGraph) {
   const FunctionProto function_proto = MakeLinearFunction();
   auto model = MakeModel(function_proto);
   Graph& graph = model->MainGraph();
+  // The target must remain unresolved, which cannot be preserved through Model::Load.
   NodeArg* x;
   NodeArg* y;
   NodeArg* sum;
@@ -494,16 +507,22 @@ TEST_F(FunctionExtractorTest, RejectsUnresolvedTargetGraph) {
 }
 
 TEST_F(FunctionExtractorTest, RejectsImpureOrUnknownOperation) {
-  const std::vector<std::string> inputs{"x", "y"};
-  const std::vector<std::string> outputs{"out"};
-  const std::vector<std::vector<NodeDef>> bodies{
-      {{{"random"}, "RandomNormal", {}}, {{"out"}, "Add", {"x", "random"}}},
-      {{{"custom"}, "Unknown", {"x"}}, {{"out"}, "Add", {"custom", "y"}}},
+  const std::vector<std::string_view> functions{
+      R"(<opset_import: ["" : 13], domain: "test.function">
+Impure0 (x, y) => (out) {
+  random = RandomNormal()
+  out = Add(x, random)
+})",
+      R"(<opset_import: ["" : 13], domain: "test.function">
+Impure1 (x, y) => (out) {
+  custom = Unknown(x)
+  out = Add(custom, y)
+})",
   };
 
-  for (size_t i = 0; i < bodies.size(); ++i) {
+  for (size_t i = 0; i < functions.size(); ++i) {
     SCOPED_TRACE(i);
-    FunctionProto function_proto = MakeFunction("Impure" + std::to_string(i), bodies[i], inputs, outputs);
+    const FunctionProto function_proto = ParseFunction(functions[i]);
     auto model = MakeModel(function_proto);
     ASSERT_STATUS_OK(model->MainGraph().Resolve());
     FunctionExtractor extractor(function_proto);
@@ -537,13 +556,8 @@ TEST_F(FunctionExtractorTest, EnforcesResourceBudgetsBeforeMutation) {
 
   for (const auto& budget_case : budget_cases) {
     SCOPED_TRACE(budget_case.name);
-    auto model = MakeModel(function_proto);
+    auto model = MakeLinearTargetModel(function_proto);
     Graph& graph = model->MainGraph();
-    NodeArg* x;
-    NodeArg* y;
-    NodeArg* sum;
-    NodeArg* output;
-    BuildLinearTarget(graph, x, y, sum, output);
     ASSERT_STATUS_OK(graph.Resolve());
 
     FunctionExtractor extractor(function_proto, budget_case.options);
@@ -555,6 +569,8 @@ TEST_F(FunctionExtractorTest, EnforcesResourceBudgetsBeforeMutation) {
 }
 
 TEST_F(FunctionExtractorTest, RejectsHighArityPatternBeforeMutation) {
+  // Keep the generated 128-input graph programmatic so pointer/index identity
+  // can be snapshotted across the rejected mutation attempt.
   constexpr size_t input_count = 128;
   std::vector<std::string> inputs;
   inputs.reserve(input_count);
@@ -613,13 +629,14 @@ TEST_F(FunctionExtractorTest, RejectsHighArityPatternBeforeMutation) {
 
 TEST_F(FunctionExtractorTest, ExtractsLinearPattern) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeLinearTargetModel(function_proto);
   Graph& graph = model->MainGraph();
-  NodeArg* x;
-  NodeArg* y;
-  NodeArg* sum;
-  NodeArg* output;
-  BuildLinearTarget(graph, x, y, sum, output);
+  NodeArg* x = graph.GetNodeArg("x");
+  NodeArg* y = graph.GetNodeArg("y");
+  NodeArg* output = graph.GetNodeArg("out");
+  ASSERT_NE(x, nullptr);
+  ASSERT_NE(y, nullptr);
+  ASSERT_NE(output, nullptr);
   ASSERT_STATUS_OK(graph.Resolve());
   const std::vector<std::string> expected_inputs{x->Name(), y->Name()};
   const std::vector<std::string> expected_outputs{output->Name()};
@@ -636,26 +653,30 @@ TEST_F(FunctionExtractorTest, ExtractsLinearPattern) {
 }
 
 TEST_F(FunctionExtractorTest, ExtractsBranchedMultiOutputPattern) {
-  const std::vector<NodeDef> nodes{
-      {{"sum"}, "Add", {"x", "y"}},
-      {{"scaled"}, "Mul", {"sum", "y"}},
-      {{"activated"}, "Relu", {"sum"}},
-  };
-  const FunctionProto function_proto =
-      MakeFunction("Branched", nodes, std::vector<std::string>{"x", "y"},
-                   std::vector<std::string>{"scaled", "activated"});
-  auto model = MakeModel(function_proto);
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+Branched (x, y) => (scaled, activated) {
+  sum = Add(x, y)
+  scaled = Mul(sum, y)
+  activated = Relu(sum)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y) => (float[2] scaled, float[2] activated) {
+  sum = Add(x, y)
+  scaled = Mul(sum, y)
+  activated = Relu(sum)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* sum = builder.MakeIntermediate<float>({2});
-  NodeArg* scaled = builder.MakeOutput<float>({2});
-  NodeArg* activated = builder.MakeOutput<float>({2});
-  builder.AddNode("Add", {x, y}, {sum});
-  builder.AddNode("Mul", {sum, y}, {scaled});
-  builder.AddNode("Relu", {sum}, {activated});
-  builder.SetGraphOutputs();
+  NodeArg* x = graph.GetNodeArg("x");
+  NodeArg* y = graph.GetNodeArg("y");
+  NodeArg* scaled = graph.GetNodeArg("scaled");
+  NodeArg* activated = graph.GetNodeArg("activated");
+  ASSERT_NE(x, nullptr);
+  ASSERT_NE(y, nullptr);
+  ASSERT_NE(scaled, nullptr);
+  ASSERT_NE(activated, nullptr);
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -668,29 +689,24 @@ TEST_F(FunctionExtractorTest, ExtractsBranchedMultiOutputPattern) {
 }
 
 TEST_F(FunctionExtractorTest, ExtractsDiamondAndProcessesSharedValueOnce) {
-  const std::vector<NodeDef> nodes{
-      {{"sum"}, "Add", {"x", "y"}},
-      {{"left"}, "Relu", {"sum"}},
-      {{"right"}, "Identity", {"sum"}},
-      {{"out"}, "Mul", {"left", "right"}},
-  };
-  const FunctionProto function_proto =
-      MakeFunction("Diamond", nodes, std::vector<std::string>{"x", "y"},
-                   std::vector<std::string>{"out"});
-  auto model = MakeModel(function_proto);
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+Diamond (x, y) => (out) {
+  sum = Add(x, y)
+  left = Relu(sum)
+  right = Identity(sum)
+  out = Mul(left, right)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y) => (float[2] out) {
+  sum = Add(x, y)
+  left = Relu(sum)
+  right = Identity(sum)
+  out = Mul(left, right)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* sum = builder.MakeIntermediate<float>({2});
-  NodeArg* left = builder.MakeIntermediate<float>({2});
-  NodeArg* right = builder.MakeIntermediate<float>({2});
-  NodeArg* output = builder.MakeOutput<float>({2});
-  builder.AddNode("Add", {x, y}, {sum});
-  builder.AddNode("Relu", {sum}, {left});
-  builder.AddNode("Identity", {sum}, {right});
-  builder.AddNode("Mul", {left, right}, {output});
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   using namespace function_extractor_internal;
@@ -711,29 +727,23 @@ TEST_F(FunctionExtractorTest, ExtractsDiamondAndProcessesSharedValueOnce) {
 }
 
 TEST_F(FunctionExtractorTest, RejectsInconsistentMultiOutputRootTuple) {
-  const std::vector<NodeDef> nodes{
-      {{"sum"}, "Add", {"x", "y"}},
-      {{"left"}, "Relu", {"sum"}},
-      {{"right"}, "Identity", {"sum"}},
-  };
-  const FunctionProto function_proto =
-      MakeFunction("TwoRoots", nodes, std::vector<std::string>{"x", "y"},
-                   std::vector<std::string>{"left", "right"});
-  auto model = MakeModel(function_proto);
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+TwoRoots (x, y) => (left, right) {
+  sum = Add(x, y)
+  left = Relu(sum)
+  right = Identity(sum)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y, float[2] other) => (float[2] left, float[2] right) {
+  sum_a = Add(x, y)
+  sum_b = Add(x, other)
+  left = Relu(sum_a)
+  right = Identity(sum_b)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* other = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* sum_a = builder.MakeIntermediate<float>({2});
-  NodeArg* sum_b = builder.MakeIntermediate<float>({2});
-  NodeArg* left = builder.MakeOutput<float>({2});
-  NodeArg* right = builder.MakeOutput<float>({2});
-  builder.AddNode("Add", {x, y}, {sum_a});
-  builder.AddNode("Add", {x, other}, {sum_b});
-  builder.AddNode("Relu", {sum_a}, {left});
-  builder.AddNode("Identity", {sum_b}, {right});
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -745,16 +755,16 @@ TEST_F(FunctionExtractorTest, RejectsInconsistentMultiOutputRootTuple) {
 
 TEST_F(FunctionExtractorTest, EnumeratesOutputRootsDeterministically) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y) => (float[2] first, float[2] second) {
+  first_sum = Add(x, y)
+  first = Relu(first_sum)
+  second_sum = Add(x, y)
+  second = Relu(second_sum)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* first = builder.MakeOutput<float>({2});
-  NodeArg* second = builder.MakeOutput<float>({2});
-  AddLinearTarget(builder, x, y, first);
-  AddLinearTarget(builder, x, y, second);
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   using namespace function_extractor_internal;
@@ -772,22 +782,24 @@ TEST_F(FunctionExtractorTest, EnumeratesOutputRootsDeterministically) {
 }
 
 TEST_F(FunctionExtractorTest, MatchesRepeatedAndAliasedFormalInputs) {
-  const std::vector<NodeDef> nodes{
-      {{"sum"}, "Add", {"x", "x"}},
-      {{"out"}, "Mul", {"sum", "y"}},
-  };
-  const FunctionProto function_proto =
-      MakeFunction("AliasedInputs", nodes, std::vector<std::string>{"x", "y"},
-                   std::vector<std::string>{"out"});
-  auto model = MakeModel(function_proto);
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+AliasedInputs (x, y) => (out) {
+  sum = Add(x, x)
+  out = Mul(sum, y)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] input) => (float[2] out) {
+  sum = Add(input, input)
+  out = Mul(sum, input)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* input = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* sum = builder.MakeIntermediate<float>({2});
-  NodeArg* output = builder.MakeOutput<float>({2});
-  builder.AddNode("Add", {input, input}, {sum});
-  builder.AddNode("Mul", {sum, input}, {output});
-  builder.SetGraphOutputs();
+  NodeArg* input = graph.GetNodeArg("input");
+  NodeArg* output = graph.GetNodeArg("out");
+  ASSERT_NE(input, nullptr);
+  ASSERT_NE(output, nullptr);
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -800,23 +812,20 @@ TEST_F(FunctionExtractorTest, MatchesRepeatedAndAliasedFormalInputs) {
 }
 
 TEST_F(FunctionExtractorTest, RejectsReversedInternalOperands) {
-  const std::vector<NodeDef> nodes{
-      {{"difference"}, "Sub", {"x", "y"}},
-      {{"out"}, "Div", {"difference", "y"}},
-  };
-  const FunctionProto function_proto =
-      MakeFunction("Positional", nodes, std::vector<std::string>{"x", "y"},
-                   std::vector<std::string>{"out"});
-  auto model = MakeModel(function_proto);
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+Positional (x, y) => (out) {
+  difference = Sub(x, y)
+  out = Div(difference, y)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y) => (float[2] out) {
+  difference = Sub(x, y)
+  out = Div(y, difference)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* difference = builder.MakeIntermediate<float>({2});
-  NodeArg* output = builder.MakeOutput<float>({2});
-  builder.AddNode("Sub", {x, y}, {difference});
-  builder.AddNode("Div", {y, difference}, {output});
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -827,22 +836,19 @@ TEST_F(FunctionExtractorTest, RejectsReversedInternalOperands) {
 
 TEST_F(FunctionExtractorTest, RootIndexAllowsExternalProducerAndOutputFanout) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] source, float[2] y) => (float[2] output_a, float[2] output_b) {
+  x = Abs(source)
+  sum = Add(x, y)
+  matched_output = Relu(sum)
+  output_a = Identity(matched_output)
+  output_b = Neg(matched_output)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* source = builder.MakeInput<float>({2}, -1.0f, 1.0f);
-  NodeArg* x = builder.MakeIntermediate<float>({2});
-  NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* sum = builder.MakeIntermediate<float>({2});
-  NodeArg* matched_output = builder.MakeIntermediate<float>({2});
-  NodeArg* output_a = builder.MakeOutput<float>({2});
-  NodeArg* output_b = builder.MakeOutput<float>({2});
-  builder.AddNode("Abs", {source}, {x});
-  builder.AddNode("Add", {x, y}, {sum});
-  builder.AddNode("Relu", {sum}, {matched_output});
-  builder.AddNode("Identity", {matched_output}, {output_a});
-  builder.AddNode("Neg", {matched_output}, {output_b});
-  builder.SetGraphOutputs();
+  NodeArg* matched_output = graph.GetNodeArg("matched_output");
+  ASSERT_NE(matched_output, nullptr);
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -856,16 +862,15 @@ TEST_F(FunctionExtractorTest, RequiresExactOperatorIdentityAndArity) {
   const FunctionProto function_proto = MakeLinearFunction();
   for (const std::string& second_op : {"Sigmoid", "Neg"}) {
     SCOPED_TRACE(second_op);
-    auto model = MakeModel(function_proto);
+    const std::string model_source =
+        R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y) => (float[2] out) {
+  sum = Add(x, y)
+  out = )" +
+        second_op + R"((sum)
+})";
+    auto model = MakeModelFromText(model_source, function_proto);
     Graph& graph = model->MainGraph();
-    FunctionExtractorGraphBuilder builder(graph);
-    NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-    NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-    NodeArg* sum = builder.MakeIntermediate<float>({2});
-    NodeArg* output = builder.MakeOutput<float>({2});
-    builder.AddNode("Add", {x, y}, {sum});
-    builder.AddNode(second_op, {sum}, {output});
-    builder.SetGraphOutputs();
     ASSERT_STATUS_OK(graph.Resolve());
 
     FunctionExtractor extractor(function_proto);
@@ -876,27 +881,25 @@ TEST_F(FunctionExtractorTest, RequiresExactOperatorIdentityAndArity) {
 }
 
 TEST_F(FunctionExtractorTest, RequiresExactEffectiveAttributes) {
-  const std::vector<NodeDef> nodes{
-      {{"transposed"}, "Transpose", {"x"}, {ONNX_NAMESPACE::MakeAttribute("perm", std::vector<int64_t>{1, 0})}},
-      {{"out"}, "Relu", {"transposed"}},
-  };
-  const FunctionProto function_proto =
-      MakeFunction("Attributes", nodes, std::vector<std::string>{"x"},
-                   std::vector<std::string>{"out"});
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+Attributes (x) => (out) {
+  transposed = Transpose <perm = [1, 0]> (x)
+  out = Relu(transposed)
+})");
 
   for (const std::vector<int64_t>& perm :
        {std::vector<int64_t>{1, 0}, std::vector<int64_t>{0, 1}}) {
     SCOPED_TRACE(::testing::PrintToString(perm));
-    auto model = MakeModel(function_proto);
+    const std::string model_source =
+        R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2, 2] x) => (float[2, 2] out) {
+  transposed = Transpose <perm = [)" +
+        std::to_string(perm[0]) + ", " + std::to_string(perm[1]) + R"(]> (x)
+  out = Relu(transposed)
+})";
+    auto model = MakeModelFromText(model_source, function_proto);
     Graph& graph = model->MainGraph();
-    FunctionExtractorGraphBuilder builder(graph);
-    NodeArg* input = builder.MakeInput<float>({2, 2}, 0.0f, 1.0f);
-    NodeArg* transposed = builder.MakeIntermediate<float>({2, 2});
-    NodeArg* output = builder.MakeOutput<float>({2, 2});
-    NodeAttributes attributes{{"perm", ONNX_NAMESPACE::MakeAttribute("perm", perm)}};
-    builder.AddNode("Transpose", {input}, {transposed}, kOnnxDomain, &attributes);
-    builder.AddNode("Relu", {transposed}, {output});
-    builder.SetGraphOutputs();
     ASSERT_STATUS_OK(graph.Resolve());
 
     FunctionExtractor extractor(function_proto);
@@ -907,25 +910,20 @@ TEST_F(FunctionExtractorTest, RequiresExactEffectiveAttributes) {
 }
 
 TEST_F(FunctionExtractorTest, MatchesOptionalAndVariadicSlotsPositionally) {
-  const std::vector<NodeDef> nodes{
-      {{"clipped"}, "Clip", {"x", "", ""}},
-      {{"out"}, "Concat", {"clipped", "y"}, {ONNX_NAMESPACE::MakeAttribute("axis", int64_t{0})}},
-  };
-  const FunctionProto function_proto =
-      MakeFunction("OptionalVariadic", nodes, std::vector<std::string>{"x", "y"},
-                   std::vector<std::string>{"out"});
-  auto model = MakeModel(function_proto);
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+OptionalVariadic (x, y) => (out) {
+  clipped = Clip(x, "", "")
+  out = Concat <axis = 0> (clipped, y)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[1] x, float[1] y) => (float[2] out) {
+  clipped = Clip(x, "", "")
+  out = Concat <axis = 0> (clipped, y)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({1}, 0.0f, 1.0f);
-  NodeArg* y = builder.MakeInput<float>({1}, 0.0f, 1.0f);
-  NodeArg* empty = builder.MakeEmptyInput();
-  NodeArg* clipped = builder.MakeIntermediate<float>({1});
-  NodeArg* output = builder.MakeOutput<float>({2});
-  builder.AddNode("Clip", {x, empty, empty}, {clipped});
-  NodeAttributes attributes{{"axis", ONNX_NAMESPACE::MakeAttribute("axis", int64_t{0})}};
-  builder.AddNode("Concat", {clipped, y}, {output}, kOnnxDomain, &attributes);
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -935,27 +933,20 @@ TEST_F(FunctionExtractorTest, MatchesOptionalAndVariadicSlotsPositionally) {
 }
 
 TEST_F(FunctionExtractorTest, MatchesOperatorWithOmittedOptionalOutput) {
-  const std::vector<NodeDef> nodes{
-      {{"pooled", ""}, "MaxPool", {"x"}, {ONNX_NAMESPACE::MakeAttribute("kernel_shape", std::vector<int64_t>{2, 2})}},
-      {{"out"}, "Identity", {"pooled"}},
-  };
-  const FunctionProto function_proto =
-      MakeFunction("OmittedOptionalOutput", nodes, std::vector<std::string>{"x"},
-                   std::vector<std::string>{"out"});
-  auto model = MakeModel(function_proto);
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+OmittedOptionalOutput (x) => (out) {
+  pooled, "" = MaxPool <kernel_shape = [2, 2]> (x)
+  out = Identity(pooled)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[1, 1, 4, 4] x) => (float[1, 1, 3, 3] out) {
+  pooled, "" = MaxPool <kernel_shape = [2, 2]> (x)
+  out = Identity(pooled)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({1, 1, 4, 4}, 0.0f, 1.0f);
-  NodeArg* pooled = builder.MakeIntermediate<float>({1, 1, 3, 3});
-  NodeArg* missing_indices = builder.MakeEmptyInput();
-  NodeArg* output = builder.MakeOutput<float>({1, 1, 3, 3});
-  NodeAttributes attributes{
-      {"kernel_shape", ONNX_NAMESPACE::MakeAttribute(
-                           "kernel_shape", std::vector<int64_t>{2, 2})}};
-  builder.AddNode("MaxPool", {x}, {pooled, missing_indices}, kOnnxDomain,
-                  &attributes);
-  builder.AddNode("Identity", {pooled}, {output});
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -965,18 +956,12 @@ TEST_F(FunctionExtractorTest, MatchesOperatorWithOmittedOptionalOutput) {
 }
 
 TEST_F(FunctionExtractorTest, AppliesKnownTypeCompatibilityRules) {
-  const std::vector<NodeDef> nodes{
-      {{"intermediate"}, "Identity", {"x"}},
-      {{"out"}, "Identity", {"intermediate"}},
-  };
-  FunctionProto function_proto =
-      MakeFunction("KnownTypes", nodes, std::vector<std::string>{"x"},
-                   std::vector<std::string>{"out"});
-  for (const std::string_view value_name : {"x", "intermediate", "out"}) {
-    AddTensorValueInfo(function_proto, value_name,
-                       ONNX_NAMESPACE::TensorProto_DataType_FLOAT,
-                       std::vector<int64_t>{2});
-  }
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+KnownTypes (float[2] x) => (float[2] out) <float[2] intermediate> {
+  intermediate = Identity(x)
+  out = Identity(intermediate)
+})");
 
   struct FloatShapeCase {
     const char* name;
@@ -990,15 +975,17 @@ TEST_F(FunctionExtractorTest, AppliesKnownTypeCompatibilityRules) {
   };
   for (const auto& test_case : float_shape_cases) {
     SCOPED_TRACE(test_case.name);
-    auto model = MakeModel(function_proto);
+    const std::string type = TensorTypeText("float", test_case.shape);
+    const std::string model_source =
+        "<ir_version: 8, opset_import: [\"\" : 13, \"test.function\" : 1]>\n"
+        "agraph (" +
+        type + " x) => (" + type +
+        " out) {\n"
+        "  intermediate = Identity(x)\n"
+        "  out = Identity(intermediate)\n"
+        "}";
+    auto model = MakeModelFromText(model_source, function_proto);
     Graph& graph = model->MainGraph();
-    FunctionExtractorGraphBuilder builder(graph);
-    NodeArg* x = builder.MakeInput<float>(test_case.shape, 0.0f, 1.0f);
-    NodeArg* intermediate = builder.MakeIntermediate<float>(test_case.shape);
-    NodeArg* output = builder.MakeOutput<float>(test_case.shape);
-    builder.AddNode("Identity", {x}, {intermediate});
-    builder.AddNode("Identity", {intermediate}, {output});
-    builder.SetGraphOutputs();
     ASSERT_STATUS_OK(graph.Resolve());
 
     FunctionExtractor extractor(function_proto);
@@ -1007,15 +994,14 @@ TEST_F(FunctionExtractorTest, AppliesKnownTypeCompatibilityRules) {
     EXPECT_EQ(result.replacements_applied, test_case.expected_replacements);
   }
 
-  auto model = MakeModel(function_proto);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (int32[2] x) => (int32[2] out) {
+  intermediate = Identity(x)
+  out = Identity(intermediate)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<int32_t>({2}, 0, 10);
-  NodeArg* intermediate = builder.MakeIntermediate<int32_t>({2});
-  NodeArg* output = builder.MakeOutput<int32_t>({2});
-  builder.AddNode("Identity", {x}, {intermediate});
-  builder.AddNode("Identity", {intermediate}, {output});
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -1026,6 +1012,7 @@ TEST_F(FunctionExtractorTest, AppliesKnownTypeCompatibilityRules) {
 
 TEST_F(FunctionExtractorTest, RejectsNonTensorValueInfo) {
   FunctionProto function_proto = MakeLinearFunction("NonTensorValueInfo");
+  // Inject the non-tensor TypeProto directly; the surrounding function remains parser-built.
   auto& value_info = *function_proto.add_value_info();
   value_info.set_name("sum");
   value_info.mutable_type()
@@ -1040,6 +1027,7 @@ TEST_F(FunctionExtractorTest, RejectsNonTensorValueInfo) {
 // Literal matching and preservation.
 
 TEST_F(FunctionExtractorTest, ComparesFloatingAndTensorBitsExactly) {
+  // Raw payloads are required to distinguish signed zero and NaN bit patterns.
   auto make_float_tensor = [](uint32_t bits) {
     ONNX_NAMESPACE::TensorProto tensor;
     tensor.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
@@ -1063,16 +1051,20 @@ TEST_F(FunctionExtractorTest, ComparesFloatingAndTensorBitsExactly) {
 
 TEST_F(FunctionExtractorTest, MatchesLiteralFromInitializer) {
   const FunctionProto function_proto = MakeLiteralFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] input) => (float[2] out) <float literal = {1.0}> {
+  sum = Add(input, literal)
+  out = Relu(sum)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* input = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* literal = builder.MakeScalarInitializer<float>(1.0f);
-  NodeArg* sum = builder.MakeIntermediate<float>({2});
-  NodeArg* output = builder.MakeOutput<float>({2});
-  builder.AddNode("Add", {input, literal}, {sum});
-  builder.AddNode("Relu", {sum}, {output});
-  builder.SetGraphOutputs();
+  NodeArg* input = graph.GetNodeArg("input");
+  NodeArg* literal = graph.GetNodeArg("literal");
+  NodeArg* output = graph.GetNodeArg("out");
+  ASSERT_NE(input, nullptr);
+  ASSERT_NE(literal, nullptr);
+  ASSERT_NE(output, nullptr);
   ASSERT_STATUS_OK(graph.Resolve());
   const std::string literal_name = literal->Name();
 
@@ -1090,6 +1082,8 @@ TEST_F(FunctionExtractorTest, MatchesLiteralFromInitializer) {
 
 TEST_F(FunctionExtractorTest, MatchesLiteralFromConstantNode) {
   const FunctionProto function_proto = MakeLiteralFunction();
+  // Model::Load canonicalizes a parsed Constant node into an initializer. Build
+  // this target directly so the test continues to cover a Constant-node witness.
   auto model = MakeModel(function_proto);
   Graph& graph = model->MainGraph();
   FunctionExtractorGraphBuilder builder(graph);
@@ -1115,18 +1109,17 @@ TEST_F(FunctionExtractorTest, MatchesLiteralFromConstantNode) {
 
 TEST_F(FunctionExtractorTest, LeavesSharedAndDeadLiteralWitnesses) {
   const FunctionProto function_proto = MakeLiteralFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] input) => (float[2] graph_output) <float literal = {1.0}> {
+  sum = Add(input, literal)
+  matched_output = Relu(sum)
+  graph_output = Add(matched_output, literal)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* input = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* literal = builder.MakeScalarInitializer<float>(1.0f);
-  NodeArg* sum = builder.MakeIntermediate<float>({2});
-  NodeArg* matched_output = builder.MakeIntermediate<float>({2});
-  NodeArg* graph_output = builder.MakeOutput<float>({2});
-  builder.AddNode("Add", {input, literal}, {sum});
-  builder.AddNode("Relu", {sum}, {matched_output});
-  builder.AddNode("Add", {matched_output, literal}, {graph_output});
-  builder.SetGraphOutputs();
+  NodeArg* literal = graph.GetNodeArg("literal");
+  ASSERT_NE(literal, nullptr);
   ASSERT_STATUS_OK(graph.Resolve());
   const std::string literal_name = literal->Name();
 
@@ -1141,17 +1134,14 @@ TEST_F(FunctionExtractorTest, LeavesSharedAndDeadLiteralWitnesses) {
 
 TEST_F(FunctionExtractorTest, RejectsOverridableInitializerLiteral) {
   const FunctionProto function_proto = MakeLiteralFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] input, float literal = {1.0}) => (float[2] out) {
+  sum = Add(input, literal)
+  out = Relu(sum)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* input = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* literal = builder.MakeScalarInitializer<float>(1.0f);
-  NodeArg* sum = builder.MakeIntermediate<float>({2});
-  NodeArg* output = builder.MakeOutput<float>({2});
-  builder.AddNode("Add", {input, literal}, {sum});
-  builder.AddNode("Relu", {sum}, {output});
-  builder.SetGraphOutputs();
-  graph.SetInputs({input, literal});
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -1162,15 +1152,14 @@ TEST_F(FunctionExtractorTest, RejectsOverridableInitializerLiteral) {
 
 TEST_F(FunctionExtractorTest, RejectsLiteralFormalInputAlias) {
   const FunctionProto function_proto = MakeLiteralFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph () => (float[2] out) <float literal = {1.0}, float[2] sum> {
+  sum = Add(literal, literal)
+  out = Relu(sum)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* literal = builder.MakeScalarInitializer<float>(1.0f);
-  NodeArg* sum = builder.MakeIntermediate<float>({2});
-  NodeArg* output = builder.MakeOutput<float>({2});
-  builder.AddNode("Add", {literal, literal}, {sum});
-  builder.AddNode("Relu", {sum}, {output});
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -1180,25 +1169,22 @@ TEST_F(FunctionExtractorTest, RejectsLiteralFormalInputAlias) {
 }
 
 TEST_F(FunctionExtractorTest, AllowsEqualLiteralsToShareWitness) {
-  const std::vector<NodeDef> nodes{
-      ONNX_NAMESPACE::FunctionBodyHelper::Const<float>("one_a", 1.0f),
-      ONNX_NAMESPACE::FunctionBodyHelper::Const<float>("one_b", 1.0f),
-      {{"sum"}, "Add", {"x", "one_a"}},
-      {{"out"}, "Mul", {"sum", "one_b"}},
-  };
-  const FunctionProto function_proto =
-      MakeFunction("SharedLiteral", nodes, std::vector<std::string>{"x"},
-                   std::vector<std::string>{"out"});
-  auto model = MakeModel(function_proto);
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+SharedLiteral (x) => (out) {
+  one_a = Constant <value = float {1.0}> ()
+  one_b = Constant <value = float {1.0}> ()
+  sum = Add(x, one_a)
+  out = Mul(sum, one_b)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] input) => (float[2] out) <float literal = {1.0}> {
+  sum = Add(input, literal)
+  out = Mul(sum, literal)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* input = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* literal = builder.MakeScalarInitializer<float>(1.0f);
-  NodeArg* sum = builder.MakeIntermediate<float>({2});
-  NodeArg* output = builder.MakeOutput<float>({2});
-  builder.AddNode("Add", {input, literal}, {sum});
-  builder.AddNode("Mul", {sum, literal}, {output});
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -1211,18 +1197,15 @@ TEST_F(FunctionExtractorTest, AllowsEqualLiteralsToShareWitness) {
 
 TEST_F(FunctionExtractorTest, RejectsPrivateIntermediateExternalConsumer) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y) => (float[2] matched_output, float[2] side_output) {
+  sum = Add(x, y)
+  matched_output = Relu(sum)
+  side_output = Neg(sum)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* sum = builder.MakeIntermediate<float>({2});
-  NodeArg* matched_output = builder.MakeOutput<float>({2});
-  NodeArg* side_output = builder.MakeOutput<float>({2});
-  builder.AddNode("Add", {x, y}, {sum});
-  builder.AddNode("Relu", {sum}, {matched_output});
-  builder.AddNode("Neg", {sum}, {side_output});
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -1233,16 +1216,14 @@ TEST_F(FunctionExtractorTest, RejectsPrivateIntermediateExternalConsumer) {
 
 TEST_F(FunctionExtractorTest, RejectsPrivateIntermediateGraphOutput) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y) => (float[2] sum, float[2] matched_output) {
+  sum = Add(x, y)
+  matched_output = Relu(sum)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* sum = builder.MakeOutput<float>({2});
-  NodeArg* matched_output = builder.MakeOutput<float>({2});
-  builder.AddNode("Add", {x, y}, {sum});
-  builder.AddNode("Relu", {sum}, {matched_output});
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -1253,17 +1234,26 @@ TEST_F(FunctionExtractorTest, RejectsPrivateIntermediateGraphOutput) {
 
 TEST_F(FunctionExtractorTest, RejectsPrivateIntermediateImplicitCapture) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y, bool condition) =>
+       (float[2] matched_output, float[2] if_output) {
+  sum = Add(x, y)
+  matched_output = Relu(sum)
+  if_output = If(condition) <
+    then_branch = then_body () => (float[2] then_output) {
+      then_output = Identity(sum)
+    },
+    else_branch = else_body () => (float[2] else_output) {
+      else_output = Identity(sum)
+    }
+  >
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* sum = builder.MakeIntermediate<float>({2});
-  NodeArg* matched_output = builder.MakeOutput<float>({2});
-  builder.AddNode("Add", {x, y}, {sum});
-  builder.AddNode("Relu", {sum}, {matched_output});
-  Node& if_node = AddCapturingIf(builder, *sum);
-  builder.SetGraphOutputs();
+  NodeArg* sum = graph.GetNodeArg("sum");
+  ASSERT_NE(sum, nullptr);
+  Node& if_node = FindOnlyOp(graph, kOnnxDomain, "If");
   ASSERT_STATUS_OK(graph.Resolve());
   ASSERT_EQ(if_node.ImplicitInputDefs().size(), 1u);
   ASSERT_EQ(if_node.ImplicitInputDefs()[0]->Name(), sum->Name());
@@ -1276,19 +1266,27 @@ TEST_F(FunctionExtractorTest, RejectsPrivateIntermediateImplicitCapture) {
 
 TEST_F(FunctionExtractorTest, PreservesFormalOutputConsumersAndImplicitCaptures) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y, bool condition) =>
+       (float[2] explicit_output, float[2] if_output) {
+  sum = Add(x, y)
+  matched_output = Relu(sum)
+  explicit_output = Identity(matched_output)
+  if_output = If(condition) <
+    then_branch = then_body () => (float[2] then_output) {
+      then_output = Identity(matched_output)
+    },
+    else_branch = else_body () => (float[2] else_output) {
+      else_output = Identity(matched_output)
+    }
+  >
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* sum = builder.MakeIntermediate<float>({2});
-  NodeArg* matched_output = builder.MakeIntermediate<float>({2});
-  NodeArg* explicit_output = builder.MakeOutput<float>({2});
-  builder.AddNode("Add", {x, y}, {sum});
-  builder.AddNode("Relu", {sum}, {matched_output});
-  builder.AddNode("Identity", {matched_output}, {explicit_output});
-  Node& if_node = AddCapturingIf(builder, *matched_output);
-  builder.SetGraphOutputs();
+  NodeArg* matched_output = graph.GetNodeArg("matched_output");
+  ASSERT_NE(matched_output, nullptr);
+  Node& if_node = FindOnlyOp(graph, kOnnxDomain, "If");
   ASSERT_STATUS_OK(graph.Resolve());
   ASSERT_EQ(if_node.ImplicitInputDefs().size(), 1u);
 
@@ -1304,29 +1302,28 @@ TEST_F(FunctionExtractorTest, PreservesFormalOutputConsumersAndImplicitCaptures)
 }
 
 TEST_F(FunctionExtractorTest, RejectsDownstreamFormalInputBinding) {
-  const std::vector<NodeDef> nodes{{{"activated"}, "Relu", {"x"}},
-                                   {{"out"}, "Add", {"activated", "y"}}};
-  const FunctionProto function_proto =
-      MakeFunction("DownstreamInput", nodes, std::vector<std::string>{"x", "y"},
-                   std::vector<std::string>{"out"});
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+DownstreamInput (x, y) => (out) {
+  activated = Relu(x)
+  out = Add(activated, y)
+})");
   for (const bool bind_formal_directly_to_matched_output : {false, true}) {
     SCOPED_TRACE(bind_formal_directly_to_matched_output);
-    auto model = MakeModel(function_proto);
+    const std::string middle =
+        bind_formal_directly_to_matched_output
+            ? ""
+            : "  formal_input_binding = Identity(activated)\n";
+    const std::string binding =
+        bind_formal_directly_to_matched_output ? "activated" : "formal_input_binding";
+    const std::string model_source =
+        R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x) => (float[2] out) {
+  activated = Relu(x)
+)" +
+        middle + "  out = Add(activated, " + binding + ")\n}";
+    auto model = MakeModelFromText(model_source, function_proto);
     Graph& graph = model->MainGraph();
-    FunctionExtractorGraphBuilder builder(graph);
-    NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-    NodeArg* activated = builder.MakeIntermediate<float>({2});
-    NodeArg* output = builder.MakeOutput<float>({2});
-    builder.AddNode("Relu", {x}, {activated});
-
-    NodeArg* formal_input_binding = activated;
-    if (!bind_formal_directly_to_matched_output) {
-      formal_input_binding = builder.MakeIntermediate<float>({2});
-      builder.AddNode("Identity", {activated}, {formal_input_binding});
-    }
-
-    builder.AddNode("Add", {activated, formal_input_binding}, {output});
-    builder.SetGraphOutputs();
     ASSERT_STATUS_OK(graph.Resolve());
 
     FunctionExtractor extractor(function_proto);
@@ -1337,22 +1334,21 @@ TEST_F(FunctionExtractorTest, RejectsDownstreamFormalInputBinding) {
 }
 
 TEST_F(FunctionExtractorTest, RejectsNonConvexLeaveAndReenterPath) {
-  const std::vector<NodeDef> nodes{{{"activated"}, "Relu", {"x"}},
-                                   {{"out"}, "Add", {"activated", "y"}}};
-  const FunctionProto function_proto =
-      MakeFunction("NonConvex", nodes, std::vector<std::string>{"x", "y"},
-                   std::vector<std::string>{"out"});
-  auto model = MakeModel(function_proto);
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+NonConvex (x, y) => (out) {
+  activated = Relu(x)
+  out = Add(activated, y)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x) => (float[2] out) {
+  activated = Relu(x)
+  outside = Identity(activated)
+  out = Add(activated, outside)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* activated = builder.MakeIntermediate<float>({2});
-  NodeArg* outside = builder.MakeIntermediate<float>({2});
-  NodeArg* output = builder.MakeOutput<float>({2});
-  builder.AddNode("Relu", {x}, {activated});
-  builder.AddNode("Identity", {activated}, {outside});
-  builder.AddNode("Add", {activated, outside}, {output});
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -1373,13 +1369,11 @@ TEST_F(FunctionExtractorTest, RejectsProviderControlOrAnnotationMismatch) {
         RejectionReason::ControlEdge,
         RejectionReason::LayeringAnnotation}) {
     SCOPED_TRACE(static_cast<int>(reason));
-    auto model = MakeModel(function_proto);
+    auto model = MakeLinearTargetModel(function_proto);
     Graph& graph = model->MainGraph();
-    NodeArg* x;
-    NodeArg* y;
-    NodeArg* sum;
-    NodeArg* output;
-    BuildLinearTarget(graph, x, y, sum, output);
+    NodeArg* x = graph.GetNodeArg("x");
+    ASSERT_NE(x, nullptr);
+    // Provider, control-edge, and layering metadata are not representable in ONNX text.
     NodeIndex control_source_index = 0;
     NodeIndex control_target_index = 0;
     if (reason == RejectionReason::ControlEdge) {
@@ -1436,15 +1430,21 @@ TEST_F(FunctionExtractorTest, RejectsProviderControlOrAnnotationMismatch) {
 
 TEST_F(FunctionExtractorTest, DoesNotCrossGraphScopes) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y, bool condition) => (float[2] if_output) {
+  sum = Add(x, y)
+  if_output = If(condition) <
+    then_branch = then_body () => (float[2] then_output) {
+      then_output = Relu(sum)
+    },
+    else_branch = else_body () => (float[2] else_output) {
+      else_output = Relu(sum)
+    }
+  >
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* sum = builder.MakeIntermediate<float>({2});
-  builder.AddNode("Add", {x, y}, {sum});
-  AddCapturingIf(builder, *sum, "Relu");
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -1459,16 +1459,16 @@ TEST_F(FunctionExtractorTest, DoesNotCrossGraphScopes) {
 
 TEST_F(FunctionExtractorTest, AppliesDisjointMatchesInOneBatch) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y) => (float[2] first, float[2] second) {
+  first_sum = Add(x, y)
+  first = Relu(first_sum)
+  second_sum = Add(x, y)
+  second = Relu(second_sum)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* first = builder.MakeOutput<float>({2});
-  NodeArg* second = builder.MakeOutput<float>({2});
-  AddLinearTarget(builder, x, y, first);
-  AddLinearTarget(builder, x, y, second);
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -1480,25 +1480,25 @@ TEST_F(FunctionExtractorTest, AppliesDisjointMatchesInOneBatch) {
 }
 
 TEST_F(FunctionExtractorTest, SelectsOverlappingMatchesDeterministically) {
-  const std::vector<NodeDef> nodes{
-      {{"sum"}, "Add", {"x", "y"}},
-      {{"out"}, "Relu", {"sum"}},
-  };
-  const FunctionProto function_proto =
-      MakeFunction("Overlapping", nodes, std::vector<std::string>{"x", "y"},
-                   std::vector<std::string>{"sum", "out"});
-  auto model = MakeModel(function_proto);
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+Overlapping (x, y) => (sum, out) {
+  sum = Add(x, y)
+  out = Relu(sum)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y) => (float[2] first, float[2] second) {
+  sum = Add(x, y)
+  first = Relu(sum)
+  second = Relu(sum)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* sum = builder.MakeIntermediate<float>({2});
-  NodeArg* first = builder.MakeOutput<float>({2});
-  NodeArg* second = builder.MakeOutput<float>({2});
-  builder.AddNode("Add", {x, y}, {sum});
-  builder.AddNode("Relu", {sum}, {first});
-  builder.AddNode("Relu", {sum}, {second});
-  builder.SetGraphOutputs();
+  NodeArg* sum = graph.GetNodeArg("sum");
+  NodeArg* first = graph.GetNodeArg("first");
+  ASSERT_NE(sum, nullptr);
+  ASSERT_NE(first, nullptr);
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -1514,21 +1514,16 @@ TEST_F(FunctionExtractorTest, SelectsOverlappingMatchesDeterministically) {
 
 TEST_F(FunctionExtractorTest, DefersBoundaryAdjacentMatchToNextPass) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y, float[2] z) => (float[2] out) {
+  first_sum = Add(x, y)
+  boundary = Relu(first_sum)
+  second_sum = Add(boundary, z)
+  out = Relu(second_sum)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* z = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* first_sum = builder.MakeIntermediate<float>({2});
-  NodeArg* boundary = builder.MakeIntermediate<float>({2});
-  NodeArg* second_sum = builder.MakeIntermediate<float>({2});
-  NodeArg* output = builder.MakeOutput<float>({2});
-  builder.AddNode("Add", {x, y}, {first_sum});
-  builder.AddNode("Relu", {first_sum}, {boundary});
-  builder.AddNode("Add", {boundary, z}, {second_sum});
-  builder.AddNode("Relu", {second_sum}, {output});
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -1541,15 +1536,16 @@ TEST_F(FunctionExtractorTest, DefersBoundaryAdjacentMatchToNextPass) {
 
 TEST_F(FunctionExtractorTest, AllowsSharedUnrelatedBoundaryValues) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] shared) => (float[2] first, float[2] second) {
+  first_sum = Add(shared, shared)
+  first = Relu(first_sum)
+  second_sum = Add(shared, shared)
+  second = Relu(second_sum)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* shared = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* first = builder.MakeOutput<float>({2});
-  NodeArg* second = builder.MakeOutput<float>({2});
-  AddLinearTarget(builder, shared, shared, first);
-  AddLinearTarget(builder, shared, shared, second);
-  builder.SetGraphOutputs();
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -1562,13 +1558,8 @@ TEST_F(FunctionExtractorTest, AllowsSharedUnrelatedBoundaryValues) {
 
 TEST_F(FunctionExtractorTest, RejectsStalePlanBeforeMutation) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeLinearTargetModel(function_proto);
   Graph& graph = model->MainGraph();
-  NodeArg* x;
-  NodeArg* y;
-  NodeArg* sum;
-  NodeArg* output;
-  BuildLinearTarget(graph, x, y, sum, output);
   ASSERT_STATUS_OK(graph.Resolve());
 
   using namespace function_extractor_internal;
@@ -1583,6 +1574,7 @@ TEST_F(FunctionExtractorTest, RejectsStalePlanBeforeMutation) {
   ASSERT_EQ(plans.size(), 1u);
   snapshot.graph_viewer.reset();
 
+  // Remove a planned node after discovery to create a stale plan.
   const NodeIndex stale_node_index = plans[0].removable_node_indices.back();
   ASSERT_TRUE(graph.RemoveNode(stale_node_index));
   EXPECT_FALSE(PrevalidatePlans(graph, compiled, plans).IsOK());
@@ -1591,13 +1583,8 @@ TEST_F(FunctionExtractorTest, RejectsStalePlanBeforeMutation) {
 
 TEST_F(FunctionExtractorTest, ReturnsInvariantErrorAtPassCap) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeLinearTargetModel(function_proto);
   Graph& graph = model->MainGraph();
-  NodeArg* x;
-  NodeArg* y;
-  NodeArg* sum;
-  NodeArg* output;
-  BuildLinearTarget(graph, x, y, sum, output);
   ASSERT_STATUS_OK(graph.Resolve());
   const size_t original_node_count = graph.NumberOfNodes();
 
@@ -1619,13 +1606,8 @@ TEST_F(FunctionExtractorTest, ReturnsInvariantErrorAtPassCap) {
 
 TEST_F(FunctionExtractorTest, ReportsAppliedCountOnResolveFailure) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeLinearTargetModel(function_proto);
   Graph& graph = model->MainGraph();
-  NodeArg* x;
-  NodeArg* y;
-  NodeArg* sum;
-  NodeArg* output;
-  BuildLinearTarget(graph, x, y, sum, output);
   ASSERT_STATUS_OK(graph.Resolve());
 
   using namespace function_extractor_internal;
@@ -1633,6 +1615,7 @@ TEST_F(FunctionExtractorTest, ReportsAppliedCountOnResolveFailure) {
       NormalizeFunctionPattern(function_proto, FunctionExtractorOptions{});
   ASSERT_STATUS_OK(normalized.construction_status);
   ExtractionControls controls;
+  // The injected failure seam is intentionally unavailable in ONNX text.
   controls.resolve_graph = FailGraphResolve;
 
   const FunctionExtractionResult result =
@@ -1647,13 +1630,8 @@ TEST_F(FunctionExtractorTest, ReportsAppliedCountOnResolveFailure) {
 
 TEST_F(FunctionExtractorTest, StrictlyDecreasesNodeCountPerReplacement) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeLinearTargetModel(function_proto);
   Graph& graph = model->MainGraph();
-  NodeArg* x;
-  NodeArg* y;
-  NodeArg* sum;
-  NodeArg* output;
-  BuildLinearTarget(graph, x, y, sum, output);
   ASSERT_STATUS_OK(graph.Resolve());
   const size_t original_node_count = graph.NumberOfNodes();
 
@@ -1667,20 +1645,22 @@ TEST_F(FunctionExtractorTest, StrictlyDecreasesNodeCountPerReplacement) {
 
 TEST_F(FunctionExtractorTest, PreservesOutputIdentityAndFanout) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+agraph (float[2] x, float[2] y) => (float[2] output_a, float[2] output_b) {
+  sum = Add(x, y)
+  pattern_output = Relu(sum)
+  output_a = Identity(pattern_output)
+  output_b = Neg(pattern_output)
+})",
+      function_proto);
   Graph& graph = model->MainGraph();
-  FunctionExtractorGraphBuilder builder(graph);
-  NodeArg* x = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* y = builder.MakeInput<float>({2}, 0.0f, 1.0f);
-  NodeArg* sum = builder.MakeIntermediate<float>({2});
-  NodeArg* pattern_output = builder.MakeIntermediate<float>({2});
-  NodeArg* output_a = builder.MakeOutput<float>({2});
-  NodeArg* output_b = builder.MakeOutput<float>({2});
-  builder.AddNode("Add", {x, y}, {sum});
-  builder.AddNode("Relu", {sum}, {pattern_output});
-  builder.AddNode("Identity", {pattern_output}, {output_a});
-  builder.AddNode("Neg", {pattern_output}, {output_b});
-  builder.SetGraphOutputs();
+  NodeArg* pattern_output = graph.GetNodeArg("pattern_output");
+  NodeArg* output_a = graph.GetNodeArg("output_a");
+  NodeArg* output_b = graph.GetNodeArg("output_b");
+  ASSERT_NE(pattern_output, nullptr);
+  ASSERT_NE(output_a, nullptr);
+  ASSERT_NE(output_b, nullptr);
   ASSERT_STATUS_OK(graph.Resolve());
   const std::string pattern_output_name = pattern_output->Name();
   const ONNX_NAMESPACE::TypeProto pattern_output_type = *pattern_output->TypeAsProto();
@@ -1700,13 +1680,8 @@ TEST_F(FunctionExtractorTest, PreservesOutputIdentityAndFanout) {
 
 TEST_F(FunctionExtractorTest, ReturnsResolvedGraphAtFixpoint) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeLinearTargetModel(function_proto);
   Graph& graph = model->MainGraph();
-  NodeArg* x;
-  NodeArg* y;
-  NodeArg* sum;
-  NodeArg* output;
-  BuildLinearTarget(graph, x, y, sum, output);
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -1723,13 +1698,8 @@ TEST_F(FunctionExtractorTest, ReturnsResolvedGraphAtFixpoint) {
 
 TEST_F(FunctionExtractorTest, PersistsRegisteredCallAfterSerializeReload) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeLinearTargetModel(function_proto);
   Graph& graph = model->MainGraph();
-  NodeArg* x;
-  NodeArg* y;
-  NodeArg* sum;
-  NodeArg* output;
-  BuildLinearTarget(graph, x, y, sum, output);
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
@@ -1746,13 +1716,10 @@ TEST_F(FunctionExtractorTest, PersistsRegisteredCallAfterSerializeReload) {
 
 TEST_F(FunctionExtractorTest, RoundTripsThroughInlineFunction) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeLinearTargetModel(function_proto);
   Graph& graph = model->MainGraph();
-  NodeArg* x;
-  NodeArg* y;
-  NodeArg* sum;
-  NodeArg* output;
-  BuildLinearTarget(graph, x, y, sum, output);
+  NodeArg* output = graph.GetNodeArg("out");
+  ASSERT_NE(output, nullptr);
   ASSERT_STATUS_OK(graph.Resolve());
 
   FunctionExtractor extractor(function_proto);
