@@ -25,6 +25,9 @@ using NodeDef = ONNX_NAMESPACE::FunctionBodyHelper::NodeDef;
 constexpr const char* kFunctionDomain = "test.function";
 constexpr int kOnnxOpset = 13;
 
+// Text fixtures keep their model/function headers explicit so each is valid,
+// standalone ONNX text. The repeated graph name is `target_graph` throughout.
+
 FunctionProto ParseFunction(std::string_view source) {
   const std::string source_string{source};
   ONNX_NAMESPACE::OnnxParser parser(source_string.c_str());
@@ -82,6 +85,16 @@ std::string TensorTypeText(std::string_view element_type,
   }
   result += "]";
   return result;
+}
+
+std::string MakeTwoIdentityModelText(std::string_view type) {
+  return "<ir_version: 8, opset_import: [\"\" : 13, \"test.function\" : 1]>\n"
+         "target_graph (" +
+         std::string{type} + " x) => (" + std::string{type} +
+         " out) {\n"
+         "  intermediate = Identity(x)\n"
+         "  out = Identity(intermediate)\n"
+         "}";
 }
 
 class FunctionExtractorGraphBuilder final : public ::onnxruntime::test::ModelTestBuilder {
@@ -150,22 +163,25 @@ FunctionProto MakeLiteralFunction(std::string name = "Literal") {
 })");
 }
 
-std::shared_ptr<Model> MakeModel(std::vector<FunctionProto> function_protos) {
+std::shared_ptr<Model> MakeEmptyModelWithFunctions(
+    std::vector<FunctionProto> function_protos) {
   return MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph () => () {
+target_graph () => () {
 })",
       function_protos);
 }
 
-std::shared_ptr<Model> MakeModel(const FunctionProto& function_proto) {
-  return MakeModel(std::vector<FunctionProto>{function_proto});
+std::shared_ptr<Model> MakeEmptyModelWithFunctions(
+    const FunctionProto& function_proto) {
+  return MakeEmptyModelWithFunctions(
+      std::vector<FunctionProto>{function_proto});
 }
 
 std::shared_ptr<Model> MakeLinearTargetModel(const FunctionProto& function_proto) {
   return MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y) => (float[2] out) {
+target_graph (float[2] x, float[2] y) => (float[2] out) {
   sum = Add(x, y)
   out = Relu(sum)
 })",
@@ -329,18 +345,33 @@ TEST_F(FunctionExtractorTest, RejectsMalformedDataflow) {
   const std::vector<std::string> inputs{"x", "y"};
   const std::vector<std::string> outputs{"out"};
 
-  const std::vector<std::vector<NodeDef>> invalid_bodies{
-      {{{"sum"}, "Add", {"x", "undefined"}}, {{"out"}, "Relu", {"sum"}}},
-      {{{"sum"}, "Add", {"x", "y"}}, {{"sum"}, "Mul", {"x", "y"}}, {{"out"}, "Relu", {"sum"}}},
-      {{{"a"}, "Add", {"b", "x"}}, {{"b"}, "Mul", {"a", "y"}}, {{"out"}, "Relu", {"a"}}},
-      {{{"sum"}, "Add", {"x", "y"}}, {{"dead"}, "Mul", {"x", "y"}}, {{"out"}, "Relu", {"sum"}}},
-      {{{"sum"}, "Add", {"x", ""}}, {{"out"}, "Relu", {"sum"}}},
+  struct MalformedDataflowCase {
+    const char* name;
+    std::vector<NodeDef> nodes;
+  };
+  const std::vector<MalformedDataflowCase> cases{
+      {"undefined input",
+       {{{"sum"}, "Add", {"x", "undefined"}}, {{"out"}, "Relu", {"sum"}}}},
+      {"duplicate producer",
+       {{{"sum"}, "Add", {"x", "y"}},
+        {{"sum"}, "Mul", {"x", "y"}},
+        {{"out"}, "Relu", {"sum"}}}},
+      {"cycle",
+       {{{"a"}, "Add", {"b", "x"}},
+        {{"b"}, "Mul", {"a", "y"}},
+        {{"out"}, "Relu", {"a"}}}},
+      {"dead operation",
+       {{{"sum"}, "Add", {"x", "y"}},
+        {{"dead"}, "Mul", {"x", "y"}},
+        {{"out"}, "Relu", {"sum"}}}},
+      {"missing required input",
+       {{{"sum"}, "Add", {"x", ""}}, {{"out"}, "Relu", {"sum"}}}},
   };
 
-  for (size_t i = 0; i < invalid_bodies.size(); ++i) {
-    SCOPED_TRACE(i);
-    ExpectConstructionRejected(MakeFunction("Malformed" + std::to_string(i),
-                                            invalid_bodies[i], inputs, outputs));
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    ExpectConstructionRejected(
+        MakeFunction("MalformedDataflow", test_case.nodes, inputs, outputs));
   }
 }
 
@@ -382,6 +413,8 @@ TEST_F(FunctionExtractorTest, RejectsConstantFormalOutput) {
       {{"out"}, "Identity", {"literal"}},
   };
   FunctionProto function_proto = MakeFunction("ConstantOutput", constant_body, no_inputs, outputs);
+  // Rebind the formal output directly to the Constant result. The text parser
+  // would reject this malformed relationship before FunctionExtractor sees it.
   function_proto.mutable_output(0)->assign("literal");
   ExpectConstructionRejected(std::move(function_proto));
 }
@@ -410,7 +443,7 @@ TEST_F(FunctionExtractorTest, RejectsUnregisteredFunction) {
   FunctionProto function_proto = MakeLinearFunction();
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13]>
-agraph (float[2] x, float[2] y) => (float[2] out) {
+target_graph (float[2] x, float[2] y) => (float[2] out) {
   sum = Add(x, y)
   out = Relu(sum)
 })");
@@ -453,7 +486,7 @@ Celu (x) => (out) {
 })");
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13]>
-agraph () => () {
+target_graph () => () {
 })");
   ASSERT_STATUS_OK(model->MainGraph().Resolve());
   FunctionExtractor extractor(function_proto);
@@ -472,7 +505,7 @@ Outer (x, y) => (out) {
 })");
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y) => (float[2] out) {
+target_graph (float[2] x, float[2] y) => (float[2] out) {
   nested_out = test.function.Nested(x, y)
   out = Identity(nested_out)
 })",
@@ -489,7 +522,7 @@ agraph (float[2] x, float[2] y) => (float[2] out) {
 
 TEST_F(FunctionExtractorTest, RejectsUnresolvedTargetGraph) {
   const FunctionProto function_proto = MakeLinearFunction();
-  auto model = MakeModel(function_proto);
+  auto model = MakeEmptyModelWithFunctions(function_proto);
   Graph& graph = model->MainGraph();
   // The target must remain unresolved, which cannot be preserved through Model::Load.
   NodeArg* x;
@@ -523,7 +556,7 @@ Impure1 (x, y) => (out) {
   for (size_t i = 0; i < functions.size(); ++i) {
     SCOPED_TRACE(i);
     const FunctionProto function_proto = ParseFunction(functions[i]);
-    auto model = MakeModel(function_proto);
+    auto model = MakeEmptyModelWithFunctions(function_proto);
     ASSERT_STATUS_OK(model->MainGraph().Resolve());
     FunctionExtractor extractor(function_proto);
     const FunctionExtractionResult result = extractor.Extract(model->MainGraph());
@@ -583,7 +616,7 @@ TEST_F(FunctionExtractorTest, RejectsHighArityPatternBeforeMutation) {
   };
   const FunctionProto function_proto =
       MakeFunction("HighArity", nodes, inputs, std::vector<std::string>{"out"});
-  auto model = MakeModel(function_proto);
+  auto model = MakeEmptyModelWithFunctions(function_proto);
   Graph& graph = model->MainGraph();
   FunctionExtractorGraphBuilder builder(graph);
   std::vector<NodeArg*> target_inputs;
@@ -662,7 +695,7 @@ Branched (x, y) => (scaled, activated) {
 })");
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y) => (float[2] scaled, float[2] activated) {
+target_graph (float[2] x, float[2] y) => (float[2] scaled, float[2] activated) {
   sum = Add(x, y)
   scaled = Mul(sum, y)
   activated = Relu(sum)
@@ -699,7 +732,7 @@ Diamond (x, y) => (out) {
 })");
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y) => (float[2] out) {
+target_graph (float[2] x, float[2] y) => (float[2] out) {
   sum = Add(x, y)
   left = Relu(sum)
   right = Identity(sum)
@@ -736,7 +769,7 @@ TwoRoots (x, y) => (left, right) {
 })");
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y, float[2] other) => (float[2] left, float[2] right) {
+target_graph (float[2] x, float[2] y, float[2] other) => (float[2] left, float[2] right) {
   sum_a = Add(x, y)
   sum_b = Add(x, other)
   left = Relu(sum_a)
@@ -757,7 +790,7 @@ TEST_F(FunctionExtractorTest, EnumeratesOutputRootsDeterministically) {
   const FunctionProto function_proto = MakeLinearFunction();
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y) => (float[2] first, float[2] second) {
+target_graph (float[2] x, float[2] y) => (float[2] first, float[2] second) {
   first_sum = Add(x, y)
   first = Relu(first_sum)
   second_sum = Add(x, y)
@@ -790,7 +823,7 @@ AliasedInputs (x, y) => (out) {
 })");
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] input) => (float[2] out) {
+target_graph (float[2] input) => (float[2] out) {
   sum = Add(input, input)
   out = Mul(sum, input)
 })",
@@ -820,7 +853,7 @@ Positional (x, y) => (out) {
 })");
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y) => (float[2] out) {
+target_graph (float[2] x, float[2] y) => (float[2] out) {
   difference = Sub(x, y)
   out = Div(y, difference)
 })",
@@ -838,7 +871,7 @@ TEST_F(FunctionExtractorTest, RootIndexAllowsExternalProducerAndOutputFanout) {
   const FunctionProto function_proto = MakeLinearFunction();
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] source, float[2] y) => (float[2] output_a, float[2] output_b) {
+target_graph (float[2] source, float[2] y) => (float[2] output_a, float[2] output_b) {
   x = Abs(source)
   sum = Add(x, y)
   matched_output = Relu(sum)
@@ -860,16 +893,27 @@ agraph (float[2] source, float[2] y) => (float[2] output_a, float[2] output_b) {
 
 TEST_F(FunctionExtractorTest, RequiresExactOperatorIdentityAndArity) {
   const FunctionProto function_proto = MakeLinearFunction();
-  for (const std::string& second_op : {"Sigmoid", "Neg"}) {
-    SCOPED_TRACE(second_op);
-    const std::string model_source =
-        R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y) => (float[2] out) {
+  struct OperatorMismatchCase {
+    const char* name;
+    std::string_view model_source;
+  };
+  const std::vector<OperatorMismatchCase> cases{
+      {"Sigmoid operator",
+       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x, float[2] y) => (float[2] out) {
   sum = Add(x, y)
-  out = )" +
-        second_op + R"((sum)
-})";
-    auto model = MakeModelFromText(model_source, function_proto);
+  out = Sigmoid(sum)
+})"},
+      {"Neg operator",
+       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x, float[2] y) => (float[2] out) {
+  sum = Add(x, y)
+  out = Neg(sum)
+})"},
+  };
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    auto model = MakeModelFromText(test_case.model_source, function_proto);
     Graph& graph = model->MainGraph();
     ASSERT_STATUS_OK(graph.Resolve());
 
@@ -888,24 +932,37 @@ Attributes (x) => (out) {
   out = Relu(transposed)
 })");
 
-  for (const std::vector<int64_t>& perm :
-       {std::vector<int64_t>{1, 0}, std::vector<int64_t>{0, 1}}) {
-    SCOPED_TRACE(::testing::PrintToString(perm));
-    const std::string model_source =
-        R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2, 2] x) => (float[2, 2] out) {
-  transposed = Transpose <perm = [)" +
-        std::to_string(perm[0]) + ", " + std::to_string(perm[1]) + R"(]> (x)
+  struct AttributeCase {
+    const char* name;
+    std::string_view model_source;
+    size_t expected_replacements;
+  };
+  const std::vector<AttributeCase> cases{
+      {"matching permutation",
+       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2, 2] x) => (float[2, 2] out) {
+  transposed = Transpose <perm = [1, 0]> (x)
   out = Relu(transposed)
-})";
-    auto model = MakeModelFromText(model_source, function_proto);
+})",
+       1},
+      {"different permutation",
+       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2, 2] x) => (float[2, 2] out) {
+  transposed = Transpose <perm = [0, 1]> (x)
+  out = Relu(transposed)
+})",
+       0},
+  };
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    auto model = MakeModelFromText(test_case.model_source, function_proto);
     Graph& graph = model->MainGraph();
     ASSERT_STATUS_OK(graph.Resolve());
 
     FunctionExtractor extractor(function_proto);
     const FunctionExtractionResult result = extractor.Extract(graph);
     ASSERT_STATUS_OK(result.status);
-    EXPECT_EQ(result.replacements_applied, perm == std::vector<int64_t>({1, 0}) ? 1u : 0u);
+    EXPECT_EQ(result.replacements_applied, test_case.expected_replacements);
   }
 }
 
@@ -918,7 +975,7 @@ OptionalVariadic (x, y) => (out) {
 })");
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[1] x, float[1] y) => (float[2] out) {
+target_graph (float[1] x, float[1] y) => (float[2] out) {
   clipped = Clip(x, "", "")
   out = Concat <axis = 0> (clipped, y)
 })",
@@ -941,7 +998,7 @@ OmittedOptionalOutput (x) => (out) {
 })");
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[1, 1, 4, 4] x) => (float[1, 1, 3, 3] out) {
+target_graph (float[1, 1, 4, 4] x) => (float[1, 1, 3, 3] out) {
   pooled, "" = MaxPool <kernel_shape = [2, 2]> (x)
   out = Identity(pooled)
 })",
@@ -975,16 +1032,10 @@ KnownTypes (float[2] x) => (float[2] out) <float[2] intermediate> {
   };
   for (const auto& test_case : float_shape_cases) {
     SCOPED_TRACE(test_case.name);
-    const std::string type = TensorTypeText("float", test_case.shape);
-    const std::string model_source =
-        "<ir_version: 8, opset_import: [\"\" : 13, \"test.function\" : 1]>\n"
-        "agraph (" +
-        type + " x) => (" + type +
-        " out) {\n"
-        "  intermediate = Identity(x)\n"
-        "  out = Identity(intermediate)\n"
-        "}";
-    auto model = MakeModelFromText(model_source, function_proto);
+    auto model = MakeModelFromText(
+        MakeTwoIdentityModelText(
+            TensorTypeText("float", test_case.shape)),
+        function_proto);
     Graph& graph = model->MainGraph();
     ASSERT_STATUS_OK(graph.Resolve());
 
@@ -996,7 +1047,7 @@ KnownTypes (float[2] x) => (float[2] out) <float[2] intermediate> {
 
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (int32[2] x) => (int32[2] out) {
+target_graph (int32[2] x) => (int32[2] out) {
   intermediate = Identity(x)
   out = Identity(intermediate)
 })",
@@ -1053,7 +1104,7 @@ TEST_F(FunctionExtractorTest, MatchesLiteralFromInitializer) {
   const FunctionProto function_proto = MakeLiteralFunction();
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] input) => (float[2] out) <float literal = {1.0}> {
+target_graph (float[2] input) => (float[2] out) <float literal = {1.0}> {
   sum = Add(input, literal)
   out = Relu(sum)
 })",
@@ -1084,7 +1135,7 @@ TEST_F(FunctionExtractorTest, MatchesLiteralFromConstantNode) {
   const FunctionProto function_proto = MakeLiteralFunction();
   // Model::Load canonicalizes a parsed Constant node into an initializer. Build
   // this target directly so the test continues to cover a Constant-node witness.
-  auto model = MakeModel(function_proto);
+  auto model = MakeEmptyModelWithFunctions(function_proto);
   Graph& graph = model->MainGraph();
   FunctionExtractorGraphBuilder builder(graph);
   NodeArg* input = builder.MakeInput<float>({2}, 0.0f, 1.0f);
@@ -1111,7 +1162,7 @@ TEST_F(FunctionExtractorTest, LeavesSharedAndDeadLiteralWitnesses) {
   const FunctionProto function_proto = MakeLiteralFunction();
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] input) => (float[2] graph_output) <float literal = {1.0}> {
+target_graph (float[2] input) => (float[2] graph_output) <float literal = {1.0}> {
   sum = Add(input, literal)
   matched_output = Relu(sum)
   graph_output = Add(matched_output, literal)
@@ -1136,7 +1187,7 @@ TEST_F(FunctionExtractorTest, RejectsOverridableInitializerLiteral) {
   const FunctionProto function_proto = MakeLiteralFunction();
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] input, float literal = {1.0}) => (float[2] out) {
+target_graph (float[2] input, float literal = {1.0}) => (float[2] out) {
   sum = Add(input, literal)
   out = Relu(sum)
 })",
@@ -1154,7 +1205,7 @@ TEST_F(FunctionExtractorTest, RejectsLiteralFormalInputAlias) {
   const FunctionProto function_proto = MakeLiteralFunction();
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph () => (float[2] out) <float literal = {1.0}, float[2] sum> {
+target_graph () => (float[2] out) <float literal = {1.0}, float[2] sum> {
   sum = Add(literal, literal)
   out = Relu(sum)
 })",
@@ -1179,7 +1230,7 @@ SharedLiteral (x) => (out) {
 })");
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] input) => (float[2] out) <float literal = {1.0}> {
+target_graph (float[2] input) => (float[2] out) <float literal = {1.0}> {
   sum = Add(input, literal)
   out = Mul(sum, literal)
 })",
@@ -1199,7 +1250,7 @@ TEST_F(FunctionExtractorTest, RejectsPrivateIntermediateExternalConsumer) {
   const FunctionProto function_proto = MakeLinearFunction();
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y) => (float[2] matched_output, float[2] side_output) {
+target_graph (float[2] x, float[2] y) => (float[2] matched_output, float[2] side_output) {
   sum = Add(x, y)
   matched_output = Relu(sum)
   side_output = Neg(sum)
@@ -1218,7 +1269,7 @@ TEST_F(FunctionExtractorTest, RejectsPrivateIntermediateGraphOutput) {
   const FunctionProto function_proto = MakeLinearFunction();
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y) => (float[2] sum, float[2] matched_output) {
+target_graph (float[2] x, float[2] y) => (float[2] sum, float[2] matched_output) {
   sum = Add(x, y)
   matched_output = Relu(sum)
 })",
@@ -1236,7 +1287,7 @@ TEST_F(FunctionExtractorTest, RejectsPrivateIntermediateImplicitCapture) {
   const FunctionProto function_proto = MakeLinearFunction();
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y, bool condition) =>
+target_graph (float[2] x, float[2] y, bool condition) =>
        (float[2] matched_output, float[2] if_output) {
   sum = Add(x, y)
   matched_output = Relu(sum)
@@ -1268,7 +1319,7 @@ TEST_F(FunctionExtractorTest, PreservesFormalOutputConsumersAndImplicitCaptures)
   const FunctionProto function_proto = MakeLinearFunction();
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y, bool condition) =>
+target_graph (float[2] x, float[2] y, bool condition) =>
        (float[2] explicit_output, float[2] if_output) {
   sum = Add(x, y)
   matched_output = Relu(sum)
@@ -1308,21 +1359,28 @@ DownstreamInput (x, y) => (out) {
   activated = Relu(x)
   out = Add(activated, y)
 })");
-  for (const bool bind_formal_directly_to_matched_output : {false, true}) {
-    SCOPED_TRACE(bind_formal_directly_to_matched_output);
-    const std::string middle =
-        bind_formal_directly_to_matched_output
-            ? ""
-            : "  formal_input_binding = Identity(activated)\n";
-    const std::string binding =
-        bind_formal_directly_to_matched_output ? "activated" : "formal_input_binding";
-    const std::string model_source =
-        R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x) => (float[2] out) {
+  struct DownstreamBindingCase {
+    const char* name;
+    std::string_view model_source;
+  };
+  const std::vector<DownstreamBindingCase> cases{
+      {"through downstream node",
+       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x) => (float[2] out) {
   activated = Relu(x)
-)" +
-        middle + "  out = Add(activated, " + binding + ")\n}";
-    auto model = MakeModelFromText(model_source, function_proto);
+  formal_input_binding = Identity(activated)
+  out = Add(activated, formal_input_binding)
+})"},
+      {"directly to matched output",
+       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x) => (float[2] out) {
+  activated = Relu(x)
+  out = Add(activated, activated)
+})"},
+  };
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    auto model = MakeModelFromText(test_case.model_source, function_proto);
     Graph& graph = model->MainGraph();
     ASSERT_STATUS_OK(graph.Resolve());
 
@@ -1342,7 +1400,7 @@ NonConvex (x, y) => (out) {
 })");
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x) => (float[2] out) {
+target_graph (float[2] x) => (float[2] out) {
   activated = Relu(x)
   outside = Identity(activated)
   out = Add(activated, outside)
@@ -1359,6 +1417,8 @@ agraph (float[2] x) => (float[2] out) {
 
 TEST_F(FunctionExtractorTest, RejectsProviderControlOrAnnotationMismatch) {
   const FunctionProto function_proto = MakeLinearFunction();
+  // Provider, control-edge, and layering metadata are not representable in
+  // ONNX text, so each parsed target is annotated after loading.
   enum class RejectionReason {
     ProviderAssignment,
     ControlEdge,
@@ -1373,7 +1433,6 @@ TEST_F(FunctionExtractorTest, RejectsProviderControlOrAnnotationMismatch) {
     Graph& graph = model->MainGraph();
     NodeArg* x = graph.GetNodeArg("x");
     ASSERT_NE(x, nullptr);
-    // Provider, control-edge, and layering metadata are not representable in ONNX text.
     NodeIndex control_source_index = 0;
     NodeIndex control_target_index = 0;
     if (reason == RejectionReason::ControlEdge) {
@@ -1432,7 +1491,7 @@ TEST_F(FunctionExtractorTest, DoesNotCrossGraphScopes) {
   const FunctionProto function_proto = MakeLinearFunction();
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y, bool condition) => (float[2] if_output) {
+target_graph (float[2] x, float[2] y, bool condition) => (float[2] if_output) {
   sum = Add(x, y)
   if_output = If(condition) <
     then_branch = then_body () => (float[2] then_output) {
@@ -1461,7 +1520,7 @@ TEST_F(FunctionExtractorTest, AppliesDisjointMatchesInOneBatch) {
   const FunctionProto function_proto = MakeLinearFunction();
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y) => (float[2] first, float[2] second) {
+target_graph (float[2] x, float[2] y) => (float[2] first, float[2] second) {
   first_sum = Add(x, y)
   first = Relu(first_sum)
   second_sum = Add(x, y)
@@ -1488,7 +1547,7 @@ Overlapping (x, y) => (sum, out) {
 })");
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y) => (float[2] first, float[2] second) {
+target_graph (float[2] x, float[2] y) => (float[2] first, float[2] second) {
   sum = Add(x, y)
   first = Relu(sum)
   second = Relu(sum)
@@ -1516,7 +1575,7 @@ TEST_F(FunctionExtractorTest, DefersBoundaryAdjacentMatchToNextPass) {
   const FunctionProto function_proto = MakeLinearFunction();
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y, float[2] z) => (float[2] out) {
+target_graph (float[2] x, float[2] y, float[2] z) => (float[2] out) {
   first_sum = Add(x, y)
   boundary = Relu(first_sum)
   second_sum = Add(boundary, z)
@@ -1538,7 +1597,7 @@ TEST_F(FunctionExtractorTest, AllowsSharedUnrelatedBoundaryValues) {
   const FunctionProto function_proto = MakeLinearFunction();
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] shared) => (float[2] first, float[2] second) {
+target_graph (float[2] shared) => (float[2] first, float[2] second) {
   first_sum = Add(shared, shared)
   first = Relu(first_sum)
   second_sum = Add(shared, shared)
@@ -1615,7 +1674,8 @@ TEST_F(FunctionExtractorTest, ReportsAppliedCountOnResolveFailure) {
       NormalizeFunctionPattern(function_proto, FunctionExtractorOptions{});
   ASSERT_STATUS_OK(normalized.construction_status);
   ExtractionControls controls;
-  // The injected failure seam is intentionally unavailable in ONNX text.
+  // This must inject a runtime Graph::Resolve failure after mutation, so it
+  // necessarily uses the internal extraction control rather than model syntax.
   controls.resolve_graph = FailGraphResolve;
 
   const FunctionExtractionResult result =
@@ -1647,7 +1707,7 @@ TEST_F(FunctionExtractorTest, PreservesOutputIdentityAndFanout) {
   const FunctionProto function_proto = MakeLinearFunction();
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
-agraph (float[2] x, float[2] y) => (float[2] output_a, float[2] output_b) {
+target_graph (float[2] x, float[2] y) => (float[2] output_a, float[2] output_b) {
   sum = Add(x, y)
   pattern_output = Relu(sum)
   output_a = Identity(pattern_output)
