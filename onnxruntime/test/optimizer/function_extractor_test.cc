@@ -1583,6 +1583,31 @@ target_graph (float[2] x) => (float[2] out) {
   ASSERT_STATUS_OK(override_model->MainGraph().Resolve());
 }
 
+TEST_F(FunctionExtractorTest, AllowsUnusedRequiredAttributeInGeneratedFunctionSchema) {
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+UnusedRequired <unused> (x) => (out) {
+  intermediate = Identity(x)
+  out = Identity(intermediate)
+})");
+  ASSERT_EQ(function_proto.attribute_size(), 1);
+  ASSERT_EQ(function_proto.attribute(0), "unused");
+
+  // With no body reference there is no operator-schema type to register.
+  // The generated schema must skip the declaration rather than reject the
+  // otherwise valid model-local function.
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x) => (float[2] out) {
+  out = test.function.UnusedRequired(x)
+})",
+      function_proto);
+  ASSERT_STATUS_OK(model->MainGraph().Resolve());
+  const Node& call =
+      FindOnlyOp(model->MainGraph(), kFunctionDomain, function_proto.name());
+  EXPECT_TRUE(call.GetAttributes().empty());
+}
+
 TEST_F(FunctionExtractorTest, RejectsInvalidAttributeDeclarationsAndReferences) {
   ExpectConstructionRejected(ParseFunction(
       R"(<opset_import: ["" : 13], domain: "test.function">
