@@ -776,9 +776,9 @@ target_graph (float[2] x) => (float[2] out) {
 TEST_F(FunctionExtractorTest, EnforcesCumulativeTargetAttributeBudgetBeforeMutation) {
   const FunctionProto function_proto = ParseFunction(
       R"(<opset_import: ["" : 13], domain: "test.function">
-TargetAttributeBudget <slope> (x) => (out) {
-  first = LeakyRelu <alpha : float = @slope> (x)
-  out = LeakyRelu <alpha : float = @slope> (first)
+TargetAttributeBudget <dtype> (x) => (out) {
+  first = Cast <to : int = @dtype> (x)
+  out = Cast <to : int = @dtype> (first)
 })");
   const auto normalized =
       function_extractor_internal::NormalizeFunctionPattern(
@@ -787,8 +787,8 @@ TargetAttributeBudget <slope> (x) => (out) {
 
   ONNX_NAMESPACE::AttributeProto canonical_target_attribute;
   ASSERT_STATUS_OK(function_extractor_internal::CanonicalizeFormalAttribute(
-      "slope", ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT,
-      ONNX_NAMESPACE::MakeAttribute("alpha", 0.2f),
+      "dtype", ONNX_NAMESPACE::AttributeProto_AttributeType_INT,
+      ONNX_NAMESPACE::MakeAttribute("to", int64_t{1}),
       std::numeric_limits<size_t>::max(), canonical_target_attribute));
   const size_t target_attribute_bytes =
       function_extractor_internal::AttributePayloadBytes(
@@ -798,8 +798,8 @@ TargetAttributeBudget <slope> (x) => (out) {
   auto model = MakeModelFromText(
       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
 target_graph (float[2] x) => (float[2] out) {
-  first = LeakyRelu <alpha = 0.2> (x)
-  out = LeakyRelu <alpha = 0.2> (first)
+  first = Cast <to : int = 1> (x)
+  out = Cast <to : int = 1> (first)
 })",
       function_proto);
   Graph& graph = model->MainGraph();
@@ -811,6 +811,13 @@ target_graph (float[2] x) => (float[2] out) {
   options.max_attribute_bytes =
       normalized.pattern_attribute_payload_bytes +
       2 * target_attribute_bytes - 1;
+  const auto budgeted_normalized =
+      function_extractor_internal::NormalizeFunctionPattern(function_proto, options);
+  ASSERT_STATUS_OK(budgeted_normalized.construction_status);
+  function_extractor_internal::CompiledFunctionPattern compiled;
+  ASSERT_STATUS_OK(function_extractor_internal::CompileFunctionPattern(
+      budgeted_normalized, graph, compiled));
+
   FunctionExtractor extractor(function_proto, options);
   const FunctionExtractionResult result = extractor.Extract(graph);
   EXPECT_FALSE(result.status.IsOK());
