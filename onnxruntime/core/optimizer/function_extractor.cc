@@ -47,7 +47,7 @@ common::Status ApplyReplacementPlan(
                              "Function call created by FunctionExtractor",
                              plan.call_inputs,
                              plan.call_outputs,
-                             nullptr,
+                             &plan.call_attributes,
                              function_proto.domain());
   call_added = true;
   call.SetOverload(function_proto.overload());

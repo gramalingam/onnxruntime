@@ -27,10 +27,14 @@ struct FunctionExtractorOptions {
   size_t max_target_nodes{1'000'000};
   /** Maximum candidate-root entries and output-root tuples per discovery pass. */
   size_t max_output_root_tuples{100'000};
-  /** Maximum pattern-slot normalization and aggregate matcher work per pass. */
+  /** Maximum aggregate normalization, enumeration, and matcher work. */
   size_t max_worklist_bindings{1'000'000};
   /** Maximum aggregate literal bytes normalized or compared per pass. */
   size_t max_literal_bytes{64U * 1024U * 1024U};
+  /** Maximum declared formal attributes in the extraction pattern. */
+  size_t max_formal_attributes{256};
+  /** Maximum pattern metadata plus target attribute payload bytes per pass. */
+  size_t max_attribute_bytes{64U * 1024U * 1024U};
 };
 
 /**
@@ -50,10 +54,11 @@ class FunctionExtractor final {
    * Copies and validates function_proto. The caller may destroy the source
    * proto after construction.
    *
-   * V1 supports connected, acyclic, pure tensor DAGs with fixed attributes,
-   * positional optional/variadic slots, and dense Constant literals. It does
-   * not support function attribute references, required call attributes,
-   * control-flow bodies, or provider-assigned matches.
+   * Supports connected, acyclic, pure tensor DAGs with fixed or formal
+   * attributes, positional optional/variadic slots, and dense Constant
+   * literals. Generated calls explicitly emit every bound required/defaulted
+   * formal attribute. Control-flow bodies and provider-assigned matches are
+   * not supported.
    */
   explicit FunctionExtractor(
       const ONNX_NAMESPACE::FunctionProto& function_proto,

@@ -41,6 +41,7 @@ struct TargetGraphSnapshot {
   InlinedHashSet<const NodeArg*> graph_outputs;
   InlinedHashSet<NodeIndex> control_edge_nodes;
   InlinedHashMap<std::string, const ONNX_NAMESPACE::TensorProto*> constant_initializers;
+  size_t aggregate_work_units{};
   // One bounded candidate list per formal-output producer group.
   InlinedVector<InlinedVector<NodeIndex>> root_candidates_by_group;
 };
@@ -58,6 +59,13 @@ struct LiteralWitness {
   bool is_initializer{};
 };
 
+struct MatchedAttributeOccurrence {
+  NodeIndex target_node_index{};
+  std::string operator_attribute_name;
+  FormalAttributeId formal_attribute_id{kNoFormalAttribute};
+  ONNX_NAMESPACE::AttributeProto canonical_value;
+};
+
 // Schedule binds each pattern value once; Processed values are never expanded
 // again. The two node maps maintain an injective operation-node mapping.
 struct MatchState {
@@ -66,6 +74,8 @@ struct MatchState {
   InlinedVector<const NodeArg*> pattern_value_to_target;
   InlinedVector<ValueVisitState> value_visit_states;
   InlinedVector<const NodeArg*> formal_input_bindings;
+  InlinedVector<std::optional<ONNX_NAMESPACE::AttributeProto>, 1> formal_attribute_bindings;
+  InlinedVector<MatchedAttributeOccurrence, 1> matched_attribute_occurrences;
   InlinedVector<LiteralWitness, 1> literal_witnesses;
   size_t scheduled_binding_count{};
 };
@@ -79,6 +89,8 @@ struct ReplacementPlan {
   InlinedVector<NodeArg*> call_outputs;
   InlinedVector<NodeIndex> pattern_node_to_target;
   InlinedVector<LiteralWitness, 1> literal_witnesses;
+  NodeAttributes call_attributes;
+  InlinedVector<MatchedAttributeOccurrence, 1> matched_attribute_occurrences;
   std::vector<graph_utils::GraphEdge> matched_input_edges;
   std::vector<graph_utils::GraphEdge> explicit_input_edges;
   std::vector<graph_utils::GraphEdge> explicit_output_edges;

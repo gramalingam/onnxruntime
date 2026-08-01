@@ -44,15 +44,54 @@ bool PatternTypeCompatible(const PatternValue& pattern_value, const NodeArg& tar
   return true;
 }
 
+const ONNX_NAMESPACE::AttributeProto* EffectiveTargetAttribute(
+    const Node& target_node, std::string_view name) {
+  const auto explicit_attribute = target_node.GetAttributes().find(std::string{name});
+  if (explicit_attribute != target_node.GetAttributes().end()) return &explicit_attribute->second;
+  if (target_node.Op() == nullptr) return nullptr;
+  const auto schema_attribute = target_node.Op()->attributes().find(std::string{name});
+  if (schema_attribute == target_node.Op()->attributes().end() ||
+      schema_attribute->second.default_value.name().empty()) {
+    return nullptr;
+  }
+  return &schema_attribute->second.default_value;
+}
+
+bool IsVariableAttributeName(const ResolvedPatternNode& pattern_node, std::string_view name) {
+  return std::any_of(
+      pattern_node.attribute_variables.begin(), pattern_node.attribute_variables.end(),
+      [&](const AttributeVariableOccurrence& occurrence) {
+        return occurrence.operator_attribute_name == name;
+      });
+}
+
 bool NodeSignatureMatches(const ResolvedPatternNode& pattern_node, const Node& target_node) {
-  return target_node.Op() != nullptr &&
-         pattern_node.canonical_domain == target_node.Domain() &&
-         pattern_node.op_type == target_node.OpType() &&
-         pattern_node.overload == target_node.Overload() &&
-         pattern_node.since_version == target_node.SinceVersion() &&
-         pattern_node.input_arity == target_node.InputDefs().size() &&
-         pattern_node.output_arity == target_node.OutputDefs().size() &&
-         AreAttributesSemanticallyEqual(pattern_node.effective_attributes, target_node.GetAttributes());
+  if (target_node.Op() == nullptr ||
+      pattern_node.canonical_domain != target_node.Domain()) {
+    return false;
+  }
+  if (pattern_node.op_type != target_node.OpType() ||
+      pattern_node.overload != target_node.Overload() ||
+      pattern_node.since_version != target_node.SinceVersion() ||
+      pattern_node.input_arity != target_node.InputDefs().size() ||
+      pattern_node.output_arity != target_node.OutputDefs().size()) {
+    return false;
+  }
+  for (const auto& [name, pattern_attribute] : pattern_node.effective_attributes) {
+    const auto* target_attribute = EffectiveTargetAttribute(target_node, name);
+    if (target_attribute == nullptr) return false;
+    NodeAttributes lhs{{name, pattern_attribute}};
+    NodeAttributes rhs{{name, *target_attribute}};
+    if (!AreAttributesSemanticallyEqual(lhs, rhs)) return false;
+  }
+  for (const auto& [name, unused] : target_node.GetAttributes()) {
+    ORT_UNUSED_PARAMETER(unused);
+    if (pattern_node.effective_attributes.find(name) == pattern_node.effective_attributes.end() &&
+        !IsVariableAttributeName(pattern_node, name)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void AppendKeyPart(std::string_view part, std::string& key) {
@@ -62,31 +101,12 @@ void AppendKeyPart(std::string_view part, std::string& key) {
   key.push_back(';');
 }
 
-std::string AttributeFingerprint(const NodeAttributes& attributes) {
-  InlinedVector<std::string_view> names;
-  names.reserve(attributes.size());
-  for (const auto& [name, unused] : attributes) {
-    ORT_UNUSED_PARAMETER(unused);
-    names.push_back(name);
-  }
-  std::sort(names.begin(), names.end());
-  std::string fingerprint;
-  for (const auto name : names) {
-    AppendKeyPart(name, fingerprint);
-    auto attribute = attributes.at(std::string{name});
-    attribute.clear_doc_string();
-    AppendKeyPart(attribute.SerializeAsString(), fingerprint);
-  }
-  return fingerprint;
-}
-
 std::string SignatureKey(std::string_view domain,
                          std::string_view op_type,
                          std::string_view overload,
                          int since_version,
                          size_t input_arity,
-                         size_t output_arity,
-                         const NodeAttributes& attributes) {
+                         size_t output_arity) {
   std::string key;
   AppendKeyPart(domain, key);
   AppendKeyPart(op_type, key);
@@ -94,20 +114,18 @@ std::string SignatureKey(std::string_view domain,
   AppendKeyPart(std::to_string(since_version), key);
   AppendKeyPart(std::to_string(input_arity), key);
   AppendKeyPart(std::to_string(output_arity), key);
-  AppendKeyPart(AttributeFingerprint(attributes), key);
   return key;
 }
 
 std::string SignatureKey(const ResolvedPatternNode& node) {
   return SignatureKey(node.canonical_domain, node.op_type, node.overload,
-                      node.since_version, node.input_arity, node.output_arity,
-                      node.effective_attributes);
+                      node.since_version, node.input_arity, node.output_arity);
 }
 
 std::string SignatureKey(const Node& node) {
   return SignatureKey(node.Domain(), node.OpType(), node.Overload(),
                       node.SinceVersion(), node.InputDefs().size(),
-                      node.OutputDefs().size(), node.GetAttributes());
+                      node.OutputDefs().size());
 }
 
 Status MatchLiteral(const PatternValue& pattern_value,
@@ -156,6 +174,7 @@ struct CandidateMatcher {
   const FunctionExtractorOptions& options;
   MatcherDiagnostics* diagnostics;
   size_t& literal_bytes_compared;
+  size_t& attribute_payload_bytes_inspected;
   size_t& aggregate_work_units;
   size_t primary_output_group;
   MatchState state;
@@ -164,6 +183,14 @@ struct CandidateMatcher {
     ORT_RETURN_IF(aggregate_work_units >= options.max_worklist_bindings,
                   "FunctionExtractor aggregate matcher work budget exceeded.");
     ++aggregate_work_units;
+    return Status::OK();
+  }
+
+  Status ConsumeAttributeBytes(size_t bytes) {
+    ORT_RETURN_IF(attribute_payload_bytes_inspected > options.max_attribute_bytes ||
+                      bytes > options.max_attribute_bytes - attribute_payload_bytes_inspected,
+                  "FunctionExtractor attribute byte budget exceeded.");
+    attribute_payload_bytes_inspected += bytes;
     return Status::OK();
   }
 
@@ -220,6 +247,47 @@ struct CandidateMatcher {
     return Status::OK();
   }
 
+  Status CheckOrBindAttribute(const AttributeVariableOccurrence& occurrence,
+                              const Node& target_node,
+                              bool& matched) {
+    ORT_RETURN_IF_ERROR(ConsumeWork());
+    const auto* target_attribute =
+        EffectiveTargetAttribute(target_node, occurrence.operator_attribute_name);
+    if (target_attribute == nullptr) {
+      matched = false;
+      return Status::OK();
+    }
+    const auto& formal =
+        compiled.normalized_pattern->formal_attributes[occurrence.formal_attribute_id];
+    ONNX_NAMESPACE::AttributeProto canonical;
+    ORT_RETURN_IF(attribute_payload_bytes_inspected > options.max_attribute_bytes,
+                  "FunctionExtractor attribute byte budget exceeded.");
+    const size_t remaining_attribute_bytes =
+        options.max_attribute_bytes - attribute_payload_bytes_inspected;
+    ORT_RETURN_IF_ERROR(CanonicalizeFormalAttribute(
+        formal.formal_name, formal.type, *target_attribute,
+        remaining_attribute_bytes, canonical));
+    ORT_RETURN_IF_ERROR(ConsumeAttributeBytes(AttributePayloadBytes(canonical)));
+    auto& binding = state.formal_attribute_bindings[occurrence.formal_attribute_id];
+    if (!binding.has_value()) {
+      binding = canonical;
+    } else {
+      bool equal = false;
+      ORT_RETURN_IF_ERROR(
+          CompareFormalAttributes(*binding, canonical, options.max_attribute_bytes, equal));
+      if (!equal) {
+        matched = false;
+        return Status::OK();
+      }
+    }
+    state.matched_attribute_occurrences.push_back(
+        MatchedAttributeOccurrence{target_node.Index(),
+                                   occurrence.operator_attribute_name,
+                                   occurrence.formal_attribute_id,
+                                   std::move(canonical)});
+    return Status::OK();
+  }
+
   Status BindProducer(PatternValueId value_id, const NodeArg& target_value, bool& matched) {
     const auto& normalized = *compiled.normalized_pattern;
     const auto& pattern_value = normalized.values[value_id];
@@ -242,6 +310,7 @@ struct CandidateMatcher {
     }
 
     auto& mapped_target = state.pattern_node_to_target[pattern_node_id];
+    bool newly_mapped = false;
     if (mapped_target != std::numeric_limits<NodeIndex>::max()) {
       matched = mapped_target == target_node_index;
       if (!matched) return Status::OK();
@@ -252,6 +321,14 @@ struct CandidateMatcher {
       }
       mapped_target = target_node_index;
       state.target_node_to_pattern.emplace(target_node_index, pattern_node_id);
+      newly_mapped = true;
+    }
+
+    if (newly_mapped) {
+      for (const auto& occurrence : compiled.resolved_nodes[pattern_node_id].attribute_variables) {
+        ORT_RETURN_IF_ERROR(CheckOrBindAttribute(occurrence, *target_node, matched));
+        if (!matched) return Status::OK();
+      }
     }
 
     const auto& pattern_node = normalized.nodes[pattern_node_id];
@@ -300,6 +377,7 @@ struct CandidateMatcher {
     state.pattern_value_to_target.assign(normalized.values.size(), nullptr);
     state.value_visit_states.assign(normalized.values.size(), ValueVisitState::Unseen);
     state.formal_input_bindings.assign(normalized.formal_input_value_ids.size(), nullptr);
+    state.formal_attribute_bindings.resize(normalized.formal_attributes.size());
     matched = true;
 
     for (size_t group_index = 0; group_index < compiled.formal_output_producer_groups.size(); ++group_index) {
@@ -358,6 +436,12 @@ struct CandidateMatcher {
 
     for (const auto mapped_node : state.pattern_node_to_target) {
       if (mapped_node == std::numeric_limits<NodeIndex>::max()) {
+        matched = false;
+        return Status::OK();
+      }
+    }
+    for (const auto& binding : state.formal_attribute_bindings) {
+      if (!binding.has_value()) {
         matched = false;
         return Status::OK();
       }
@@ -515,6 +599,14 @@ struct CandidateMatcher {
       plan.call_outputs.push_back(const_cast<NodeArg*>(state.pattern_value_to_target[output_id]));
     }
     plan.literal_witnesses = state.literal_witnesses;
+    plan.matched_attribute_occurrences = state.matched_attribute_occurrences;
+    for (FormalAttributeId formal_id = 0;
+         formal_id < normalized.formal_attributes.size();
+         ++formal_id) {
+      plan.call_attributes.emplace(
+          normalized.formal_attributes[formal_id].formal_name,
+          *state.formal_attribute_bindings[formal_id]);
+    }
     plan.pattern_node_to_target = state.pattern_node_to_target;
     plan.primary_root_topological_position =
         snapshot.topological_positions.at(
@@ -629,6 +721,12 @@ Status BuildTargetGraphSnapshot(
     const auto compatible_groups = groups_by_signature.find(SignatureKey(*node));
     if (compatible_groups != groups_by_signature.end()) {
       for (const auto group_index : compatible_groups->second) {
+        ORT_RETURN_IF(snapshot.aggregate_work_units >= options.max_worklist_bindings,
+                      "FunctionExtractor aggregate root-index work budget exceeded.");
+        ++snapshot.aggregate_work_units;
+        const auto pattern_node_id =
+            compiled_pattern.formal_output_producer_groups[group_index].producer_node_id;
+        if (!NodeSignatureMatches(compiled_pattern.resolved_nodes[pattern_node_id], *node)) continue;
         ORT_RETURN_IF(candidate_entry_count >= options.max_output_root_tuples,
                       "FunctionExtractor root candidate-entry budget exceeded.");
         snapshot.root_candidates_by_group[group_index].push_back(node_index);
@@ -660,7 +758,11 @@ Status DiscoverReplacementPlans(
 
   size_t tuple_count = 0;
   size_t literal_bytes_compared = 0;
-  size_t aggregate_work_units = 0;
+  size_t attribute_payload_bytes_inspected =
+      compiled_pattern.normalized_pattern->pattern_attribute_payload_bytes;
+  ORT_RETURN_IF(attribute_payload_bytes_inspected > options.max_attribute_bytes,
+                "FunctionExtractor attribute byte budget exceeded.");
+  size_t aggregate_work_units = snapshot.aggregate_work_units;
   InlinedVector<NodeIndex> tuple(groups.size(), std::numeric_limits<NodeIndex>::max());
   InlinedVector<size_t> group_order(groups.size());
   for (size_t i = 0; i < group_order.size(); ++i) group_order[i] = i;
@@ -673,6 +775,12 @@ Status DiscoverReplacementPlans(
   std::function<void(size_t)> enumerate = [&](size_t order_index) {
     if (!enumeration_status.IsOK()) return;
     if (order_index == groups.size()) {
+      if (aggregate_work_units >= options.max_worklist_bindings) {
+        enumeration_status =
+            MatcherError("aggregate output-root tuple construction budget exceeded");
+        return;
+      }
+      ++aggregate_work_units;
       ++tuple_count;
       if (tuple_count > options.max_output_root_tuples) {
         enumeration_status =
@@ -681,7 +789,8 @@ Status DiscoverReplacementPlans(
       }
       if (diagnostics != nullptr) ++diagnostics->output_root_tuples_considered;
       CandidateMatcher matcher{compiled_pattern, snapshot, options, diagnostics,
-                               literal_bytes_compared, aggregate_work_units,
+                               literal_bytes_compared, attribute_payload_bytes_inspected,
+                               aggregate_work_units,
                                primary_output_group};
       ReplacementPlan plan;
       bool matched = false;
@@ -785,6 +894,35 @@ Status PrevalidatePlans(
                         snapshot.control_edge_nodes.find(target_node_index) !=
                             snapshot.control_edge_nodes.end(),
                     "Replacement plan node semantics changed.");
+    }
+    ORT_RETURN_IF(plan.call_attributes.size() !=
+                      compiled_pattern.normalized_pattern->formal_attributes.size(),
+                  "Replacement plan call attributes changed.");
+    for (const auto& occurrence : plan.matched_attribute_occurrences) {
+      const auto* node = graph.GetNode(occurrence.target_node_index);
+      ORT_RETURN_IF(node == nullptr, "Replacement plan attribute node was removed.");
+      const auto* target_attribute =
+          EffectiveTargetAttribute(*node, occurrence.operator_attribute_name);
+      ORT_RETURN_IF(target_attribute == nullptr,
+                    "Replacement plan target attribute became missing.");
+      const auto& formal =
+          compiled_pattern.normalized_pattern->formal_attributes[occurrence.formal_attribute_id];
+      ONNX_NAMESPACE::AttributeProto canonical;
+      ORT_RETURN_IF_ERROR(CanonicalizeFormalAttribute(
+          formal.formal_name, formal.type, *target_attribute,
+          std::numeric_limits<size_t>::max(), canonical));
+      bool equal = false;
+      ORT_RETURN_IF_ERROR(CompareFormalAttributes(
+          canonical, occurrence.canonical_value,
+          std::numeric_limits<size_t>::max(), equal));
+      ORT_RETURN_IF_NOT(equal, "Replacement plan target attribute changed.");
+      const auto call_attribute = plan.call_attributes.find(formal.formal_name);
+      ORT_RETURN_IF(call_attribute == plan.call_attributes.end(),
+                    "Replacement plan formal attribute became missing.");
+      ORT_RETURN_IF_ERROR(CompareFormalAttributes(
+          canonical, call_attribute->second,
+          std::numeric_limits<size_t>::max(), equal));
+      ORT_RETURN_IF_NOT(equal, "Replacement plan formal binding changed.");
     }
     std::vector<graph_utils::GraphEdge> current_input_edges;
     std::vector<graph_utils::GraphEdge> current_output_edges;

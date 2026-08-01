@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <type_traits>
 
 #include "core/common/safeint.h"
@@ -22,6 +23,76 @@ using common::Status;
 
 Status InvalidPattern(const std::string& message) {
   return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Invalid function extraction pattern: ", message);
+}
+
+bool IsSupportedFormalAttributeType(ONNX_NAMESPACE::AttributeProto_AttributeType type) {
+  switch (type) {
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT:
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_INT:
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_STRING:
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_TENSOR:
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_FLOATS:
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_INTS:
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_STRINGS:
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_TENSORS:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool HasConcreteAttributeValue(const ONNX_NAMESPACE::AttributeProto& attribute) {
+  switch (attribute.type()) {
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT:
+      return attribute.has_f();
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_INT:
+      return attribute.has_i();
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_STRING:
+      return attribute.has_s();
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_TENSOR:
+      return attribute.has_t();
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_FLOATS:
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_INTS:
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_STRINGS:
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_TENSORS:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool AttributeReferenceContainsValue(const ONNX_NAMESPACE::AttributeProto& attribute) {
+  switch (attribute.type()) {
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT:
+      return attribute.has_f();
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_INT:
+      return attribute.has_i();
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_STRING:
+      return attribute.has_s();
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_TENSOR:
+      return attribute.has_t();
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_FLOATS:
+      return attribute.floats_size() != 0;
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_INTS:
+      return attribute.ints_size() != 0;
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_STRINGS:
+      return attribute.strings_size() != 0;
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_TENSORS:
+      return attribute.tensors_size() != 0;
+    default:
+      return false;
+  }
+}
+
+bool IsParameterizedConstantAttribute(std::string_view name,
+                                      ONNX_NAMESPACE::AttributeProto_AttributeType type) {
+  return (name == "value" && type == ONNX_NAMESPACE::AttributeProto_AttributeType_TENSOR) ||
+         (name == "value_float" && type == ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT) ||
+         (name == "value_floats" && type == ONNX_NAMESPACE::AttributeProto_AttributeType_FLOATS) ||
+         (name == "value_int" && type == ONNX_NAMESPACE::AttributeProto_AttributeType_INT) ||
+         (name == "value_ints" && type == ONNX_NAMESPACE::AttributeProto_AttributeType_INTS) ||
+         (name == "value_string" && type == ONNX_NAMESPACE::AttributeProto_AttributeType_STRING) ||
+         (name == "value_strings" && type == ONNX_NAMESPACE::AttributeProto_AttributeType_STRINGS);
 }
 
 std::string CanonicalDomain(std::string_view domain) {
@@ -49,6 +120,69 @@ Status AppendTensorData(const ONNX_NAMESPACE::TensorProto& tensor,
   return Status::OK();
 }
 
+template <typename T>
+Status AppendPackedTensorData(const ONNX_NAMESPACE::TensorProto& tensor,
+                              size_t storage_count,
+                              size_t element_count,
+                              size_t max_bytes,
+                              std::string& data) {
+  const size_t bytes = SafeInt<size_t>(storage_count) * sizeof(T);
+  ORT_RETURN_IF_NOT(bytes <= max_bytes, "Tensor literal byte budget exceeded.");
+  InlinedVector<T> values(storage_count);
+  const void* raw_data = tensor.has_raw_data() ? tensor.raw_data().data() : nullptr;
+  const size_t raw_data_size = tensor.has_raw_data() ? tensor.raw_data().size() : 0;
+  ORT_RETURN_IF_ERROR(
+      utils::UnpackTensor(tensor, raw_data, raw_data_size, values.data(), element_count));
+  data.append(reinterpret_cast<const char*>(values.data()), bytes);
+  return Status::OK();
+}
+
+Status AppendBoolTensorData(const ONNX_NAMESPACE::TensorProto& tensor,
+                            size_t element_count,
+                            size_t max_bytes,
+                            std::string& data) {
+  ORT_RETURN_IF_NOT(element_count <= max_bytes, "Tensor literal byte budget exceeded.");
+  std::unique_ptr<bool[]> values = std::make_unique<bool[]>(element_count);
+  const void* raw_data = tensor.has_raw_data() ? tensor.raw_data().data() : nullptr;
+  const size_t raw_data_size = tensor.has_raw_data() ? tensor.raw_data().size() : 0;
+  ORT_RETURN_IF_ERROR(
+      utils::UnpackTensor(tensor, raw_data, raw_data_size, values.get(), element_count));
+  for (size_t i = 0; i < element_count; ++i) {
+    data.push_back(values[i] ? '\1' : '\0');
+  }
+  return Status::OK();
+}
+
+template <typename T>
+Status AppendComplexTensorData(const ONNX_NAMESPACE::TensorProto& tensor,
+                               size_t element_count,
+                               size_t max_bytes,
+                               std::string& data) {
+  const size_t scalar_count = SafeInt<size_t>(element_count) * 2;
+  const size_t bytes = SafeInt<size_t>(scalar_count) * sizeof(T);
+  ORT_RETURN_IF_NOT(bytes <= max_bytes, "Tensor literal byte budget exceeded.");
+  if (tensor.has_raw_data()) {
+    ORT_RETURN_IF_NOT(tensor.raw_data().size() == bytes,
+                      "Complex tensor raw data size does not match its shape.");
+    data.append(tensor.raw_data());
+    return Status::OK();
+  }
+  if constexpr (std::is_same_v<T, float>) {
+    ORT_RETURN_IF_NOT(static_cast<size_t>(tensor.float_data_size()) == scalar_count,
+                      "Complex tensor data size does not match its shape.");
+    for (const float value : tensor.float_data()) {
+      data.append(reinterpret_cast<const char*>(&value), sizeof(value));
+    }
+  } else {
+    ORT_RETURN_IF_NOT(static_cast<size_t>(tensor.double_data_size()) == scalar_count,
+                      "Complex tensor data size does not match its shape.");
+    for (const double value : tensor.double_data()) {
+      data.append(reinterpret_cast<const char*>(&value), sizeof(value));
+    }
+  }
+  return Status::OK();
+}
+
 Status TensorLogicalBytes(const ONNX_NAMESPACE::TensorProto& tensor,
                           size_t max_bytes,
                           const std::filesystem::path* model_path,
@@ -67,10 +201,14 @@ Status TensorLogicalBytes(const ONNX_NAMESPACE::TensorProto& tensor,
     case ONNX_NAMESPACE::TensorProto_DataType_DOUBLE:
       ORT_RETURN_IF_ERROR(AppendTensorData<double>(tensor, element_count, max_bytes, model_path, data));
       break;
-    case ONNX_NAMESPACE::TensorProto_DataType_FLOAT16:
-    case ONNX_NAMESPACE::TensorProto_DataType_BFLOAT16:
     case ONNX_NAMESPACE::TensorProto_DataType_UINT16:
       ORT_RETURN_IF_ERROR(AppendTensorData<uint16_t>(tensor, element_count, max_bytes, model_path, data));
+      break;
+    case ONNX_NAMESPACE::TensorProto_DataType_FLOAT16:
+      ORT_RETURN_IF_ERROR(AppendTensorData<MLFloat16>(tensor, element_count, max_bytes, model_path, data));
+      break;
+    case ONNX_NAMESPACE::TensorProto_DataType_BFLOAT16:
+      ORT_RETURN_IF_ERROR(AppendTensorData<BFloat16>(tensor, element_count, max_bytes, model_path, data));
       break;
     case ONNX_NAMESPACE::TensorProto_DataType_INT16:
       ORT_RETURN_IF_ERROR(AppendTensorData<int16_t>(tensor, element_count, max_bytes, model_path, data));
@@ -79,8 +217,10 @@ Status TensorLogicalBytes(const ONNX_NAMESPACE::TensorProto& tensor,
       ORT_RETURN_IF_ERROR(AppendTensorData<int8_t>(tensor, element_count, max_bytes, model_path, data));
       break;
     case ONNX_NAMESPACE::TensorProto_DataType_UINT8:
-    case ONNX_NAMESPACE::TensorProto_DataType_BOOL:
       ORT_RETURN_IF_ERROR(AppendTensorData<uint8_t>(tensor, element_count, max_bytes, model_path, data));
+      break;
+    case ONNX_NAMESPACE::TensorProto_DataType_BOOL:
+      ORT_RETURN_IF_ERROR(AppendBoolTensorData(tensor, element_count, max_bytes, data));
       break;
     case ONNX_NAMESPACE::TensorProto_DataType_INT32:
       ORT_RETURN_IF_ERROR(AppendTensorData<int32_t>(tensor, element_count, max_bytes, model_path, data));
@@ -93,6 +233,51 @@ Status TensorLogicalBytes(const ONNX_NAMESPACE::TensorProto& tensor,
       break;
     case ONNX_NAMESPACE::TensorProto_DataType_UINT64:
       ORT_RETURN_IF_ERROR(AppendTensorData<uint64_t>(tensor, element_count, max_bytes, model_path, data));
+      break;
+    case ONNX_NAMESPACE::TensorProto_DataType_COMPLEX64:
+      ORT_RETURN_IF_ERROR(AppendComplexTensorData<float>(tensor, element_count, max_bytes, data));
+      break;
+    case ONNX_NAMESPACE::TensorProto_DataType_COMPLEX128:
+      ORT_RETURN_IF_ERROR(AppendComplexTensorData<double>(tensor, element_count, max_bytes, data));
+      break;
+#if !defined(DISABLE_FLOAT8_TYPES)
+    case ONNX_NAMESPACE::TensorProto_DataType_FLOAT8E4M3FN:
+      ORT_RETURN_IF_ERROR(AppendTensorData<Float8E4M3FN>(tensor, element_count, max_bytes, model_path, data));
+      break;
+    case ONNX_NAMESPACE::TensorProto_DataType_FLOAT8E4M3FNUZ:
+      ORT_RETURN_IF_ERROR(AppendTensorData<Float8E4M3FNUZ>(tensor, element_count, max_bytes, model_path, data));
+      break;
+    case ONNX_NAMESPACE::TensorProto_DataType_FLOAT8E5M2:
+      ORT_RETURN_IF_ERROR(AppendTensorData<Float8E5M2>(tensor, element_count, max_bytes, model_path, data));
+      break;
+    case ONNX_NAMESPACE::TensorProto_DataType_FLOAT8E5M2FNUZ:
+      ORT_RETURN_IF_ERROR(AppendTensorData<Float8E5M2FNUZ>(tensor, element_count, max_bytes, model_path, data));
+      break;
+    case ONNX_NAMESPACE::TensorProto_DataType_FLOAT8E8M0:
+      ORT_RETURN_IF_ERROR(AppendTensorData<Float8E8M0>(tensor, element_count, max_bytes, model_path, data));
+      break;
+#endif
+    case ONNX_NAMESPACE::TensorProto_DataType_INT4:
+      ORT_RETURN_IF_ERROR(AppendPackedTensorData<Int4x2>(
+          tensor, Int4x2::CalcNumInt4Pairs(element_count), element_count, max_bytes, data));
+      break;
+    case ONNX_NAMESPACE::TensorProto_DataType_UINT4:
+      ORT_RETURN_IF_ERROR(AppendPackedTensorData<UInt4x2>(
+          tensor, UInt4x2::CalcNumInt4Pairs(element_count), element_count, max_bytes, data));
+      break;
+#if !defined(DISABLE_FLOAT4_TYPES)
+    case ONNX_NAMESPACE::TensorProto_DataType_FLOAT4E2M1:
+      ORT_RETURN_IF_ERROR(AppendPackedTensorData<Float4E2M1x2>(
+          tensor, Float4E2M1x2::CalcNumFloat4Pairs(element_count), element_count, max_bytes, data));
+      break;
+#endif
+    case ONNX_NAMESPACE::TensorProto_DataType_INT2:
+      ORT_RETURN_IF_ERROR(AppendPackedTensorData<Int2x4>(
+          tensor, Int2x4::CalcNumInt2Quads(element_count), element_count, max_bytes, data));
+      break;
+    case ONNX_NAMESPACE::TensorProto_DataType_UINT2:
+      ORT_RETURN_IF_ERROR(AppendPackedTensorData<UInt2x4>(
+          tensor, UInt2x4::CalcNumInt2Quads(element_count), element_count, max_bytes, data));
       break;
     case ONNX_NAMESPACE::TensorProto_DataType_STRING:
       for (const auto& value : tensor.string_data()) {
@@ -108,6 +293,25 @@ Status TensorLogicalBytes(const ONNX_NAMESPACE::TensorProto& tensor,
   }
 
   ORT_RETURN_IF_NOT(data.size() <= max_bytes, "Tensor literal byte budget exceeded.");
+  return Status::OK();
+}
+
+Status CanonicalizeTensorAttribute(const ONNX_NAMESPACE::TensorProto& source,
+                                   size_t max_bytes,
+                                   ONNX_NAMESPACE::TensorProto& canonical) {
+  ORT_RETURN_IF(source.data_location() == ONNX_NAMESPACE::TensorProto_DataLocation_EXTERNAL ||
+                    source.external_data_size() != 0,
+                "Formal attribute tensors may not use external data.");
+  std::string bytes;
+  ORT_RETURN_IF_ERROR(TensorLogicalBytes(source, max_bytes, nullptr, bytes));
+  canonical.Clear();
+  canonical.set_data_type(source.data_type());
+  canonical.mutable_dims()->CopyFrom(source.dims());
+  if (source.data_type() == ONNX_NAMESPACE::TensorProto_DataType_STRING) {
+    canonical.mutable_string_data()->CopyFrom(source.string_data());
+  } else {
+    canonical.set_raw_data(std::move(bytes));
+  }
   return Status::OK();
 }
 
@@ -135,9 +339,13 @@ Status MakeLiteralDescriptor(const ONNX_NAMESPACE::NodeProto& node, size_t max_b
   return Status::OK();
 }
 
-void AddSchemaDefaults(const ONNX_NAMESPACE::OpSchema& schema, NodeAttributes& attributes) {
+void AddSchemaDefaults(const ONNX_NAMESPACE::OpSchema& schema,
+                       const InlinedHashSet<std::string>& variable_names,
+                       NodeAttributes& attributes) {
   for (const auto& [name, definition] : schema.attributes()) {
-    if (attributes.find(name) == attributes.end() && utils::HasName(definition.default_value)) {
+    if (variable_names.find(name) == variable_names.end() &&
+        attributes.find(name) == attributes.end() &&
+        utils::HasName(definition.default_value)) {
       attributes.emplace(name, definition.default_value);
     }
   }
@@ -146,7 +354,7 @@ void AddSchemaDefaults(const ONNX_NAMESPACE::OpSchema& schema, NodeAttributes& a
 bool IsAllowedOnnxPureOp(std::string_view op_type) {
   static const InlinedHashSet<std::string> pure_ops{
       "Identity", "Add", "Sub", "Mul", "Div", "Relu", "Cast", "MatMul",
-      "Transpose", "Reshape", "Clip", "Concat", "MaxPool"};
+      "Transpose", "Reshape", "Clip", "Concat", "MaxPool", "LeakyRelu"};
   return pure_ops.find(op_type) != pure_ops.end();
 }
 
@@ -160,10 +368,9 @@ Status ValidateTransitivePurity(const ONNX_NAMESPACE::FunctionProto& function,
 
   for (const auto& node : function.node()) {
     for (const auto& attribute : node.attribute()) {
-      ORT_RETURN_IF(!attribute.ref_attr_name().empty() ||
-                        attribute.type() == ONNX_NAMESPACE::AttributeProto_AttributeType_GRAPH ||
+      ORT_RETURN_IF(attribute.type() == ONNX_NAMESPACE::AttributeProto_AttributeType_GRAPH ||
                         attribute.type() == ONNX_NAMESPACE::AttributeProto_AttributeType_GRAPHS,
-                    "Nested functions with attribute references or graph attributes are not supported.");
+                    "Nested functions with graph attributes are not supported.");
     }
     const auto domain = CanonicalDomain(node.domain());
     if (domain == kOnnxDomain && IsAllowedOnnxPureOp(node.op_type())) continue;
@@ -207,8 +414,16 @@ Status ResolveNode(const PatternNode& pattern_node,
   resolved_node.overload = node_proto.overload();
   resolved_node.input_arity = pattern_node.input_value_ids.size();
   resolved_node.output_arity = pattern_node.output_value_ids.size();
+  resolved_node.attribute_variables = pattern_node.attribute_variables;
+  resolved_node.is_parameterized_constant = pattern_node.is_parameterized_constant;
+  InlinedHashSet<std::string> variable_names;
+  for (const auto& occurrence : pattern_node.attribute_variables) {
+    variable_names.insert(occurrence.operator_attribute_name);
+  }
   for (const auto& attribute : node_proto.attribute()) {
-    resolved_node.effective_attributes.emplace(attribute.name(), attribute);
+    if (attribute.ref_attr_name().empty()) {
+      resolved_node.effective_attributes.emplace(attribute.name(), attribute);
+    }
   }
 
   const auto function_id =
@@ -225,7 +440,7 @@ Status ResolveNode(const PatternNode& pattern_node,
     ORT_RETURN_IF_ERROR(
         ValidateTransitivePurity(*local_function->second->onnx_func_proto_, graph, visiting));
     resolved_node.transitively_pure = true;
-    AddSchemaDefaults(*resolved_node.schema, resolved_node.effective_attributes);
+    AddSchemaDefaults(*resolved_node.schema, variable_names, resolved_node.effective_attributes);
     return Status::OK();
   }
 
@@ -250,11 +465,21 @@ Status ResolveNode(const PatternNode& pattern_node,
   ORT_RETURN_IF_NOT(resolved_node.schema != nullptr, "No schema for pattern node ",
                     resolved_node.canonical_domain, ":", resolved_node.op_type, " at opset ", version, ".");
   resolved_node.since_version = resolved_node.schema->since_version();
-  AddSchemaDefaults(*resolved_node.schema, resolved_node.effective_attributes);
+  const auto* standard_schema = ONNX_NAMESPACE::OpSchemaRegistry::Instance()->GetSchema(
+      resolved_node.op_type, version,
+      resolved_node.canonical_domain == kOnnxDomain ? "" : resolved_node.canonical_domain);
+  resolved_node.is_standard_onnx_schema = resolved_node.schema == standard_schema;
+  AddSchemaDefaults(*resolved_node.schema, variable_names, resolved_node.effective_attributes);
   return Status::OK();
 }
 
 bool AttributeEqual(const ONNX_NAMESPACE::AttributeProto& lhs, const ONNX_NAMESPACE::AttributeProto& rhs) {
+  if (IsSupportedFormalAttributeType(lhs.type()) && lhs.type() == rhs.type()) {
+    bool equal = false;
+    const auto status =
+        CompareFormalAttributes(lhs, rhs, std::numeric_limits<size_t>::max(), equal);
+    return status.IsOK() && equal;
+  }
   ONNX_NAMESPACE::AttributeProto normalized_lhs = lhs;
   ONNX_NAMESPACE::AttributeProto normalized_rhs = rhs;
   normalized_lhs.clear_doc_string();
@@ -277,29 +502,27 @@ NormalizedFunctionPattern NormalizeFunctionPattern(
     return fail(ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Function pattern node budget exceeded."));
   }
 
-  size_t pattern_slot_units = 0;
-  auto consume_pattern_slots = [&](size_t units) {
-    if (pattern_slot_units > options.max_worklist_bindings ||
-        units > options.max_worklist_bindings - pattern_slot_units) {
+  size_t pattern_work_units = 0;
+  auto consume_pattern_work = [&](size_t units) {
+    if (pattern_work_units > options.max_worklist_bindings ||
+        units > options.max_worklist_bindings - pattern_work_units) {
       return false;
     }
-    pattern_slot_units += units;
+    pattern_work_units += units;
     return true;
   };
   for (const auto& node : function_proto.node()) {
     const size_t input_slots = static_cast<size_t>(node.input_size());
     const size_t output_slots = static_cast<size_t>(node.output_size());
     // Count every input conservatively as both a body slot and a consumer incidence.
-    if (!consume_pattern_slots(input_slots) ||
-        !consume_pattern_slots(input_slots) ||
-        !consume_pattern_slots(output_slots)) {
+    if (!consume_pattern_work(input_slots) ||
+        !consume_pattern_work(input_slots) ||
+        !consume_pattern_work(output_slots)) {
       return fail(ORT_MAKE_STATUS(
           ONNXRUNTIME, FAIL,
           "Function extraction invariant/resource limit exceeded: pattern slot budget."));
     }
   }
-
-  result.function_proto = function_proto;
 
   try {
     ONNX_NAMESPACE::checker::CheckerContext checker_context;
@@ -351,17 +574,66 @@ NormalizedFunctionPattern NormalizeFunctionPattern(
   status = add_formals(function_proto.output(), false);
   if (!status.IsOK()) return fail(InvalidPattern(status.ErrorMessage()));
 
-  if (function_proto.attribute_size() != 0) {
-    return fail(InvalidPattern("required function attributes are not supported in v1"));
-  }
-  InlinedHashSet<std::string> declared_attributes;
-  for (const auto& attribute : function_proto.attribute_proto()) {
-    if (attribute.name().empty() || !declared_attributes.insert(attribute.name()).second) {
-      return fail(InvalidPattern("function attribute defaults must be non-empty and non-duplicated"));
+  size_t pattern_attribute_payload_bytes = 0;
+  auto consume_attribute_bytes = [&](size_t bytes) {
+    if (pattern_attribute_payload_bytes > options.max_attribute_bytes ||
+        bytes > options.max_attribute_bytes - pattern_attribute_payload_bytes) {
+      return false;
     }
+    pattern_attribute_payload_bytes += bytes;
+    return true;
+  };
+  InlinedHashMap<std::string, FormalAttributeId> formal_attribute_ids;
+  for (const auto& name : function_proto.attribute()) {
+    if (name.empty() || formal_attribute_ids.find(name) != formal_attribute_ids.end()) {
+      return fail(InvalidPattern("required function attributes must be non-empty and non-duplicated"));
+    }
+    if (result.formal_attributes.size() >= options.max_formal_attributes ||
+        !consume_pattern_work(1)) {
+      return fail(ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Function attribute pattern budget exceeded."));
+    }
+    const FormalAttributeId formal_id = result.formal_attributes.size();
+    formal_attribute_ids.emplace(name, formal_id);
+    result.formal_attributes.push_back(FormalAttributePattern{});
+    result.formal_attributes.back().formal_name = name;
+    result.formal_attributes.back().required = true;
+  }
+  for (const auto& attribute : function_proto.attribute_proto()) {
+    if (attribute.name().empty() ||
+        formal_attribute_ids.find(attribute.name()) != formal_attribute_ids.end()) {
+      return fail(InvalidPattern(
+          "defaulted function attributes must be non-empty, non-duplicated, and disjoint from required attributes"));
+    }
+    if (!attribute.ref_attr_name().empty() ||
+        !IsSupportedFormalAttributeType(attribute.type()) ||
+        !HasConcreteAttributeValue(attribute)) {
+      return fail(InvalidPattern("function attribute default must contain one supported concrete value"));
+    }
+    if (result.formal_attributes.size() >= options.max_formal_attributes ||
+        !consume_pattern_work(1) ||
+        !consume_pattern_work(1)) {
+      return fail(ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Function attribute pattern budget exceeded."));
+    }
+    ONNX_NAMESPACE::AttributeProto canonical_default;
+    status = CanonicalizeFormalAttribute(
+        attribute.name(), attribute.type(), attribute, options.max_attribute_bytes, canonical_default);
+    if (!status.IsOK()) return fail(std::move(status));
+    if (!consume_attribute_bytes(AttributePayloadBytes(canonical_default))) {
+      return fail(ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Function attribute byte budget exceeded."));
+    }
+    const FormalAttributeId formal_id = result.formal_attributes.size();
+    formal_attribute_ids.emplace(attribute.name(), formal_id);
+    result.formal_attributes.push_back(FormalAttributePattern{});
+    auto& formal = result.formal_attributes.back();
+    formal.formal_name = attribute.name();
+    formal.type = attribute.type();
+    formal.canonical_default = std::move(canonical_default);
   }
 
-  InlinedVector<bool> constant_nodes(function_proto.node_size(), false);
+  InlinedVector<InlinedVector<AttributeVariableOccurrence>> source_attribute_variables(
+      function_proto.node_size());
+  InlinedVector<bool> folded_constant_nodes(function_proto.node_size(), false);
+  InlinedVector<bool> parameterized_constant_nodes(function_proto.node_size(), false);
   InlinedHashSet<std::string> produced_names;
   for (int node_index = 0; node_index < function_proto.node_size(); ++node_index) {
     const auto& node = function_proto.node(node_index);
@@ -371,7 +643,29 @@ NormalizedFunctionPattern NormalizeFunctionPattern(
         return fail(InvalidPattern("duplicate node attribute '" + attribute.name() + "'"));
       }
       if (!attribute.ref_attr_name().empty()) {
-        return fail(InvalidPattern("ref_attr_name is not supported"));
+        const auto formal_it = formal_attribute_ids.find(attribute.ref_attr_name());
+        if (attribute.name().empty() ||
+            formal_it == formal_attribute_ids.end() ||
+            !IsSupportedFormalAttributeType(attribute.type()) ||
+            AttributeReferenceContainsValue(attribute)) {
+          return fail(InvalidPattern(
+              "attribute reference must name a declared formal, declare a supported type, and contain no value"));
+        }
+        auto& formal = result.formal_attributes[formal_it->second];
+        if (formal.type == ONNX_NAMESPACE::AttributeProto_AttributeType_UNDEFINED) {
+          formal.type = attribute.type();
+        } else if (formal.type != attribute.type()) {
+          return fail(InvalidPattern("all occurrences of a formal attribute must have the same type"));
+        }
+        ONNX_NAMESPACE::AttributeProto occurrence_metadata = attribute;
+        occurrence_metadata.clear_doc_string();
+        if (!consume_pattern_work(1) ||
+            !consume_attribute_bytes(occurrence_metadata.ByteSizeLong())) {
+          return fail(ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Function attribute pattern budget exceeded."));
+        }
+        source_attribute_variables[node_index].push_back(
+            AttributeVariableOccurrence{kNoPatternNode, attribute.name(), formal_it->second});
+        continue;
       }
       if (attribute.type() == ONNX_NAMESPACE::AttributeProto_AttributeType_GRAPH ||
           attribute.type() == ONNX_NAMESPACE::AttributeProto_AttributeType_GRAPHS) {
@@ -380,9 +674,19 @@ NormalizedFunctionPattern NormalizeFunctionPattern(
     }
 
     const bool is_constant = CanonicalDomain(node.domain()) == kOnnxDomain && node.op_type() == "Constant";
-    constant_nodes[node_index] = is_constant;
     if (is_constant && node.output_size() != 1) {
       return fail(InvalidPattern("Constant nodes must have exactly one output"));
+    }
+    if (is_constant && !source_attribute_variables[node_index].empty()) {
+      if (node.input_size() != 0 || node.attribute_size() != 1 ||
+          !IsParameterizedConstantAttribute(
+              source_attribute_variables[node_index][0].operator_attribute_name,
+              result.formal_attributes[source_attribute_variables[node_index][0].formal_attribute_id].type)) {
+        return fail(InvalidPattern("parameterized Constant has an unsupported attribute form"));
+      }
+      parameterized_constant_nodes[node_index] = true;
+    } else {
+      folded_constant_nodes[node_index] = is_constant;
     }
     for (int output_index = 0; output_index < node.output_size(); ++output_index) {
       const std::string& output = node.output(output_index);
@@ -405,13 +709,37 @@ NormalizedFunctionPattern NormalizeFunctionPattern(
       if (result.values[value_id].is_formal_input) {
         return fail(InvalidPattern("formal input '" + output + "' is produced by a body node"));
       }
-      if (is_constant) {
+      if (folded_constant_nodes[node_index]) {
         result.values[value_id].is_literal = true;
         status = MakeLiteralDescriptor(node, options.max_literal_bytes, result.values[value_id].literal);
         if (!status.IsOK()) return fail(std::move(status));
       }
     }
   }
+
+  InlinedVector<bool> formal_referenced(result.formal_attributes.size(), false);
+  for (const auto& occurrences : source_attribute_variables) {
+    for (const auto& occurrence : occurrences) {
+      formal_referenced[occurrence.formal_attribute_id] = true;
+    }
+  }
+  for (FormalAttributeId formal_id = 0;
+       formal_id < result.formal_attributes.size();
+       ++formal_id) {
+    if (!formal_referenced[formal_id] ||
+        result.formal_attributes[formal_id].type ==
+            ONNX_NAMESPACE::AttributeProto_AttributeType_UNDEFINED) {
+      return fail(InvalidPattern("every formal attribute must be referenced by the function body"));
+    }
+    ONNX_NAMESPACE::AttributeProto declaration_metadata;
+    declaration_metadata.set_name(result.formal_attributes[formal_id].formal_name);
+    declaration_metadata.set_type(result.formal_attributes[formal_id].type);
+    if (!consume_attribute_bytes(declaration_metadata.ByteSizeLong())) {
+      return fail(ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Function attribute byte budget exceeded."));
+    }
+  }
+  result.pattern_attribute_payload_bytes = pattern_attribute_payload_bytes;
+  result.function_proto = function_proto;
 
   for (const auto& value_info : function_proto.value_info()) {
     if (!value_info.has_type() || !value_info.type().has_tensor_type()) {
@@ -426,12 +754,19 @@ NormalizedFunctionPattern NormalizeFunctionPattern(
 
   InlinedVector<PatternNodeId> source_to_pattern(function_proto.node_size(), kNoPatternNode);
   for (int source_index = 0; source_index < function_proto.node_size(); ++source_index) {
-    if (constant_nodes[source_index]) continue;
+    if (folded_constant_nodes[source_index]) continue;
     if (function_proto.node(source_index).output_size() == 0) {
       return fail(InvalidPattern("function operation nodes must have outputs"));
     }
     source_to_pattern[source_index] = result.nodes.size();
     result.nodes.push_back(PatternNode{static_cast<size_t>(source_index)});
+    auto& pattern_node = result.nodes.back();
+    pattern_node.is_parameterized_constant = parameterized_constant_nodes[source_index];
+    pattern_node.attribute_variables = source_attribute_variables[source_index];
+    for (auto& occurrence : pattern_node.attribute_variables) {
+      occurrence.pattern_node_id = source_to_pattern[source_index];
+      result.formal_attributes[occurrence.formal_attribute_id].occurrences.push_back(occurrence);
+    }
   }
   if (result.nodes.size() > options.max_pattern_nodes) {
     return fail(ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Function pattern node budget exceeded."));
@@ -446,19 +781,19 @@ NormalizedFunctionPattern NormalizeFunctionPattern(
     for (int output_index = 0; output_index < source.output_size(); ++output_index) {
       const auto& output = source.output(output_index);
       if (output.empty()) {
-        if (!constant_nodes[source_index]) {
+        if (!folded_constant_nodes[source_index]) {
           result.nodes[pattern_node_id].output_value_ids.push_back(kMissingPatternValue);
         }
         continue;
       }
       auto& value = result.values[value_ids.at(output)];
-      if (!constant_nodes[source_index]) {
+      if (!folded_constant_nodes[source_index]) {
         value.producer_node_id = pattern_node_id;
         value.producer_output_index = static_cast<size_t>(output_index);
         result.nodes[pattern_node_id].output_value_ids.push_back(value_ids.at(output));
       }
     }
-    if (constant_nodes[source_index]) continue;
+    if (folded_constant_nodes[source_index]) continue;
 
     for (int input_index = 0; input_index < source.input_size(); ++input_index) {
       const auto& input = source.input(input_index);
@@ -560,6 +895,9 @@ NormalizedFunctionPattern NormalizeFunctionPattern(
     if (value.producer_node_id == kNoPatternNode) {
       return fail(InvalidPattern("formal output '" + value.name + "' is not produced by an operation node"));
     }
+    if (result.nodes[value.producer_node_id].is_parameterized_constant) {
+      return fail(InvalidPattern("formal outputs may not be produced by Constant nodes"));
+    }
     pending.push_back(value.producer_node_id);
   }
   while (!pending.empty()) {
@@ -593,6 +931,23 @@ Status CompileFunctionPattern(
     auto& resolved = compiled_pattern.resolved_nodes[node_id];
     resolved.pattern_node_id = node_id;
     ORT_RETURN_IF_ERROR(ResolveNode(normalized_pattern.nodes[node_id], normalized_pattern, graph, resolved));
+    for (const auto& occurrence : resolved.attribute_variables) {
+      const auto schema_attribute = resolved.schema->attributes().find(occurrence.operator_attribute_name);
+      ORT_RETURN_IF(schema_attribute == resolved.schema->attributes().end() ||
+                        schema_attribute->second.type !=
+                            normalized_pattern.formal_attributes[occurrence.formal_attribute_id].type,
+                    "Function attribute variable does not agree with the resolved operator schema: ",
+                    occurrence.operator_attribute_name);
+      if (utils::HasName(schema_attribute->second.default_value)) {
+        ONNX_NAMESPACE::AttributeProto canonical_default;
+        ORT_RETURN_IF_ERROR(CanonicalizeFormalAttribute(
+            normalized_pattern.formal_attributes[occurrence.formal_attribute_id].formal_name,
+            normalized_pattern.formal_attributes[occurrence.formal_attribute_id].type,
+            schema_attribute->second.default_value,
+            std::numeric_limits<size_t>::max(),
+            canonical_default));
+      }
+    }
     ORT_RETURN_IF_NOT(IsV1PureOperator(resolved), "Function pattern contains an impure or unsupported operator: ",
                       resolved.canonical_domain, ":", resolved.op_type);
   }
@@ -651,6 +1006,12 @@ Status ValidateRegisteredFunction(
 }
 
 bool IsV1PureOperator(const ResolvedPatternNode& node) {
+  if (node.is_parameterized_constant) {
+    return node.is_standard_onnx_schema &&
+           node.canonical_domain == kOnnxDomain && node.op_type == "Constant" &&
+           node.input_arity == 0 && node.output_arity == 1 &&
+           node.attribute_variables.size() == 1;
+  }
   if (node.canonical_domain != kOnnxDomain) {
     return !node.function_fingerprint.empty() && node.transitively_pure;
   }
@@ -664,6 +1025,133 @@ bool AreAttributesSemanticallyEqual(const NodeAttributes& lhs, const NodeAttribu
     if (other == rhs.end() || !AttributeEqual(attribute, other->second)) return false;
   }
   return true;
+}
+
+size_t AttributePayloadBytes(const ONNX_NAMESPACE::AttributeProto& attribute) {
+  ONNX_NAMESPACE::AttributeProto payload = attribute;
+  payload.clear_name();
+  payload.clear_ref_attr_name();
+  payload.clear_doc_string();
+  return payload.ByteSizeLong();
+}
+
+Status CanonicalizeFormalAttribute(
+    std::string_view formal_name,
+    ONNX_NAMESPACE::AttributeProto_AttributeType declared_type,
+    const ONNX_NAMESPACE::AttributeProto& source,
+    size_t max_attribute_bytes,
+    ONNX_NAMESPACE::AttributeProto& canonical) {
+  ORT_RETURN_IF_NOT(IsSupportedFormalAttributeType(declared_type) &&
+                        source.type() == declared_type &&
+                        HasConcreteAttributeValue(source),
+                    "Formal attribute has no supported concrete value.");
+  canonical.Clear();
+  canonical.set_name(std::string{formal_name});
+  canonical.set_type(declared_type);
+  switch (declared_type) {
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT:
+      canonical.set_f(source.f());
+      break;
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_INT:
+      canonical.set_i(source.i());
+      break;
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_STRING:
+      canonical.set_s(source.s());
+      break;
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_TENSOR: {
+      ORT_RETURN_IF_ERROR(
+          CanonicalizeTensorAttribute(source.t(), max_attribute_bytes, *canonical.mutable_t()));
+      break;
+    }
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_FLOATS:
+      canonical.mutable_floats()->CopyFrom(source.floats());
+      break;
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_INTS:
+      canonical.mutable_ints()->CopyFrom(source.ints());
+      break;
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_STRINGS:
+      canonical.mutable_strings()->CopyFrom(source.strings());
+      break;
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_TENSORS:
+      for (const auto& tensor : source.tensors()) {
+        ORT_RETURN_IF_ERROR(
+            CanonicalizeTensorAttribute(tensor, max_attribute_bytes, *canonical.add_tensors()));
+      }
+      break;
+    default:
+      return InvalidPattern("unsupported formal attribute type");
+  }
+  ORT_RETURN_IF(AttributePayloadBytes(canonical) > max_attribute_bytes,
+                "Function attribute byte budget exceeded.");
+  return Status::OK();
+}
+
+Status CompareFormalAttributes(
+    const ONNX_NAMESPACE::AttributeProto& lhs,
+    const ONNX_NAMESPACE::AttributeProto& rhs,
+    size_t max_attribute_bytes,
+    bool& equal) {
+  equal = false;
+  if (lhs.type() != rhs.type()) return Status::OK();
+  switch (lhs.type()) {
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT: {
+      uint32_t lhs_bits;
+      uint32_t rhs_bits;
+      const float lhs_value = lhs.f();
+      const float rhs_value = rhs.f();
+      std::memcpy(&lhs_bits, &lhs_value, sizeof(lhs_bits));
+      std::memcpy(&rhs_bits, &rhs_value, sizeof(rhs_bits));
+      equal = lhs_bits == rhs_bits;
+      return Status::OK();
+    }
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_INT:
+      equal = lhs.i() == rhs.i();
+      return Status::OK();
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_STRING:
+      equal = lhs.s() == rhs.s();
+      return Status::OK();
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_TENSOR:
+      return CompareTensorLiterals(lhs.t(), rhs.t(), max_attribute_bytes, equal);
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_FLOATS:
+      if (lhs.floats_size() != rhs.floats_size()) return Status::OK();
+      equal = true;
+      for (int i = 0; i < lhs.floats_size(); ++i) {
+        uint32_t lhs_bits;
+        uint32_t rhs_bits;
+        const float lhs_value = lhs.floats(i);
+        const float rhs_value = rhs.floats(i);
+        std::memcpy(&lhs_bits, &lhs_value, sizeof(lhs_bits));
+        std::memcpy(&rhs_bits, &rhs_value, sizeof(rhs_bits));
+        if (lhs_bits != rhs_bits) {
+          equal = false;
+          break;
+        }
+      }
+      return Status::OK();
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_INTS:
+      if (lhs.ints_size() != rhs.ints_size()) return Status::OK();
+      equal = std::equal(lhs.ints().begin(), lhs.ints().end(), rhs.ints().begin());
+      return Status::OK();
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_STRINGS:
+      if (lhs.strings_size() != rhs.strings_size()) return Status::OK();
+      equal = std::equal(lhs.strings().begin(), lhs.strings().end(), rhs.strings().begin());
+      return Status::OK();
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_TENSORS:
+      if (lhs.tensors_size() != rhs.tensors_size()) return Status::OK();
+      equal = true;
+      for (int i = 0; i < lhs.tensors_size(); ++i) {
+        bool tensor_equal = false;
+        ORT_RETURN_IF_ERROR(
+            CompareTensorLiterals(lhs.tensors(i), rhs.tensors(i), max_attribute_bytes, tensor_equal));
+        if (!tensor_equal) {
+          equal = false;
+          break;
+        }
+      }
+      return Status::OK();
+    default:
+      return InvalidPattern("unsupported formal attribute type");
+  }
 }
 
 Status NormalizeConstantAttributes(

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <limits>
+#include <optional>
 #include <string>
 
 #include "core/common/inlined_containers.h"
@@ -17,8 +18,10 @@ namespace function_extractor_internal {
 
 using PatternNodeId = size_t;
 using PatternValueId = size_t;
+using FormalAttributeId = size_t;
 constexpr PatternValueId kMissingPatternValue = std::numeric_limits<PatternValueId>::max();
 constexpr PatternNodeId kNoPatternNode = std::numeric_limits<PatternNodeId>::max();
+constexpr FormalAttributeId kNoFormalAttribute = std::numeric_limits<FormalAttributeId>::max();
 
 struct PatternValueConsumer {
   PatternNodeId node_id{kNoPatternNode};
@@ -46,10 +49,27 @@ struct PatternValue {
   LiteralDescriptor literal;
 };
 
+struct AttributeVariableOccurrence {
+  PatternNodeId pattern_node_id{kNoPatternNode};
+  std::string operator_attribute_name;
+  FormalAttributeId formal_attribute_id{kNoFormalAttribute};
+};
+
 struct PatternNode {
   size_t source_node_proto_index{};
   InlinedVector<PatternValueId> input_value_ids;
   InlinedVector<PatternValueId> output_value_ids;
+  InlinedVector<AttributeVariableOccurrence> attribute_variables;
+  bool is_parameterized_constant{};
+};
+
+struct FormalAttributePattern {
+  std::string formal_name;
+  ONNX_NAMESPACE::AttributeProto_AttributeType type{
+      ONNX_NAMESPACE::AttributeProto_AttributeType_UNDEFINED};
+  bool required{};
+  std::optional<ONNX_NAMESPACE::AttributeProto> canonical_default;
+  InlinedVector<AttributeVariableOccurrence> occurrences;
 };
 
 // Owns the context-free validated pattern. Values use stable numeric IDs, and
@@ -58,9 +78,11 @@ struct NormalizedFunctionPattern {
   ONNX_NAMESPACE::FunctionProto function_proto;
   InlinedVector<PatternValueId> formal_input_value_ids;
   InlinedVector<PatternValueId> formal_output_value_ids;
+  InlinedVector<FormalAttributePattern, 1> formal_attributes;
   InlinedVector<PatternValue, 1> values;
   InlinedVector<PatternNode, 1> nodes;
   InlinedVector<PatternNodeId> reverse_topological_node_ids;
+  size_t pattern_attribute_payload_bytes{};
   common::Status construction_status{common::Status::OK()};
 };
 
@@ -74,10 +96,13 @@ struct ResolvedPatternNode {
   int since_version{-1};
   const ONNX_NAMESPACE::OpSchema* schema{};
   NodeAttributes effective_attributes;
+  InlinedVector<AttributeVariableOccurrence> attribute_variables;
   size_t input_arity{};
   size_t output_arity{};
   std::string function_fingerprint;
   bool transitively_pure{};
+  bool is_parameterized_constant{};
+  bool is_standard_onnx_schema{};
 };
 
 struct FormalOutputProducerGroup {
@@ -109,6 +134,21 @@ common::Status ValidateRegisteredFunction(
 bool IsV1PureOperator(const ResolvedPatternNode& node);
 
 bool AreAttributesSemanticallyEqual(const NodeAttributes& lhs, const NodeAttributes& rhs);
+
+common::Status CanonicalizeFormalAttribute(
+    std::string_view formal_name,
+    ONNX_NAMESPACE::AttributeProto_AttributeType declared_type,
+    const ONNX_NAMESPACE::AttributeProto& source,
+    size_t max_attribute_bytes,
+    ONNX_NAMESPACE::AttributeProto& canonical);
+
+common::Status CompareFormalAttributes(
+    const ONNX_NAMESPACE::AttributeProto& lhs,
+    const ONNX_NAMESPACE::AttributeProto& rhs,
+    size_t max_attribute_bytes,
+    bool& equal);
+
+size_t AttributePayloadBytes(const ONNX_NAMESPACE::AttributeProto& attribute);
 
 common::Status NormalizeConstantAttributes(
     const NodeAttributes& attributes,

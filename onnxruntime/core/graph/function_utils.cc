@@ -221,8 +221,13 @@ static void IOTypeConstraintHelper(const ONNX_NAMESPACE::FunctionProto& onnx_fun
     // type attribute, we add its referenced attribute
     // into the op's schema
     for (auto& attr : node.attribute()) {
-      if (!attr.ref_attr_name().empty() && utils::HasType(attr))
-        attribute_type_map[attr.ref_attr_name()] = attr.type();
+      if (!attr.ref_attr_name().empty() && utils::HasType(attr)) {
+        const auto [attribute_it, inserted] =
+            attribute_type_map.emplace(attr.ref_attr_name(), attr.type());
+        ORT_ENFORCE(inserted || attribute_it->second == attr.type(),
+                    "Function attribute parameter ", attr.ref_attr_name(),
+                    " is referenced with inconsistent types.");
+      }
       if (attr.ref_attr_name().empty() && attr.has_g()) {
         for (const auto& sgnode : attr.g().node())
           process_node(sgnode);
@@ -260,10 +265,31 @@ static void IOTypeConstraintHelper(const ONNX_NAMESPACE::FunctionProto& onnx_fun
   }
 
   const auto attr_end = attribute_type_map.end();
+  InlinedHashSet<std::string_view> registered_attributes;
   for (auto& attribute_name : onnx_func_proto.attribute()) {
     auto hit = attribute_type_map.find(attribute_name);
-    if (hit != attr_end)
-      op_schema->Attr(attribute_name, "", hit->second, false);
+    ORT_ENFORCE(hit != attr_end,
+                "Required function attribute parameter ", attribute_name,
+                " is not referenced by the function body.");
+    op_schema->Attr(attribute_name, "", hit->second, true);
+    registered_attributes.insert(attribute_name);
+  }
+  for (const auto& attribute_default : onnx_func_proto.attribute_proto()) {
+    ORT_ENFORCE(!attribute_default.name().empty() &&
+                    attribute_default.ref_attr_name().empty() &&
+                    utils::HasType(attribute_default),
+                "Function attribute default must have a name, concrete type, and no reference.");
+    ORT_ENFORCE(registered_attributes.find(attribute_default.name()) ==
+                    registered_attributes.end(),
+                "Function attribute parameter ", attribute_default.name(),
+                " is declared as both required and defaulted.");
+    const auto hit = attribute_type_map.find(attribute_default.name());
+    ORT_ENFORCE(hit == attr_end || hit->second == attribute_default.type(),
+                "Function attribute default ", attribute_default.name(),
+                " disagrees with its body references.");
+    op_schema->Attr(ONNX_NAMESPACE::OpSchema::Attribute{
+        attribute_default.name(), "", attribute_default});
+    registered_attributes.insert(attribute_default.name());
   }
 }
 
