@@ -596,7 +596,6 @@ NormalizedFunctionPattern NormalizeFunctionPattern(
     formal_attribute_ids.emplace(name, formal_id);
     result.formal_attributes.push_back(FormalAttributePattern{});
     result.formal_attributes.back().formal_name = name;
-    result.formal_attributes.back().required = true;
   }
   for (const auto& attribute : function_proto.attribute_proto()) {
     if (attribute.name().empty() ||
@@ -627,7 +626,6 @@ NormalizedFunctionPattern NormalizeFunctionPattern(
     auto& formal = result.formal_attributes.back();
     formal.formal_name = attribute.name();
     formal.type = attribute.type();
-    formal.canonical_default = std::move(canonical_default);
   }
 
   InlinedVector<InlinedVector<AttributeVariableOccurrence>> source_attribute_variables(
@@ -664,7 +662,7 @@ NormalizedFunctionPattern NormalizeFunctionPattern(
           return fail(ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Function attribute pattern budget exceeded."));
         }
         source_attribute_variables[node_index].push_back(
-            AttributeVariableOccurrence{kNoPatternNode, attribute.name(), formal_it->second});
+            AttributeVariableOccurrence{attribute.name(), formal_it->second});
         continue;
       }
       if (attribute.type() == ONNX_NAMESPACE::AttributeProto_AttributeType_GRAPH ||
@@ -739,6 +737,7 @@ NormalizedFunctionPattern NormalizeFunctionPattern(
     }
   }
   result.pattern_attribute_payload_bytes = pattern_attribute_payload_bytes;
+  result.max_attribute_bytes = options.max_attribute_bytes;
   result.function_proto = function_proto;
 
   for (const auto& value_info : function_proto.value_info()) {
@@ -763,10 +762,6 @@ NormalizedFunctionPattern NormalizeFunctionPattern(
     auto& pattern_node = result.nodes.back();
     pattern_node.is_parameterized_constant = parameterized_constant_nodes[source_index];
     pattern_node.attribute_variables = source_attribute_variables[source_index];
-    for (auto& occurrence : pattern_node.attribute_variables) {
-      occurrence.pattern_node_id = source_to_pattern[source_index];
-      result.formal_attributes[occurrence.formal_attribute_id].occurrences.push_back(occurrence);
-    }
   }
   if (result.nodes.size() > options.max_pattern_nodes) {
     return fail(ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Function pattern node budget exceeded."));
@@ -944,11 +939,12 @@ Status CompileFunctionPattern(
             normalized_pattern.formal_attributes[occurrence.formal_attribute_id].formal_name,
             normalized_pattern.formal_attributes[occurrence.formal_attribute_id].type,
             schema_attribute->second.default_value,
-            std::numeric_limits<size_t>::max(),
+            normalized_pattern.max_attribute_bytes,
             canonical_default));
       }
     }
-    ORT_RETURN_IF_NOT(IsV1PureOperator(resolved), "Function pattern contains an impure or unsupported operator: ",
+    ORT_RETURN_IF_NOT(IsSupportedPureOperator(resolved),
+                      "Function pattern contains an impure or unsupported operator: ",
                       resolved.canonical_domain, ":", resolved.op_type);
   }
 
@@ -1005,7 +1001,7 @@ Status ValidateRegisteredFunction(
   return Status::OK();
 }
 
-bool IsV1PureOperator(const ResolvedPatternNode& node) {
+bool IsSupportedPureOperator(const ResolvedPatternNode& node) {
   if (node.is_parameterized_constant) {
     return node.is_standard_onnx_schema &&
            node.canonical_domain == kOnnxDomain && node.op_type == "Constant" &&
@@ -1028,11 +1024,11 @@ bool AreAttributesSemanticallyEqual(const NodeAttributes& lhs, const NodeAttribu
 }
 
 size_t AttributePayloadBytes(const ONNX_NAMESPACE::AttributeProto& attribute) {
-  ONNX_NAMESPACE::AttributeProto payload = attribute;
-  payload.clear_name();
-  payload.clear_ref_attr_name();
-  payload.clear_doc_string();
-  return payload.ByteSizeLong();
+  ONNX_NAMESPACE::AttributeProto metadata;
+  if (!attribute.name().empty()) metadata.set_name(attribute.name());
+  if (!attribute.ref_attr_name().empty()) metadata.set_ref_attr_name(attribute.ref_attr_name());
+  if (!attribute.doc_string().empty()) metadata.set_doc_string(attribute.doc_string());
+  return SafeInt<size_t>(attribute.ByteSizeLong()) - metadata.ByteSizeLong();
 }
 
 Status CanonicalizeFormalAttribute(
@@ -1045,6 +1041,8 @@ Status CanonicalizeFormalAttribute(
                         source.type() == declared_type &&
                         HasConcreteAttributeValue(source),
                     "Formal attribute has no supported concrete value.");
+  ORT_RETURN_IF(AttributePayloadBytes(source) > max_attribute_bytes,
+                "Function attribute byte budget exceeded.");
   canonical.Clear();
   canonical.set_name(std::string{formal_name});
   canonical.set_type(declared_type);
@@ -1059,8 +1057,15 @@ Status CanonicalizeFormalAttribute(
       canonical.set_s(source.s());
       break;
     case ONNX_NAMESPACE::AttributeProto_AttributeType_TENSOR: {
-      ORT_RETURN_IF_ERROR(
-          CanonicalizeTensorAttribute(source.t(), max_attribute_bytes, *canonical.mutable_t()));
+      const size_t used_bytes = AttributePayloadBytes(canonical);
+      ORT_RETURN_IF(used_bytes >= max_attribute_bytes,
+                    "Function attribute byte budget exceeded.");
+      ONNX_NAMESPACE::TensorProto canonical_tensor;
+      ORT_RETURN_IF_ERROR(CanonicalizeTensorAttribute(
+          source.t(), max_attribute_bytes - used_bytes, canonical_tensor));
+      ORT_RETURN_IF(canonical_tensor.ByteSizeLong() > max_attribute_bytes - used_bytes,
+                    "Function attribute byte budget exceeded.");
+      canonical.mutable_t()->Swap(&canonical_tensor);
       break;
     }
     case ONNX_NAMESPACE::AttributeProto_AttributeType_FLOATS:
@@ -1074,8 +1079,18 @@ Status CanonicalizeFormalAttribute(
       break;
     case ONNX_NAMESPACE::AttributeProto_AttributeType_TENSORS:
       for (const auto& tensor : source.tensors()) {
-        ORT_RETURN_IF_ERROR(
-            CanonicalizeTensorAttribute(tensor, max_attribute_bytes, *canonical.add_tensors()));
+        const size_t used_bytes = AttributePayloadBytes(canonical);
+        ORT_RETURN_IF(used_bytes >= max_attribute_bytes,
+                      "Function attribute byte budget exceeded.");
+        ONNX_NAMESPACE::TensorProto canonical_tensor;
+        ORT_RETURN_IF_ERROR(CanonicalizeTensorAttribute(
+            tensor, max_attribute_bytes - used_bytes, canonical_tensor));
+        const size_t remaining_bytes = max_attribute_bytes - used_bytes;
+        ORT_RETURN_IF(canonical_tensor.ByteSizeLong() > remaining_bytes,
+                      "Function attribute byte budget exceeded.");
+        canonical.add_tensors()->Swap(&canonical_tensor);
+        ORT_RETURN_IF(AttributePayloadBytes(canonical) > max_attribute_bytes,
+                      "Function attribute byte budget exceeded.");
       }
       break;
     default:

@@ -907,21 +907,23 @@ Status PrevalidatePlans(
                     "Replacement plan target attribute became missing.");
       const auto& formal =
           compiled_pattern.normalized_pattern->formal_attributes[occurrence.formal_attribute_id];
+      const size_t max_attribute_bytes =
+          compiled_pattern.normalized_pattern->max_attribute_bytes;
       ONNX_NAMESPACE::AttributeProto canonical;
       ORT_RETURN_IF_ERROR(CanonicalizeFormalAttribute(
           formal.formal_name, formal.type, *target_attribute,
-          std::numeric_limits<size_t>::max(), canonical));
+          max_attribute_bytes, canonical));
       bool equal = false;
       ORT_RETURN_IF_ERROR(CompareFormalAttributes(
           canonical, occurrence.canonical_value,
-          std::numeric_limits<size_t>::max(), equal));
+          max_attribute_bytes, equal));
       ORT_RETURN_IF_NOT(equal, "Replacement plan target attribute changed.");
       const auto call_attribute = plan.call_attributes.find(formal.formal_name);
       ORT_RETURN_IF(call_attribute == plan.call_attributes.end(),
                     "Replacement plan formal attribute became missing.");
       ORT_RETURN_IF_ERROR(CompareFormalAttributes(
           canonical, call_attribute->second,
-          std::numeric_limits<size_t>::max(), equal));
+          max_attribute_bytes, equal));
       ORT_RETURN_IF_NOT(equal, "Replacement plan formal binding changed.");
     }
     std::vector<graph_utils::GraphEdge> current_input_edges;

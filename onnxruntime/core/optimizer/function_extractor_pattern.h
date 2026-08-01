@@ -5,7 +5,6 @@
 #include <cstddef>
 #include <filesystem>
 #include <limits>
-#include <optional>
 #include <string>
 
 #include "core/common/inlined_containers.h"
@@ -50,7 +49,6 @@ struct PatternValue {
 };
 
 struct AttributeVariableOccurrence {
-  PatternNodeId pattern_node_id{kNoPatternNode};
   std::string operator_attribute_name;
   FormalAttributeId formal_attribute_id{kNoFormalAttribute};
 };
@@ -67,9 +65,6 @@ struct FormalAttributePattern {
   std::string formal_name;
   ONNX_NAMESPACE::AttributeProto_AttributeType type{
       ONNX_NAMESPACE::AttributeProto_AttributeType_UNDEFINED};
-  bool required{};
-  std::optional<ONNX_NAMESPACE::AttributeProto> canonical_default;
-  InlinedVector<AttributeVariableOccurrence> occurrences;
 };
 
 // Owns the context-free validated pattern. Values use stable numeric IDs, and
@@ -83,6 +78,7 @@ struct NormalizedFunctionPattern {
   InlinedVector<PatternNode, 1> nodes;
   InlinedVector<PatternNodeId> reverse_topological_node_ids;
   size_t pattern_attribute_payload_bytes{};
+  size_t max_attribute_bytes{};
   common::Status construction_status{common::Status::OK()};
 };
 
@@ -131,7 +127,7 @@ common::Status ValidateRegisteredFunction(
     const NormalizedFunctionPattern& normalized_pattern,
     const Graph& graph);
 
-bool IsV1PureOperator(const ResolvedPatternNode& node);
+bool IsSupportedPureOperator(const ResolvedPatternNode& node);
 
 bool AreAttributesSemanticallyEqual(const NodeAttributes& lhs, const NodeAttributes& rhs);
 

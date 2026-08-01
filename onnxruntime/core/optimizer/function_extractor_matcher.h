@@ -74,7 +74,9 @@ struct MatchState {
   InlinedVector<const NodeArg*> pattern_value_to_target;
   InlinedVector<ValueVisitState> value_visit_states;
   InlinedVector<const NodeArg*> formal_input_bindings;
+  // Candidate-local: first occurrence binds; later occurrences must agree.
   InlinedVector<std::optional<ONNX_NAMESPACE::AttributeProto>, 1> formal_attribute_bindings;
+  // Owned snapshots used to prove target attributes remain stable before apply.
   InlinedVector<MatchedAttributeOccurrence, 1> matched_attribute_occurrences;
   InlinedVector<LiteralWitness, 1> literal_witnesses;
   size_t scheduled_binding_count{};
@@ -89,7 +91,9 @@ struct ReplacementPlan {
   InlinedVector<NodeArg*> call_outputs;
   InlinedVector<NodeIndex> pattern_node_to_target;
   InlinedVector<LiteralWitness, 1> literal_witnesses;
+  // Owned formal-name-keyed attributes copied directly to the generated call.
   NodeAttributes call_attributes;
+  // Owned target-occurrence snapshots rechecked during whole-batch prevalidation.
   InlinedVector<MatchedAttributeOccurrence, 1> matched_attribute_occurrences;
   std::vector<graph_utils::GraphEdge> matched_input_edges;
   std::vector<graph_utils::GraphEdge> explicit_input_edges;
