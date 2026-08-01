@@ -355,12 +355,14 @@ TEST_F(FunctionExtractorTest, RejectsInvalidAttributes) {
   duplicate_declaration.add_attribute("axis");
   ExpectConstructionRejected(std::move(duplicate_declaration));
 
-  FunctionProto duplicate_default = MakeLinearFunction("DuplicateDefault");
-  duplicate_default.add_attribute("axis");
+  FunctionProto duplicate_default = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+DuplicateDefault <slope : float = 0.1> (x) => (out) {
+  activated = LeakyRelu <alpha : float = @slope> (x)
+  out = Identity(activated)
+})");
   duplicate_default.add_attribute_proto()->CopyFrom(
-      ONNX_NAMESPACE::MakeAttribute("axis", int64_t{0}));
-  duplicate_default.add_attribute_proto()->CopyFrom(
-      ONNX_NAMESPACE::MakeAttribute("axis", int64_t{1}));
+      ONNX_NAMESPACE::MakeAttribute("slope", 0.2f));
   ExpectConstructionRejected(std::move(duplicate_default));
 }
 
@@ -763,6 +765,52 @@ target_graph (float[2] x) => (float[2] out) {
   FunctionExtractorOptions options;
   options.max_attribute_bytes =
       normalized.pattern_attribute_payload_bytes - 1;
+  FunctionExtractor extractor(function_proto, options);
+  const FunctionExtractionResult result = extractor.Extract(graph);
+  EXPECT_FALSE(result.status.IsOK());
+  EXPECT_EQ(result.replacements_applied, 0u);
+  EXPECT_EQ(graph.ToGraphProto().SerializeAsString(), graph_proto_before);
+  EXPECT_FALSE(graph.GraphResolveNeeded());
+}
+
+TEST_F(FunctionExtractorTest, EnforcesCumulativeTargetAttributeBudgetBeforeMutation) {
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+TargetAttributeBudget <slope> (x) => (out) {
+  first = LeakyRelu <alpha : float = @slope> (x)
+  out = LeakyRelu <alpha : float = @slope> (first)
+})");
+  const auto normalized =
+      function_extractor_internal::NormalizeFunctionPattern(
+          function_proto, FunctionExtractorOptions{});
+  ASSERT_STATUS_OK(normalized.construction_status);
+
+  ONNX_NAMESPACE::AttributeProto canonical_target_attribute;
+  ASSERT_STATUS_OK(function_extractor_internal::CanonicalizeFormalAttribute(
+      "slope", ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT,
+      ONNX_NAMESPACE::MakeAttribute("alpha", 0.2f),
+      std::numeric_limits<size_t>::max(), canonical_target_attribute));
+  const size_t target_attribute_bytes =
+      function_extractor_internal::AttributePayloadBytes(
+          canonical_target_attribute);
+  ASSERT_GT(target_attribute_bytes, 0u);
+
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x) => (float[2] out) {
+  first = LeakyRelu <alpha = 0.2> (x)
+  out = LeakyRelu <alpha = 0.2> (first)
+})",
+      function_proto);
+  Graph& graph = model->MainGraph();
+  ASSERT_STATUS_OK(graph.Resolve());
+  const std::string graph_proto_before =
+      graph.ToGraphProto().SerializeAsString();
+
+  FunctionExtractorOptions options;
+  options.max_attribute_bytes =
+      normalized.pattern_attribute_payload_bytes +
+      2 * target_attribute_bytes - 1;
   FunctionExtractor extractor(function_proto, options);
   const FunctionExtractionResult result = extractor.Extract(graph);
   EXPECT_FALSE(result.status.IsOK());
@@ -1299,6 +1347,38 @@ target_graph (float[2] x) => (float[2] out) {
     const Node& call = FindOnlyOp(graph, kFunctionDomain, function_proto.name());
     AssertFloatCallAttribute(call, "slope", test_case.expected_binding);
   }
+}
+
+TEST_F(FunctionExtractorTest, BindsConcreteEmptyRepeatedDefault) {
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+EmptyPermutation <permutation : ints = []> (x) => (out) {
+  transposed = Transpose <perm : ints = @permutation> (x)
+  out = Identity(transposed)
+})");
+  ASSERT_EQ(function_proto.attribute_proto_size(), 1);
+  const auto& default_attribute = function_proto.attribute_proto(0);
+  ASSERT_EQ(default_attribute.type(),
+            ONNX_NAMESPACE::AttributeProto_AttributeType_INTS);
+  ASSERT_EQ(default_attribute.ints_size(), 0);
+
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[] x) => (float[] out) {
+  transposed = Transpose <perm : ints = []> (x)
+  out = Identity(transposed)
+})",
+      function_proto);
+  Graph& graph = model->MainGraph();
+  ASSERT_STATUS_OK(graph.Resolve());
+
+  FunctionExtractor extractor(function_proto);
+  const FunctionExtractionResult result = extractor.Extract(graph);
+  ASSERT_STATUS_OK(result.status);
+  ASSERT_EQ(result.replacements_applied, 1u);
+  const Node& call = FindOnlyOp(graph, kFunctionDomain, function_proto.name());
+  const std::vector<int64_t> empty_permutation;
+  AssertIntsCallAttribute(call, "permutation", empty_permutation);
 }
 
 TEST_F(FunctionExtractorTest, RejectsMissingRequiredAttributeWithoutOperatorDefault) {
