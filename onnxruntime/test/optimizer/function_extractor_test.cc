@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <algorithm>
+
 #include "gtest/gtest.h"
 
 #include "core/common/logging/logging.h"
@@ -231,6 +233,41 @@ void AssertCallIO(const Node& node,
   }
 }
 
+const ONNX_NAMESPACE::AttributeProto& GetOnlyCallAttribute(
+    const Node& call, std::string_view expected_name) {
+  const NodeAttributes& attributes = call.GetAttributes();
+  EXPECT_EQ(attributes.size(), 1u);
+  const auto attribute_it = attributes.find(std::string{expected_name});
+  ORT_ENFORCE(attribute_it != attributes.end(),
+              "Expected call attribute ", expected_name);
+  return attribute_it->second;
+}
+
+void AssertFloatCallAttribute(const Node& call,
+                              std::string_view expected_name,
+                              float expected_value) {
+  const auto& attribute = GetOnlyCallAttribute(call, expected_name);
+  EXPECT_EQ(attribute.name(), expected_name);
+  EXPECT_EQ(attribute.type(), ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT);
+  EXPECT_FLOAT_EQ(attribute.f(), expected_value);
+  EXPECT_TRUE(attribute.ref_attr_name().empty());
+  EXPECT_TRUE(attribute.doc_string().empty());
+}
+
+void AssertIntsCallAttribute(const Node& call,
+                             std::string_view expected_name,
+                             gsl::span<const int64_t> expected_values) {
+  const auto& attribute = GetOnlyCallAttribute(call, expected_name);
+  EXPECT_EQ(attribute.name(), expected_name);
+  EXPECT_EQ(attribute.type(), ONNX_NAMESPACE::AttributeProto_AttributeType_INTS);
+  ASSERT_EQ(attribute.ints_size(), static_cast<int>(expected_values.size()));
+  for (size_t i = 0; i < expected_values.size(); ++i) {
+    EXPECT_EQ(attribute.ints(static_cast<int>(i)), expected_values[i]);
+  }
+  EXPECT_TRUE(attribute.ref_attr_name().empty());
+  EXPECT_TRUE(attribute.doc_string().empty());
+}
+
 std::shared_ptr<Model> SerializeAndReload(Model& model) {
   std::string serialized_model;
   EXPECT_TRUE(model.ToProto().SerializeToString(&serialized_model));
@@ -322,14 +359,6 @@ TEST_F(FunctionExtractorTest, RejectsInvalidAttributes) {
   duplicate_default.add_attribute_proto()->CopyFrom(
       ONNX_NAMESPACE::MakeAttribute("axis", int64_t{1}));
   ExpectConstructionRejected(std::move(duplicate_default));
-
-  FunctionProto referenced_attribute = MakeLinearFunction("ReferencedAttribute");
-  // The parser cannot encode both ref_attr_name and its required AttributeProto type.
-  auto& attribute = *referenced_attribute.mutable_node(0)->add_attribute();
-  attribute.set_name("axis");
-  attribute.set_ref_attr_name("axis");
-  attribute.set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_INT);
-  ExpectConstructionRejected(std::move(referenced_attribute));
 }
 
 TEST_F(FunctionExtractorTest, RejectsUnusedRequiredFunctionAttribute) {
@@ -658,6 +687,50 @@ TEST_F(FunctionExtractorTest, RejectsHighArityPatternBeforeMutation) {
   EXPECT_EQ(node_identities_after, node_identities_before);
 }
 
+TEST_F(FunctionExtractorTest, EnforcesAttributeResourceBudgetsBeforeMutation) {
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+AttributeBudget <slope> (x) => (out) {
+  activated = LeakyRelu <alpha : float = @slope> (x)
+  out = Identity(activated)
+})");
+
+  struct AttributeBudgetCase {
+    const char* name;
+    FunctionExtractorOptions options;
+  };
+  FunctionExtractorOptions formal_count_limit;
+  formal_count_limit.max_formal_attributes = 0;
+  FunctionExtractorOptions attribute_byte_limit;
+  attribute_byte_limit.max_attribute_bytes = 0;
+  const std::vector<AttributeBudgetCase> cases{
+      {"formal attribute count", formal_count_limit},
+      {"attribute byte count", attribute_byte_limit},
+  };
+
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    auto model = MakeModelFromText(
+        R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x) => (float[2] out) {
+  activated = LeakyRelu <alpha = 0.2> (x)
+  out = Identity(activated)
+})",
+        function_proto);
+    Graph& graph = model->MainGraph();
+    ASSERT_STATUS_OK(graph.Resolve());
+    const std::string graph_proto_before =
+        graph.ToGraphProto().SerializeAsString();
+
+    FunctionExtractor extractor(function_proto, test_case.options);
+    const FunctionExtractionResult result = extractor.Extract(graph);
+    EXPECT_FALSE(result.status.IsOK());
+    EXPECT_EQ(result.replacements_applied, 0u);
+    EXPECT_EQ(graph.ToGraphProto().SerializeAsString(), graph_proto_before);
+    EXPECT_FALSE(graph.GraphResolveNeeded());
+  }
+}
+
 // Deterministic structural matching.
 
 TEST_F(FunctionExtractorTest, ExtractsLinearPattern) {
@@ -964,6 +1037,338 @@ target_graph (float[2, 2] x) => (float[2, 2] out) {
     ASSERT_STATUS_OK(result.status);
     EXPECT_EQ(result.replacements_applied, test_case.expected_replacements);
   }
+}
+
+// Function attribute parameters.
+
+TEST_F(FunctionExtractorTest, BindsRequiredAttributeAndEmitsCallAttribute) {
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+ParameterizedLeakyRelu <slope> (x) => (out) {
+  activated = LeakyRelu <alpha : float = @slope> (x)
+  out = Identity(activated)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x) => (float[2] out) {
+  activated = LeakyRelu <alpha = 0.2> (x)
+  out = Identity(activated)
+})",
+      function_proto);
+  Graph& graph = model->MainGraph();
+  ASSERT_STATUS_OK(graph.Resolve());
+
+  FunctionExtractor extractor(function_proto);
+  const FunctionExtractionResult result = extractor.Extract(graph);
+  ASSERT_STATUS_OK(result.status);
+  ASSERT_EQ(result.replacements_applied, 1u);
+  const Node& call = FindOnlyOp(graph, kFunctionDomain, function_proto.name());
+  AssertFloatCallAttribute(call, "slope", 0.2f);
+  AssertResolved(graph);
+}
+
+TEST_F(FunctionExtractorTest, EmitsOnlyFormalAttributesWhenFixedAttributesCoexist) {
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+ParameterizedMaxPool <padding> (x) => (out) {
+  pooled, "" = MaxPool <kernel_shape = [2, 2], pads : ints = @padding> (x)
+  out = Identity(pooled)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[1, 1, 4, 4] x) => (float[1, 1, 3, 3] out) {
+  pooled, "" = MaxPool <kernel_shape = [2, 2], pads = [0, 0, 0, 0]> (x)
+  out = Identity(pooled)
+})",
+      function_proto);
+  Graph& graph = model->MainGraph();
+  ASSERT_STATUS_OK(graph.Resolve());
+
+  FunctionExtractor extractor(function_proto);
+  const FunctionExtractionResult result = extractor.Extract(graph);
+  ASSERT_STATUS_OK(result.status);
+  ASSERT_EQ(result.replacements_applied, 1u);
+  const Node& call = FindOnlyOp(graph, kFunctionDomain, function_proto.name());
+  const std::vector<int64_t> expected_padding{0, 0, 0, 0};
+  AssertIntsCallAttribute(call, "padding", expected_padding);
+}
+
+TEST_F(FunctionExtractorTest, RequiresConsistentRepeatedAttributeBinding) {
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+TwiceLeakyRelu <slope> (x) => (out) {
+  first = LeakyRelu <alpha : float = @slope> (x)
+  out = LeakyRelu <alpha : float = @slope> (first)
+})");
+
+  struct RepeatedBindingCase {
+    const char* name;
+    std::string_view model_source;
+    size_t expected_replacements;
+  };
+  const std::vector<RepeatedBindingCase> cases{
+      {"agreeing occurrences",
+       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x) => (float[2] out) {
+  first = LeakyRelu <alpha = 0.2> (x)
+  out = LeakyRelu <alpha = 0.2> (first)
+})",
+       1},
+      {"disagreeing occurrences",
+       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x) => (float[2] out) {
+  first = LeakyRelu <alpha = 0.2> (x)
+  out = LeakyRelu <alpha = 0.3> (first)
+})",
+       0},
+  };
+
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    auto model = MakeModelFromText(test_case.model_source, function_proto);
+    Graph& graph = model->MainGraph();
+    ASSERT_STATUS_OK(graph.Resolve());
+
+    FunctionExtractor extractor(function_proto);
+    const FunctionExtractionResult result = extractor.Extract(graph);
+    ASSERT_STATUS_OK(result.status);
+    ASSERT_EQ(result.replacements_applied, test_case.expected_replacements);
+    if (test_case.expected_replacements == 1) {
+      const Node& call = FindOnlyOp(graph, kFunctionDomain, function_proto.name());
+      AssertFloatCallAttribute(call, "slope", 0.2f);
+    } else {
+      EXPECT_EQ(CountOp(graph, kFunctionDomain, function_proto.name()), 0u);
+    }
+  }
+}
+
+TEST_F(FunctionExtractorTest, BindsDefaultedAttributeFromEffectiveTargetValue) {
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+DefaultedLeakyRelu <slope : float = 0.01> (x) => (out) {
+  activated = LeakyRelu <alpha : float = @slope> (x)
+  out = Identity(activated)
+})");
+
+  struct DefaultBindingCase {
+    const char* name;
+    std::string_view model_source;
+    float expected_binding;
+  };
+  const std::vector<DefaultBindingCase> cases{
+      {"omitted target attribute uses operator default",
+       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x) => (float[2] out) {
+  activated = LeakyRelu(x)
+  out = Identity(activated)
+})",
+       0.01f},
+      {"explicit target override",
+       R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x) => (float[2] out) {
+  activated = LeakyRelu <alpha = 0.4> (x)
+  out = Identity(activated)
+})",
+       0.4f},
+  };
+
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    auto model = MakeModelFromText(test_case.model_source, function_proto);
+    Graph& graph = model->MainGraph();
+    ASSERT_STATUS_OK(graph.Resolve());
+
+    FunctionExtractor extractor(function_proto);
+    const FunctionExtractionResult result = extractor.Extract(graph);
+    ASSERT_STATUS_OK(result.status);
+    ASSERT_EQ(result.replacements_applied, 1u);
+    const Node& call = FindOnlyOp(graph, kFunctionDomain, function_proto.name());
+    AssertFloatCallAttribute(call, "slope", test_case.expected_binding);
+  }
+}
+
+TEST_F(FunctionExtractorTest, RejectsMissingRequiredAttributeWithoutOperatorDefault) {
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+ParameterizedTranspose <permutation> (x) => (out) {
+  transposed = Transpose <perm : ints = @permutation> (x)
+  out = Identity(transposed)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2, 3] x) => (float[3, 2] out) {
+  transposed = Transpose(x)
+  out = Identity(transposed)
+})",
+      function_proto);
+  Graph& graph = model->MainGraph();
+  ASSERT_STATUS_OK(graph.Resolve());
+
+  FunctionExtractor extractor(function_proto);
+  const FunctionExtractionResult result = extractor.Extract(graph);
+  ASSERT_STATUS_OK(result.status);
+  EXPECT_EQ(result.replacements_applied, 0u);
+  EXPECT_EQ(CountOp(graph, kFunctionDomain, function_proto.name()), 0u);
+}
+
+TEST_F(FunctionExtractorTest, EmitsIndependentAttributesForDisjointMatches) {
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+IndependentBindings <slope> (x) => (out) {
+  activated = LeakyRelu <alpha : float = @slope> (x)
+  out = Identity(activated)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x) => (float[2] first_out, float[2] second_out) {
+  first_activation = LeakyRelu <alpha = 0.2> (x)
+  first_out = Identity(first_activation)
+  second_activation = LeakyRelu <alpha = 0.4> (x)
+  second_out = Identity(second_activation)
+})",
+      function_proto);
+  Graph& graph = model->MainGraph();
+  ASSERT_STATUS_OK(graph.Resolve());
+
+  FunctionExtractor extractor(function_proto);
+  const FunctionExtractionResult result = extractor.Extract(graph);
+  ASSERT_STATUS_OK(result.status);
+  ASSERT_EQ(result.replacements_applied, 2u);
+
+  std::vector<float> emitted_bindings;
+  for (const Node& node : graph.Nodes()) {
+    if (node.Domain() == kFunctionDomain && node.OpType() == function_proto.name()) {
+      const auto& attribute = GetOnlyCallAttribute(node, "slope");
+      ASSERT_EQ(attribute.type(), ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT);
+      emitted_bindings.push_back(attribute.f());
+    }
+  }
+  ASSERT_EQ(emitted_bindings.size(), 2u);
+  std::sort(emitted_bindings.begin(), emitted_bindings.end());
+  EXPECT_EQ(emitted_bindings, (std::vector<float>{0.2f, 0.4f}));
+}
+
+TEST_F(FunctionExtractorTest, MatchesParameterizedConstantStructurally) {
+  const FunctionProto function_proto = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+ParameterizedConstant <scalar> (x) => (out) {
+  literal = Constant <value_float : float = @scalar> ()
+  sum = Add(x, literal)
+  out = Relu(sum)
+})");
+
+  // Model::Load canonicalizes Constant nodes into initializers. Build the
+  // positive target directly so the parameterized Constant remains structural.
+  auto model = MakeEmptyModelWithFunctions(function_proto);
+  Graph& graph = model->MainGraph();
+  FunctionExtractorGraphBuilder builder(graph);
+  NodeArg* input = builder.MakeInput<float>({2}, 0.0f, 1.0f);
+  NodeArg* literal = builder.MakeIntermediate<float>({});
+  NodeArg* sum = builder.MakeIntermediate<float>({2});
+  NodeArg* output = builder.MakeOutput<float>({2});
+  NodeAttributes constant_attributes{
+      {"value_float", ONNX_NAMESPACE::MakeAttribute("value_float", 2.0f)}};
+  builder.AddNode("Constant", {}, {literal}, kOnnxDomain,
+                  &constant_attributes);
+  builder.AddNode("Add", {input, literal}, {sum});
+  builder.AddNode("Relu", {sum}, {output});
+  builder.SetGraphOutputs();
+  ASSERT_STATUS_OK(graph.Resolve());
+
+  FunctionExtractor extractor(function_proto);
+  const FunctionExtractionResult result = extractor.Extract(graph);
+  ASSERT_STATUS_OK(result.status);
+  ASSERT_EQ(result.replacements_applied, 1u);
+  EXPECT_EQ(CountOp(graph, kOnnxDomain, "Constant"), 0u);
+  const Node& call = FindOnlyOp(graph, kFunctionDomain, function_proto.name());
+  AssertFloatCallAttribute(call, "scalar", 2.0f);
+
+  auto initializer_model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x) => (float[2] out) <float literal = {2.0}> {
+  sum = Add(x, literal)
+  out = Relu(sum)
+})",
+      function_proto);
+  Graph& initializer_graph = initializer_model->MainGraph();
+  ASSERT_STATUS_OK(initializer_graph.Resolve());
+  FunctionExtractor initializer_extractor(function_proto);
+  const FunctionExtractionResult initializer_result =
+      initializer_extractor.Extract(initializer_graph);
+  ASSERT_STATUS_OK(initializer_result.status);
+  EXPECT_EQ(initializer_result.replacements_applied, 0u);
+}
+
+TEST_F(FunctionExtractorTest, PreservesRequiredAndDefaultedFunctionSchemaSemantics) {
+  const FunctionProto required_function = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+RequiredSchema <slope> (x) => (out) {
+  activated = LeakyRelu <alpha : float = @slope> (x)
+  out = Identity(activated)
+})");
+  ONNX_NAMESPACE::ModelProto missing_required_model = ParseModel(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x) => (float[2] out) {
+  out = test.function.RequiredSchema(x)
+})");
+  missing_required_model.add_functions()->CopyFrom(required_function);
+  std::shared_ptr<Model> rejected_model;
+  common::Status missing_required_status =
+      Model::Load(std::move(missing_required_model), rejected_model, nullptr,
+                  DefaultLoggingManager().DefaultLogger());
+  if (missing_required_status.IsOK()) {
+    ASSERT_NE(rejected_model, nullptr);
+    missing_required_status = rejected_model->MainGraph().Resolve();
+  }
+  EXPECT_FALSE(missing_required_status.IsOK());
+
+  const FunctionProto defaulted_function = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+DefaultedSchema <slope : float = 0.01> (x) => (out) {
+  activated = LeakyRelu <alpha : float = @slope> (x)
+  out = Identity(activated)
+})");
+  auto omitted_model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x) => (float[2] out) {
+  out = test.function.DefaultedSchema(x)
+})",
+      defaulted_function);
+  ASSERT_STATUS_OK(omitted_model->MainGraph().Resolve());
+
+  auto override_model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "test.function" : 1]>
+target_graph (float[2] x) => (float[2] out) {
+  out = test.function.DefaultedSchema <slope = 0.4> (x)
+})",
+      defaulted_function);
+  ASSERT_STATUS_OK(override_model->MainGraph().Resolve());
+}
+
+TEST_F(FunctionExtractorTest, RejectsInvalidAttributeParameterReferences) {
+  ExpectConstructionRejected(ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+UndeclaredReference (x) => (out) {
+  activated = LeakyRelu <alpha : float = @undeclared> (x)
+  out = Identity(activated)
+})"));
+
+  FunctionProto unsupported_reference = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "test.function">
+UnsupportedReference <attribute> (x) => (out) {
+  activated = LeakyRelu <alpha : float = @attribute> (x)
+  out = Identity(activated)
+})");
+  auto& attribute = *unsupported_reference.mutable_node(0)->mutable_attribute(0);
+  attribute.set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_GRAPH);
+  ExpectConstructionRejected(std::move(unsupported_reference));
+
+  FunctionProto unsupported_default = MakeLinearFunction("UnsupportedDefault");
+  auto& default_attribute = *unsupported_default.add_attribute_proto();
+  default_attribute.set_name("attribute");
+  default_attribute.set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_GRAPH);
+  default_attribute.mutable_g()->set_name("unsupported_default");
+  ExpectConstructionRejected(std::move(unsupported_default));
 }
 
 TEST_F(FunctionExtractorTest, MatchesOptionalAndVariadicSlotsPositionally) {
