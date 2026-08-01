@@ -487,6 +487,33 @@ bool AttributeEqual(const ONNX_NAMESPACE::AttributeProto& lhs, const ONNX_NAMESP
   return normalized_lhs.SerializeAsString() == normalized_rhs.SerializeAsString();
 }
 
+Status CanonicalizeFormalAttributeWithinBudget(
+    std::string_view formal_name,
+    ONNX_NAMESPACE::AttributeProto_AttributeType declared_type,
+    const ONNX_NAMESPACE::AttributeProto& source,
+    size_t max_attribute_bytes,
+    size_t& aggregate_attribute_bytes,
+    ONNX_NAMESPACE::AttributeProto& canonical) {
+  ORT_RETURN_IF(aggregate_attribute_bytes >= max_attribute_bytes,
+                "Function attribute byte budget exceeded.");
+  const size_t bytes_before = aggregate_attribute_bytes;
+  const size_t remaining_bytes = max_attribute_bytes - bytes_before;
+  const size_t source_bytes = AttributePayloadBytes(source);
+  ORT_RETURN_IF(source_bytes > remaining_bytes,
+                "Function attribute byte budget exceeded.");
+
+  // Reserve the source payload before canonicalization can copy or expand it.
+  aggregate_attribute_bytes += source_bytes;
+  ORT_RETURN_IF_ERROR(CanonicalizeFormalAttribute(
+      formal_name, declared_type, source, remaining_bytes, canonical));
+
+  const size_t canonical_bytes = AttributePayloadBytes(canonical);
+  ORT_RETURN_IF(canonical_bytes > remaining_bytes,
+                "Function attribute byte budget exceeded.");
+  aggregate_attribute_bytes = bytes_before + canonical_bytes;
+  return Status::OK();
+}
+
 }  // namespace
 
 NormalizedFunctionPattern NormalizeFunctionPattern(
@@ -614,12 +641,11 @@ NormalizedFunctionPattern NormalizeFunctionPattern(
       return fail(ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Function attribute pattern budget exceeded."));
     }
     ONNX_NAMESPACE::AttributeProto canonical_default;
-    status = CanonicalizeFormalAttribute(
-        attribute.name(), attribute.type(), attribute, options.max_attribute_bytes, canonical_default);
+    status = CanonicalizeFormalAttributeWithinBudget(
+        attribute.name(), attribute.type(), attribute,
+        options.max_attribute_bytes, pattern_attribute_payload_bytes,
+        canonical_default);
     if (!status.IsOK()) return fail(std::move(status));
-    if (!consume_attribute_bytes(AttributePayloadBytes(canonical_default))) {
-      return fail(ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Function attribute byte budget exceeded."));
-    }
     const FormalAttributeId formal_id = result.formal_attributes.size();
     formal_attribute_ids.emplace(attribute.name(), formal_id);
     result.formal_attributes.push_back(FormalAttributePattern{});
@@ -921,6 +947,8 @@ Status CompileFunctionPattern(
   compiled_pattern = CompiledFunctionPattern{};
   compiled_pattern.normalized_pattern = &normalized_pattern;
   compiled_pattern.resolved_nodes.resize(normalized_pattern.nodes.size());
+  size_t aggregate_attribute_bytes =
+      normalized_pattern.pattern_attribute_payload_bytes;
 
   for (PatternNodeId node_id = 0; node_id < normalized_pattern.nodes.size(); ++node_id) {
     auto& resolved = compiled_pattern.resolved_nodes[node_id];
@@ -935,11 +963,12 @@ Status CompileFunctionPattern(
                     occurrence.operator_attribute_name);
       if (utils::HasName(schema_attribute->second.default_value)) {
         ONNX_NAMESPACE::AttributeProto canonical_default;
-        ORT_RETURN_IF_ERROR(CanonicalizeFormalAttribute(
+        ORT_RETURN_IF_ERROR(CanonicalizeFormalAttributeWithinBudget(
             normalized_pattern.formal_attributes[occurrence.formal_attribute_id].formal_name,
             normalized_pattern.formal_attributes[occurrence.formal_attribute_id].type,
             schema_attribute->second.default_value,
             normalized_pattern.max_attribute_bytes,
+            aggregate_attribute_bytes,
             canonical_default));
       }
     }
