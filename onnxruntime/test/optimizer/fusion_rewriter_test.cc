@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <tuple>
 #include <type_traits>
 
 #include "gtest/gtest.h"
@@ -1934,6 +1935,51 @@ TEST_F(FusionRewriterTest, ZeroRuleAttemptBudgetDoesNoWork) {
   EXPECT_FALSE(result.status.IsOK());
   EXPECT_EQ(result.replacements_applied, 0u);
   EXPECT_EQ(SerializeGraph(model->MainGraph()), before);
+}
+
+TEST_F(FusionRewriterTest, WorkUnitBudgetIsCumulativeAcrossRules) {
+  const auto apply = [](size_t max_work_units, size_t rule_count) {
+    auto model = MakeTwoIdentityModel();
+    std::vector<FusionRule> rules;
+    for (size_t i = 0; i < rule_count; ++i) {
+      rules.push_back(MakeRule(
+          MakeTwoIdentityPattern("Rule" + std::to_string(i)),
+          MakeFastGeluReplacement(), MakeConstraints(), {},
+          FusionRuleOptions{
+              static_cast<FusionRuleId>(i + 1),
+              "rule-" + std::to_string(i), 0}));
+    }
+    FusionRuleSetOptions options;
+    options.max_work_units = max_work_units;
+    const std::string before = SerializeGraph(model->MainGraph());
+    FusionRewriteResult result =
+        MakeRuleSet(std::move(rules), options)->Apply(*model);
+    return std::tuple{
+        std::move(result),
+        SerializeGraph(model->MainGraph()) == before};
+  };
+
+  size_t single_rule_budget = 0;
+  for (size_t budget = 1; budget <= 1024; ++budget) {
+    auto [result, graph_unchanged] = apply(budget, 1);
+    if (result.status.IsOK() && result.replacements_applied == 1) {
+      single_rule_budget = budget;
+      break;
+    }
+  }
+  ASSERT_NE(single_rule_budget, 0u);
+
+  auto [single_result, single_graph_unchanged] =
+      apply(single_rule_budget, 1);
+  ASSERT_STATUS_OK(single_result.status);
+  EXPECT_EQ(single_result.replacements_applied, 1u);
+  EXPECT_FALSE(single_graph_unchanged);
+
+  auto [combined_result, combined_graph_unchanged] =
+      apply(single_rule_budget, 2);
+  EXPECT_FALSE(combined_result.status.IsOK());
+  EXPECT_EQ(combined_result.replacements_applied, 0u);
+  EXPECT_TRUE(combined_graph_unchanged);
 }
 
 TEST_F(FusionRewriterTest, ReplacementBudgetFailsBeforeCurrentBatchMutates) {
