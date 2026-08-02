@@ -13,8 +13,8 @@
 
 namespace onnxruntime::fusion_rewriter_internal {
 
-struct FusionRuleInternal {
-  FusionRuleInternal(
+struct NormalizedFusionRule {
+  NormalizedFusionRule(
       const PatternFunctionProto& pattern,
       FusionReplacementCall replacement,
       const ConstraintProgramDefinition& constraints,
@@ -33,7 +33,7 @@ struct FusionRuleInternal {
 };
 
 struct CompiledFusionRule {
-  const FusionRuleInternal* rule{};
+  const NormalizedFusionRule* rule{};
   function_extractor_internal::CompiledFunctionPattern compiled_pattern;
   const ONNX_NAMESPACE::OpSchema* replacement_schema{};
   std::string canonical_replacement_domain;
@@ -41,7 +41,7 @@ struct CompiledFusionRule {
 
 struct FusionRuleSetState {
   FusionRuleSetOptions options;
-  std::vector<std::unique_ptr<FusionRuleInternal>> normalized_rules;
+  std::vector<std::unique_ptr<NormalizedFusionRule>> normalized_rules;
   common::Status construction_status{common::Status::OK()};
 };
 
@@ -70,12 +70,12 @@ FunctionExtractorOptions MakeMatcherOptions(
     const FusionRuleSetOptions& options);
 
 common::Status CompileFusionRule(
-    const FusionRuleInternal& rule,
+    const NormalizedFusionRule& rule,
     const Graph& graph,
     CompiledFusionRule& compiled_rule);
 
 common::Status ValidateReplacementMappings(
-    const FusionRuleInternal& rule);
+    const NormalizedFusionRule& rule);
 
 common::Status MaterializeFusionReplacementPlan(
     const CompiledFusionRule& compiled_rule,

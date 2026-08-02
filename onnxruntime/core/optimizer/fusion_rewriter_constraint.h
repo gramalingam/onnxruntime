@@ -361,7 +361,7 @@ struct FusionConstraintProgram::Impl {
 
 // This friend of FusionMatchContext is the sole internal constructor path for
 // the ephemeral opaque callback view.
-struct FusionRuleInternal {
+struct FusionPredicateInvoker {
   static common::Status InvokePredicate(
       const FusionMatchPredicate& predicate,
       const function_extractor_internal::NormalizedFunctionPattern& pattern,

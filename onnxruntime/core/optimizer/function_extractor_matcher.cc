@@ -102,40 +102,6 @@ bool NodeSignatureMatches(const ResolvedPatternNode& pattern_node, const Node& t
   return true;
 }
 
-void AppendKeyPart(std::string_view part, std::string& key) {
-  key += std::to_string(part.size());
-  key.push_back(':');
-  key.append(part);
-  key.push_back(';');
-}
-
-std::string SignatureKey(std::string_view domain,
-                         std::string_view op_type,
-                         std::string_view overload,
-                         int since_version,
-                         size_t input_arity,
-                         size_t output_arity) {
-  std::string key;
-  AppendKeyPart(domain, key);
-  AppendKeyPart(op_type, key);
-  AppendKeyPart(overload, key);
-  AppendKeyPart(std::to_string(since_version), key);
-  AppendKeyPart(std::to_string(input_arity), key);
-  AppendKeyPart(std::to_string(output_arity), key);
-  return key;
-}
-
-std::string SignatureKey(const ResolvedPatternNode& node) {
-  return SignatureKey(node.canonical_domain, node.op_type, node.overload,
-                      node.since_version, node.input_arity, node.output_arity);
-}
-
-std::string SignatureKey(const Node& node) {
-  return SignatureKey(node.Domain(), node.OpType(), node.Overload(),
-                      node.SinceVersion(), node.InputDefs().size(),
-                      node.OutputDefs().size());
-}
-
 Status MatchLiteral(const PatternValue& pattern_value,
                     const NodeArg& target_value,
                     const TargetGraphSnapshot& snapshot,
@@ -186,7 +152,31 @@ struct CandidateMatcher {
   size_t& aggregate_work_units;
   size_t primary_output_group;
   const CompleteBindingHook* complete_binding_hook;
+  bool allow_omitted_optional_formal_inputs;
+  bool capture_failure;
   MatchState state;
+  MatcherFailure failure;
+
+  void Reject(MatcherFailureStage stage, MatcherFailureCode code,
+              std::optional<PatternNodeId> pattern_node = std::nullopt,
+              std::optional<PatternValueId> pattern_value = std::nullopt,
+              std::optional<NodeIndex> target_node = std::nullopt,
+              std::optional<size_t> target_slot = std::nullopt,
+              std::string_view detail = {}) {
+    if (!capture_failure) {
+      return;
+    }
+    failure.valid = true;
+    failure.stage = stage;
+    failure.code = code;
+    failure.pattern_node = pattern_node;
+    failure.pattern_value = pattern_value;
+    failure.target_node = target_node;
+    failure.target_slot = target_slot;
+    failure.pattern_nodes_matched =
+        state.target_node_to_pattern.size();
+    failure.detail = detail;
+  }
 
   Status ConsumeWork() {
     ORT_RETURN_IF(aggregate_work_units >= options.max_worklist_bindings,
@@ -205,16 +195,27 @@ struct CandidateMatcher {
 
   Status Schedule(PatternValueId pattern_value_id, const NodeArg* target_value, bool& matched) {
     if (target_value == nullptr || !target_value->Exists()) {
+      Reject(MatcherFailureStage::kValueBinding,
+             MatcherFailureCode::kRepeatedBindingMismatch,
+             std::nullopt, pattern_value_id);
       matched = false;
       return Status::OK();
     }
     if (!PatternTypeCompatible(compiled.normalized_pattern->values[pattern_value_id], *target_value)) {
+      Reject(MatcherFailureStage::kValueBinding,
+             MatcherFailureCode::kRepeatedBindingMismatch,
+             std::nullopt, pattern_value_id);
       matched = false;
       return Status::OK();
     }
     auto& visit_state = state.value_visit_states[pattern_value_id];
     if (visit_state != ValueVisitState::Unseen) {
       matched = state.pattern_value_to_target[pattern_value_id] == target_value;
+      if (!matched) {
+        Reject(MatcherFailureStage::kValueBinding,
+               MatcherFailureCode::kRepeatedBindingMismatch,
+               std::nullopt, pattern_value_id);
+      }
       return Status::OK();
     }
     ORT_RETURN_IF_ERROR(ConsumeWork());
@@ -263,6 +264,10 @@ struct CandidateMatcher {
     const auto* target_attribute =
         EffectiveTargetAttribute(target_node, occurrence.operator_attribute_name);
     if (target_attribute == nullptr) {
+      Reject(MatcherFailureStage::kAttributeBinding,
+             MatcherFailureCode::kMissingEffectiveAttribute,
+             std::nullopt, std::nullopt, target_node.Index(),
+             std::nullopt, occurrence.operator_attribute_name);
       matched = false;
       return Status::OK();
     }
@@ -285,6 +290,10 @@ struct CandidateMatcher {
       ORT_RETURN_IF_ERROR(
           CompareFormalAttributes(*binding, canonical, options.max_attribute_bytes, equal));
       if (!equal) {
+        Reject(MatcherFailureStage::kAttributeBinding,
+               MatcherFailureCode::kAttributeValueMismatch,
+               std::nullopt, std::nullopt, target_node.Index(),
+               std::nullopt, occurrence.operator_attribute_name);
         matched = false;
         return Status::OK();
       }
@@ -303,6 +312,9 @@ struct CandidateMatcher {
     const auto target_producer = snapshot.producers.find(&target_value);
     if (target_producer == snapshot.producers.end() ||
         target_producer->second.output_index != pattern_value.producer_output_index) {
+      Reject(MatcherFailureStage::kStructuralEdge,
+             MatcherFailureCode::kOutputSlotMismatch,
+             pattern_value.producer_node_id, value_id);
       matched = false;
       return Status::OK();
     }
@@ -314,6 +326,9 @@ struct CandidateMatcher {
         !NodeSignatureMatches(compiled.resolved_nodes[pattern_node_id], *target_node) ||
         !target_node->GetExecutionProviderType().empty() ||
         snapshot.control_edge_nodes.find(target_node_index) != snapshot.control_edge_nodes.end()) {
+      Reject(MatcherFailureStage::kStructuralNode,
+             MatcherFailureCode::kOpMismatch, pattern_node_id, value_id,
+             target_node_index);
       matched = false;
       return Status::OK();
     }
@@ -322,9 +337,17 @@ struct CandidateMatcher {
     bool newly_mapped = false;
     if (mapped_target != std::numeric_limits<NodeIndex>::max()) {
       matched = mapped_target == target_node_index;
+      if (!matched) {
+        Reject(MatcherFailureStage::kValueBinding,
+               MatcherFailureCode::kRepeatedBindingMismatch,
+               pattern_node_id, value_id, target_node_index);
+      }
       if (!matched) return Status::OK();
     } else {
       if (state.target_node_to_pattern.find(target_node_index) != state.target_node_to_pattern.end()) {
+        Reject(MatcherFailureStage::kValueBinding,
+               MatcherFailureCode::kRepeatedBindingMismatch,
+               pattern_node_id, value_id, target_node_index);
         matched = false;
         return Status::OK();
       }
@@ -347,12 +370,20 @@ struct CandidateMatcher {
       const auto* target_output = target_node->OutputDefs()[output_index];
       if (pattern_output == kMissingPatternValue) {
         if (target_output != nullptr && target_output->Exists()) {
+          Reject(MatcherFailureStage::kStructuralEdge,
+                 MatcherFailureCode::kOutputSlotMismatch,
+                 pattern_node_id, std::nullopt, target_node_index,
+                 output_index);
           matched = false;
           return Status::OK();
         }
         continue;
       }
       if (target_output == nullptr || !target_output->Exists()) {
+        Reject(MatcherFailureStage::kStructuralEdge,
+               MatcherFailureCode::kOutputSlotMismatch,
+               pattern_node_id, pattern_output, target_node_index,
+               output_index);
         matched = false;
         return Status::OK();
       }
@@ -368,17 +399,41 @@ struct CandidateMatcher {
               : nullptr;
       if (pattern_input == kMissingPatternValue) {
         if (target_input != nullptr && target_input->Exists()) {
+          Reject(MatcherFailureStage::kStructuralEdge,
+                 MatcherFailureCode::kOutputSlotMismatch,
+                 pattern_node_id, std::nullopt, target_node_index,
+                 input_index);
           matched = false;
           return Status::OK();
         }
         continue;
       }
       if (target_input == nullptr || !target_input->Exists()) {
-        if (normalized.values[pattern_input].is_formal_input) {
-          state.value_visit_states[pattern_input] =
-              ValueVisitState::Processed;
+        const auto& resolved_node = compiled.resolved_nodes[pattern_node_id];
+        const bool is_optional_formal_input =
+            normalized.values[pattern_input].is_formal_input &&
+            input_index < resolved_node.schema->inputs().size() &&
+            resolved_node.schema->inputs()[input_index].GetOption() ==
+                ONNX_NAMESPACE::OpSchema::Optional;
+        if (allow_omitted_optional_formal_inputs &&
+            is_optional_formal_input) {
+          auto& visit_state = state.value_visit_states[pattern_input];
+          if (visit_state == ValueVisitState::Unseen) {
+            visit_state = ValueVisitState::Processed;
+          } else if (state.pattern_value_to_target[pattern_input] != nullptr) {
+            Reject(MatcherFailureStage::kValueBinding,
+                   MatcherFailureCode::kRepeatedBindingMismatch,
+                   pattern_node_id, pattern_input, target_node_index,
+                   input_index);
+            matched = false;
+            return Status::OK();
+          }
           continue;
         }
+        Reject(MatcherFailureStage::kStructuralEdge,
+               MatcherFailureCode::kOutputSlotMismatch,
+               pattern_node_id, pattern_input, target_node_index,
+               input_index);
         matched = false;
         return Status::OK();
       }
@@ -401,6 +456,9 @@ struct CandidateMatcher {
       const auto& group = compiled.formal_output_producer_groups[group_index];
       const auto* target_node = snapshot.graph_viewer->GetNode(output_root_nodes[group_index]);
       if (target_node == nullptr) {
+        Reject(MatcherFailureStage::kStructuralNode,
+               MatcherFailureCode::kOpMismatch,
+               group.producer_node_id);
         matched = false;
         return Status::OK();
       }
@@ -409,6 +467,10 @@ struct CandidateMatcher {
         const auto formal_output_index = group.formal_output_indices[i];
         const auto target_output_index = group.producer_output_indices[i];
         if (target_output_index >= target_node->OutputDefs().size()) {
+          Reject(MatcherFailureStage::kStructuralEdge,
+                 MatcherFailureCode::kOutputSlotMismatch,
+                 group.producer_node_id, std::nullopt,
+                 target_node->Index(), target_output_index);
           matched = false;
           return Status::OK();
         }
@@ -442,7 +504,16 @@ struct CandidateMatcher {
         LiteralWitness witness;
         ORT_RETURN_IF_ERROR(MatchLiteral(pattern_value, *target_value, snapshot, options,
                                          literal_bytes_compared, witness, matched));
-        if (!matched) return Status::OK();
+        if (!matched) {
+          Reject(MatcherFailureStage::kLiteral,
+                 MatcherFailureCode::kLiteralMismatch,
+                 std::nullopt, value_id, std::nullopt,
+                 std::nullopt, "tensor literal differs");
+          if (capture_failure) {
+            failure.target_value_name = target_value->Name();
+          }
+          return Status::OK();
+        }
         witness.pattern_value_id = value_id;
         state.literal_witnesses.push_back(std::move(witness));
         continue;
@@ -453,12 +524,16 @@ struct CandidateMatcher {
 
     for (const auto mapped_node : state.pattern_node_to_target) {
       if (mapped_node == std::numeric_limits<NodeIndex>::max()) {
+        Reject(MatcherFailureStage::kFinalValidation,
+               MatcherFailureCode::kOpMismatch);
         matched = false;
         return Status::OK();
       }
     }
     for (const auto& binding : state.formal_attribute_bindings) {
       if (!binding.has_value()) {
+        Reject(MatcherFailureStage::kFinalValidation,
+               MatcherFailureCode::kMissingEffectiveAttribute);
         matched = false;
         return Status::OK();
       }
@@ -467,6 +542,9 @@ struct CandidateMatcher {
                                                  state.formal_input_bindings.end());
     for (const auto& witness : state.literal_witnesses) {
       if (formal_inputs.find(witness.target_value) != formal_inputs.end()) {
+        Reject(MatcherFailureStage::kFinalValidation,
+               MatcherFailureCode::kRepeatedBindingMismatch,
+               std::nullopt, witness.pattern_value_id);
         matched = false;
         return Status::OK();
       }
@@ -497,6 +575,8 @@ struct CandidateMatcher {
                 return snapshot.topological_positions.at(lhs) < snapshot.topological_positions.at(rhs);
               });
     if (plan.removable_node_indices.size() <= 1) {
+      Reject(MatcherFailureStage::kFinalValidation,
+             MatcherFailureCode::kOpMismatch);
       matched = false;
       return Status::OK();
     }
@@ -508,6 +588,8 @@ struct CandidateMatcher {
       const auto producer = snapshot.producers.find(formal_input);
       if (producer != snapshot.producers.end() &&
           removable.find(producer->second.node_index) != removable.end()) {
+        Reject(MatcherFailureStage::kClosure,
+               MatcherFailureCode::kExternalPrivateUse);
         matched = false;
         return Status::OK();
       }
@@ -521,6 +603,8 @@ struct CandidateMatcher {
         annotation = node->GetLayeringAnnotation();
         first_node = false;
       } else if (node->GetLayeringAnnotation() != annotation) {
+        Reject(MatcherFailureStage::kFinalValidation,
+               MatcherFailureCode::kOpMismatch);
         matched = false;
         return Status::OK();
       }
@@ -534,6 +618,9 @@ struct CandidateMatcher {
       const auto* target_value = state.pattern_value_to_target[value_id];
       if (target_value == nullptr) continue;
       if (snapshot.graph_outputs.find(target_value) != snapshot.graph_outputs.end()) {
+        Reject(MatcherFailureStage::kClosure,
+               MatcherFailureCode::kExternalPrivateUse,
+               pattern_value.producer_node_id, value_id);
         matched = false;
         return Status::OK();
       }
@@ -542,6 +629,10 @@ struct CandidateMatcher {
         for (const auto& consumer : explicit_consumers->second) {
           ORT_RETURN_IF_ERROR(ConsumeWork());
           if (removable.find(consumer.node_index) == removable.end()) {
+            Reject(MatcherFailureStage::kClosure,
+                   MatcherFailureCode::kExternalPrivateUse,
+                   pattern_value.producer_node_id, value_id,
+                   consumer.node_index, consumer.input_index);
             matched = false;
             return Status::OK();
           }
@@ -552,6 +643,9 @@ struct CandidateMatcher {
         for (const auto consumer : implicit_consumers->second) {
           ORT_RETURN_IF_ERROR(ConsumeWork());
           if (removable.find(consumer) == removable.end()) {
+            Reject(MatcherFailureStage::kClosure,
+                   MatcherFailureCode::kExternalPrivateUse,
+                   pattern_value.producer_node_id, value_id, consumer);
             matched = false;
             return Status::OK();
           }
@@ -602,6 +696,9 @@ struct CandidateMatcher {
           for (const auto& consumer : explicit_consumers->second) {
             ORT_RETURN_IF_ERROR(ConsumeWork());
             if (removable.find(consumer.node_index) != removable.end()) {
+              Reject(MatcherFailureStage::kConvexity,
+                     MatcherFailureCode::kNonConvex,
+                     std::nullopt, std::nullopt, consumer.node_index);
               matched = false;
               return Status::OK();
             }
@@ -612,6 +709,9 @@ struct CandidateMatcher {
           for (const auto consumer : implicit_consumers->second) {
             ORT_RETURN_IF_ERROR(ConsumeWork());
             if (removable.find(consumer) != removable.end()) {
+              Reject(MatcherFailureStage::kConvexity,
+                     MatcherFailureCode::kNonConvex,
+                     std::nullopt, std::nullopt, consumer);
               matched = false;
               return Status::OK();
             }
@@ -689,7 +789,6 @@ bool PlansConflict(const ReplacementPlan& lhs, const ReplacementPlan& rhs) {
 
 Status BuildTargetGraphSnapshot(
     const Graph& graph,
-    const CompiledFunctionPattern& compiled_pattern,
     const FunctionExtractorOptions& options,
     TargetGraphSnapshot& snapshot) {
   snapshot = TargetGraphSnapshot{};
@@ -699,8 +798,6 @@ Status BuildTargetGraphSnapshot(
                 "FunctionExtractor target node budget exceeded.");
   const auto& topological_order = snapshot.graph_viewer->GetNodesInTopologicalOrder();
   snapshot.topological_node_indices.assign(topological_order.begin(), topological_order.end());
-  snapshot.root_candidates_by_group.resize(
-      compiled_pattern.formal_output_producer_groups.size());
   InlinedHashMap<std::string, NodeIndex> node_indices_by_name;
   for (const auto node_index : snapshot.topological_node_indices) {
     const auto* node = snapshot.graph_viewer->GetNode(node_index);
@@ -708,7 +805,6 @@ Status BuildTargetGraphSnapshot(
                   "FunctionExtractor requires a resolved target graph.");
     node_indices_by_name.emplace(node->Name(), node_index);
   }
-  size_t candidate_entry_count = 0;
   for (size_t position = 0; position < snapshot.topological_node_indices.size(); ++position) {
     const auto node_index = snapshot.topological_node_indices[position];
     snapshot.topological_positions.emplace(node_index, position);
@@ -739,29 +835,6 @@ Status BuildTargetGraphSnapshot(
         snapshot.implicit_consumers[implicit_input].push_back(node_index);
       }
     }
-    for (size_t group_index = 0;
-         group_index <
-         compiled_pattern.formal_output_producer_groups.size();
-         ++group_index) {
-      ORT_RETURN_IF(snapshot.aggregate_work_units >=
-                        options.max_worklist_bindings,
-                    "FunctionExtractor aggregate root-index work budget exceeded.");
-      ++snapshot.aggregate_work_units;
-      const auto pattern_node_id =
-          compiled_pattern.formal_output_producer_groups[group_index]
-              .producer_node_id;
-      if (!NodeSignatureMatches(
-              compiled_pattern.resolved_nodes[pattern_node_id],
-              *node)) {
-        continue;
-      }
-      ORT_RETURN_IF(candidate_entry_count >=
-                        options.max_output_root_tuples,
-                    "FunctionExtractor root candidate-entry budget exceeded.");
-      snapshot.root_candidates_by_group[group_index].push_back(
-          node_index);
-      ++candidate_entry_count;
-    }
   }
   for (const auto* output : snapshot.graph_viewer->GetOutputs()) {
     snapshot.graph_outputs.insert(output);
@@ -774,17 +847,27 @@ Status BuildTargetGraphSnapshot(
   return Status::OK();
 }
 
+Status BuildTargetGraphSnapshot(
+    const Graph& graph,
+    const CompiledFunctionPattern&,
+    const FunctionExtractorOptions& options,
+    TargetGraphSnapshot& snapshot) {
+  return BuildTargetGraphSnapshot(graph, options, snapshot);
+}
+
 Status DiscoverReplacementPlans(
     const CompiledFunctionPattern& compiled_pattern,
     const TargetGraphSnapshot& snapshot,
     const FunctionExtractorOptions& options,
     std::vector<ReplacementPlan>& plans,
     MatcherDiagnostics* diagnostics,
-    const CompleteBindingHook* complete_binding_hook) {
+    const CompleteBindingHook* complete_binding_hook,
+    const MatcherExecutionOptions& execution_options) {
   plans.clear();
   const auto& groups = compiled_pattern.formal_output_producer_groups;
   ORT_RETURN_IF(groups.empty(), "FunctionExtractor pattern has no formal output producer.");
-  const auto& candidates = snapshot.root_candidates_by_group;
+  InlinedVector<InlinedVector<NodeIndex>> candidates(groups.size());
+  size_t candidate_entry_count = 0;
 
   size_t tuple_count = 0;
   size_t literal_bytes_compared = 0;
@@ -793,6 +876,23 @@ Status DiscoverReplacementPlans(
   ORT_RETURN_IF(attribute_payload_bytes_inspected > options.max_attribute_bytes,
                 "FunctionExtractor attribute byte budget exceeded.");
   size_t aggregate_work_units = snapshot.aggregate_work_units;
+  for (const auto node_index : snapshot.topological_node_indices) {
+    const auto* node = snapshot.graph_viewer->GetNode(node_index);
+    for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
+      ORT_RETURN_IF(aggregate_work_units >= options.max_worklist_bindings,
+                    "FunctionExtractor aggregate root-index work budget exceeded.");
+      ++aggregate_work_units;
+      const auto pattern_node_id = groups[group_index].producer_node_id;
+      if (!NodeSignatureMatches(
+              compiled_pattern.resolved_nodes[pattern_node_id], *node)) {
+        continue;
+      }
+      ORT_RETURN_IF(candidate_entry_count >= options.max_output_root_tuples,
+                    "FunctionExtractor root candidate-entry budget exceeded.");
+      candidates[group_index].push_back(node_index);
+      ++candidate_entry_count;
+    }
+  }
   InlinedVector<NodeIndex> tuple(groups.size(), std::numeric_limits<NodeIndex>::max());
   InlinedVector<size_t> group_order(groups.size());
   for (size_t i = 0; i < group_order.size(); ++i) group_order[i] = i;
@@ -817,19 +917,55 @@ Status DiscoverReplacementPlans(
             MatcherError("output-root tuple budget exceeded");
         return;
       }
+      if (execution_options.total_attempts != nullptr) {
+        if (*execution_options.total_attempts >=
+            execution_options.max_attempts) {
+          enumeration_status =
+              MatcherError("rule-attempt budget exceeded");
+          return;
+        }
+        ++*execution_options.total_attempts;
+      }
       if (diagnostics != nullptr) ++diagnostics->output_root_tuples_considered;
       CandidateMatcher matcher{compiled_pattern, snapshot, options, diagnostics,
                                literal_bytes_compared, attribute_payload_bytes_inspected,
                                aggregate_work_units,
-                               primary_output_group, complete_binding_hook};
+                               primary_output_group, complete_binding_hook,
+                               execution_options
+                                   .allow_omitted_optional_formal_inputs,
+                               execution_options.failure_hook != nullptr};
+      matcher.state.anchor_node = tuple[primary_output_group];
+      matcher.state.anchor_output_slot =
+          groups[primary_output_group].producer_output_indices.front();
+      matcher.state.anchor_rank =
+          snapshot.topological_node_indices.size() - 1 -
+          snapshot.topological_positions.at(matcher.state.anchor_node);
+      matcher.state.tuple_ordinal = tuple_count - 1;
       ReplacementPlan plan;
       bool matched = false;
       enumeration_status = matcher.Run(tuple, plan, matched);
-      if (!enumeration_status.IsOK() || !matched) return;
+      if (!enumeration_status.IsOK()) return;
+      if (!matched) {
+        if (execution_options.failure_hook != nullptr &&
+            matcher.failure.valid) {
+          (*execution_options.failure_hook)(
+              matcher.failure, matcher.state.anchor_node,
+              matcher.state.anchor_output_slot,
+              matcher.state.anchor_rank, matcher.state.tuple_ordinal);
+        }
+        return;
+      }
       if (diagnostics != nullptr) {
         ++diagnostics->structurally_matched_candidates;
         ++diagnostics->accepted_candidates;
       }
+      plan.anchor_rank =
+          snapshot.topological_node_indices.size() - 1 -
+          plan.primary_root_topological_position;
+      plan.anchor_node = matcher.state.anchor_node;
+      plan.anchor_output_slot =
+          matcher.state.anchor_output_slot;
+      plan.tuple_ordinal = tuple_count - 1;
       plans.push_back(std::move(plan));
       return;
     }

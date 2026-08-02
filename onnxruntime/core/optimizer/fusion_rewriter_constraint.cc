@@ -392,6 +392,48 @@ TruthValue CompareDimensions(const DimensionFact& lhs,
   return TruthValue::kUnknown;
 }
 
+TruthValue CompareDimensionClass(gsl::span<const DimensionFact> facts) {
+  if (facts.size() < 2) {
+    return TruthValue::kTrue;
+  }
+  std::optional<int64_t> concrete_value;
+  std::optional<std::string_view> symbol;
+  bool has_unknown_comparison = false;
+  for (const auto& fact : facts) {
+    switch (fact.kind) {
+      case DimensionFactKind::kUnknown:
+        has_unknown_comparison = true;
+        break;
+      case DimensionFactKind::kValue:
+        if (concrete_value.has_value() &&
+            *concrete_value != fact.value) {
+          return TruthValue::kFalse;
+        }
+        concrete_value = fact.value;
+        if (symbol.has_value()) {
+          has_unknown_comparison = true;
+        }
+        break;
+      case DimensionFactKind::kSymbol:
+        if (fact.symbol.empty()) {
+          has_unknown_comparison = true;
+          break;
+        }
+        if (symbol.has_value() && *symbol != fact.symbol) {
+          has_unknown_comparison = true;
+        } else if (!symbol.has_value()) {
+          symbol = fact.symbol;
+        }
+        if (concrete_value.has_value()) {
+          has_unknown_comparison = true;
+        }
+        break;
+    }
+  }
+  return has_unknown_comparison ? TruthValue::kUnknown
+                                : TruthValue::kTrue;
+}
+
 DimensionFact DimensionFromProto(
     const ONNX_NAMESPACE::TensorShapeProto_Dimension& dimension) {
   DimensionFact result;
@@ -1420,7 +1462,6 @@ Status EvaluateConstraintProgram(
                     "Compiled fusion constraint predicate is missing.");
 
   for (const auto& dimension_class : program.dimension_classes) {
-    TruthValue class_value = TruthValue::kTrue;
     std::vector<DimensionFact> facts;
     facts.reserve(dimension_class.dimensions.size());
     for (const auto& dimension : dimension_class.dimensions) {
@@ -1437,12 +1478,7 @@ Status EvaluateConstraintProgram(
         facts.push_back(fact);
       }
     }
-    for (size_t lhs = 0; lhs < facts.size(); ++lhs) {
-      for (size_t rhs = lhs + 1; rhs < facts.size(); ++rhs) {
-        class_value = MergeEquality(
-            class_value, CompareDimensions(facts[lhs], facts[rhs]));
-      }
-    }
+    const TruthValue class_value = CompareDimensionClass(facts);
     if (!ApplyUnknownPolicy(class_value, dimension_class.unknown_policy)) {
       result.satisfied = false;
       result.detail = dimension_class.label.empty()
@@ -2670,7 +2706,7 @@ FusionAttributeView FusionMatchContext::EffectiveAttribute(
   return FusionAttributeView(&impl_->attributes.back());
 }
 
-common::Status FusionRuleInternal::InvokePredicate(
+common::Status FusionPredicateInvoker::InvokePredicate(
     const FusionMatchPredicate& predicate,
     const function_extractor_internal::NormalizedFunctionPattern& pattern,
     const function_extractor_internal::CompiledFunctionPattern&

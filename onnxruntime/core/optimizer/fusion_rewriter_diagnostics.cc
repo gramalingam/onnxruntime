@@ -391,23 +391,23 @@ FusionDiagnosticMode FailureSink::Mode() const noexcept {
 void FailureSink::RegisterRule(FusionRuleId rule_id,
                                int32_t anchor_local_priority,
                                size_t registration_order) {
-  FusionDiagnosticsTestAccess::RegisterRule(
+  FusionDiagnosticsAccess::RegisterRule(
       collector_, rule_id, anchor_local_priority, registration_order);
 }
 
 void FailureSink::RecordFailure(const FusionFailureRecord& record,
                                 size_t epoch, size_t anchor_rank,
                                 size_t tuple_ordinal) {
-  FusionDiagnosticsTestAccess::RecordFailure(
+  FusionDiagnosticsAccess::RecordFailure(
       collector_, record, epoch, anchor_rank, tuple_ordinal);
 }
 
 void FailureSink::RecordSuccess(FusionRuleId rule_id) {
-  FusionDiagnosticsTestAccess::RecordSuccess(collector_, rule_id);
+  FusionDiagnosticsAccess::RecordSuccess(collector_, rule_id);
 }
 
 void FailureSink::RecordSuccess(const FusionFailureRecord& record) {
-  FusionDiagnosticsTestAccess::RecordSuccessEvent(collector_, record);
+  FusionDiagnosticsAccess::RecordSuccessEvent(collector_, record);
 }
 
 MatchAttempt::MatchAttempt(FailureSink& failure_sink,
@@ -470,7 +470,7 @@ common::Status CreateFailureSink(
 
   if (mode == FusionDiagnosticMode::kOff) {
     if (collector != nullptr) {
-      FusionDiagnosticsTestAccess::Configure(
+      FusionDiagnosticsAccess::Configure(
           *collector, mode, max_records, max_bytes);
     }
     return common::Status::OK();
@@ -482,13 +482,13 @@ common::Status CreateFailureSink(
         "FusionTraceCollector must be non-null when fusion diagnostics are enabled.");
   }
 
-  FusionDiagnosticsTestAccess::Configure(
+  FusionDiagnosticsAccess::Configure(
       *collector, mode, max_records, max_bytes);
   failure_sink = std::make_unique<FailureSink>(*collector, mode);
   return common::Status::OK();
 }
 
-void FusionDiagnosticsTestAccess::Configure(
+void FusionDiagnosticsAccess::Configure(
     FusionTraceCollector& collector,
     FusionDiagnosticMode mode,
     size_t max_records,
@@ -499,7 +499,7 @@ void FusionDiagnosticsTestAccess::Configure(
   collector.impl_->max_bytes = max_bytes;
 }
 
-void FusionDiagnosticsTestAccess::RecordFailure(
+void FusionDiagnosticsAccess::RecordFailure(
     FusionTraceCollector& collector,
     const FusionFailureRecord& record,
     size_t epoch,
@@ -534,7 +534,7 @@ void FusionDiagnosticsTestAccess::RecordFailure(
   impl.RecordBestFailure(record, score);
 }
 
-void FusionDiagnosticsTestAccess::RecordSuccess(
+void FusionDiagnosticsAccess::RecordSuccess(
     FusionTraceCollector& collector,
     FusionRuleId rule_id) {
   FusionFailureRecord record;
@@ -543,7 +543,7 @@ void FusionDiagnosticsTestAccess::RecordSuccess(
   RecordSuccessEvent(collector, record);
 }
 
-void FusionDiagnosticsTestAccess::RegisterRule(
+void FusionDiagnosticsAccess::RegisterRule(
     FusionTraceCollector& collector,
     FusionRuleId rule_id,
     int32_t anchor_local_priority,
@@ -559,7 +559,7 @@ void FusionDiagnosticsTestAccess::RegisterRule(
   impl.all_failure_best_cache_dirty = true;
 }
 
-void FusionDiagnosticsTestAccess::RecordSuccessEvent(
+void FusionDiagnosticsAccess::RecordSuccessEvent(
     FusionTraceCollector& collector,
     const FusionFailureRecord& input_record) {
   auto& impl = *collector.impl_;
@@ -580,6 +580,31 @@ void FusionDiagnosticsTestAccess::RecordSuccessEvent(
       impl.mode == FusionDiagnosticMode::kDryRun) {
     static_cast<void>(impl.AppendRecord(record));
   }
+}
+
+void FusionDiagnosticsTestAccess::Configure(
+    FusionTraceCollector& collector,
+    FusionDiagnosticMode mode,
+    size_t max_records,
+    size_t max_bytes) {
+  FusionDiagnosticsAccess::Configure(
+      collector, mode, max_records, max_bytes);
+}
+
+void FusionDiagnosticsTestAccess::RecordFailure(
+    FusionTraceCollector& collector,
+    const FusionFailureRecord& record,
+    size_t epoch,
+    size_t anchor_rank,
+    size_t tuple_ordinal) {
+  FusionDiagnosticsAccess::RecordFailure(
+      collector, record, epoch, anchor_rank, tuple_ordinal);
+}
+
+void FusionDiagnosticsTestAccess::RecordSuccess(
+    FusionTraceCollector& collector,
+    FusionRuleId rule_id) {
+  FusionDiagnosticsAccess::RecordSuccess(collector, rule_id);
 }
 
 }  // namespace fusion_rewriter_internal

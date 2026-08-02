@@ -64,6 +64,14 @@ struct FusionExecutionControls {
   void* epoch_observer_state{};
 };
 
+class FusionRuleSetExecution final {
+ public:
+  static FusionRewriteResult Apply(
+      const FusionRuleSet& rule_set, Graph& graph,
+      const FusionExecutionControls& controls,
+      FusionTraceCollector* trace);
+};
+
 class FusionRuleSetTestAccess final {
  public:
   static common::Status DiscoverPlans(

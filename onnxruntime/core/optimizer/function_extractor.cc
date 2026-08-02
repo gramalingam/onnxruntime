@@ -128,7 +128,7 @@ FunctionExtractionResult ExtractGraph(
     std::vector<ReplacementPlan> selected_plans;
     {
       TargetGraphSnapshot snapshot;
-      result.status = BuildTargetGraphSnapshot(graph, compiled_pattern, options, snapshot);
+      result.status = BuildTargetGraphSnapshot(graph, options, snapshot);
       if (!result.status.IsOK()) return result;
 
       std::vector<ReplacementPlan> discovered_plans;

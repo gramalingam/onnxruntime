@@ -38,7 +38,7 @@ FunctionExtractorOptions MakeMatcherOptions(
   return matcher_options;
 }
 
-FusionRuleInternal::FusionRuleInternal(
+NormalizedFusionRule::NormalizedFusionRule(
     const PatternFunctionProto& pattern_proto,
     FusionReplacementCall replacement_call,
     const ConstraintProgramDefinition& constraint_program,
@@ -74,7 +74,7 @@ FusionRuleInternal::FusionRuleInternal(
 }
 
 common::Status ValidateReplacementMappings(
-    const FusionRuleInternal& rule) {
+    const NormalizedFusionRule& rule) {
   const auto& replacement = rule.replacement;
   const auto& normalized = rule.normalized_pattern;
   ORT_RETURN_IF(replacement.op_type.empty(),
@@ -131,7 +131,7 @@ common::Status ValidateReplacementMappings(
 }
 
 common::Status CompileFusionRule(
-    const FusionRuleInternal& rule,
+    const NormalizedFusionRule& rule,
     const Graph& graph,
     CompiledFusionRule& compiled_rule) {
   ORT_RETURN_IF_ERROR(rule.construction_status);

@@ -69,6 +69,25 @@ common::Status CreateFailureSink(
     size_t max_bytes,
     std::unique_ptr<FailureSink>& failure_sink);
 
+class FusionDiagnosticsAccess final {
+ public:
+  static void Configure(FusionTraceCollector& collector,
+                        FusionDiagnosticMode mode,
+                        size_t max_records, size_t max_bytes);
+  static void RegisterRule(FusionTraceCollector& collector,
+                           FusionRuleId rule_id,
+                           int32_t anchor_local_priority,
+                           size_t registration_order);
+  static void RecordFailure(FusionTraceCollector& collector,
+                            const FusionFailureRecord& record,
+                            size_t epoch, size_t anchor_rank,
+                            size_t tuple_ordinal);
+  static void RecordSuccess(FusionTraceCollector& collector,
+                            FusionRuleId rule_id);
+  static void RecordSuccessEvent(FusionTraceCollector& collector,
+                                 const FusionFailureRecord& record);
+};
+
 class FusionDiagnosticsTestAccess final {
  public:
   static void Configure(FusionTraceCollector& collector,
@@ -82,14 +101,7 @@ class FusionDiagnosticsTestAccess final {
                             FusionRuleId rule_id);
 
  private:
-  static void RegisterRule(FusionTraceCollector& collector,
-                           FusionRuleId rule_id,
-                           int32_t anchor_local_priority,
-                           size_t registration_order);
-  static void RecordSuccessEvent(FusionTraceCollector& collector,
-                                 const FusionFailureRecord& record);
-
-  friend class FailureSink;
+  FusionDiagnosticsTestAccess() = delete;
 };
 
 }  // namespace onnxruntime::fusion_rewriter_internal

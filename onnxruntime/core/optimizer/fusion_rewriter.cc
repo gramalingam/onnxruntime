@@ -2,6 +2,7 @@
 
 #if !defined(ORT_MINIMAL_BUILD)
 
+#include <limits>
 #include <unordered_set>
 #include <utility>
 
@@ -63,7 +64,7 @@ struct FusionRuleSet::Impl
         return;
       }
       normalized_rules.push_back(
-          std::make_unique<fusion_rewriter_internal::FusionRuleInternal>(
+          std::make_unique<fusion_rewriter_internal::NormalizedFusionRule>(
               rule.impl_->pattern, std::move(rule.impl_->replacement),
               *rule.impl_->constraint_definition,
               std::move(rule.impl_->predicate),
@@ -110,12 +111,90 @@ common::Status ValidateGraphForDiscovery(const Graph& graph) {
   return common::Status::OK();
 }
 
+FusionMatchStage ToFusionStage(
+    function_extractor_internal::MatcherFailureStage stage) {
+  using MatcherStage =
+      function_extractor_internal::MatcherFailureStage;
+  switch (stage) {
+    case MatcherStage::kStructuralNode:
+      return FusionMatchStage::kStructuralNode;
+    case MatcherStage::kStructuralEdge:
+      return FusionMatchStage::kStructuralEdge;
+    case MatcherStage::kValueBinding:
+      return FusionMatchStage::kValueBinding;
+    case MatcherStage::kAttributeBinding:
+      return FusionMatchStage::kAttributeBinding;
+    case MatcherStage::kLiteral:
+      return FusionMatchStage::kLiteral;
+    case MatcherStage::kClosure:
+      return FusionMatchStage::kClosure;
+    case MatcherStage::kConvexity:
+      return FusionMatchStage::kConvexity;
+    case MatcherStage::kFinalValidation:
+      return FusionMatchStage::kFinalValidation;
+  }
+  ORT_THROW("Unknown matcher failure stage.");
+}
+
+FusionFailureCode ToFusionCode(
+    function_extractor_internal::MatcherFailureCode code) {
+  using MatcherCode = function_extractor_internal::MatcherFailureCode;
+  switch (code) {
+    case MatcherCode::kOpMismatch:
+      return FusionFailureCode::kOpMismatch;
+    case MatcherCode::kOutputSlotMismatch:
+      return FusionFailureCode::kOutputSlotMismatch;
+    case MatcherCode::kRepeatedBindingMismatch:
+      return FusionFailureCode::kRepeatedBindingMismatch;
+    case MatcherCode::kMissingEffectiveAttribute:
+      return FusionFailureCode::kMissingEffectiveAttribute;
+    case MatcherCode::kAttributeValueMismatch:
+      return FusionFailureCode::kAttributeValueMismatch;
+    case MatcherCode::kLiteralMismatch:
+      return FusionFailureCode::kLiteralMismatch;
+    case MatcherCode::kExternalPrivateUse:
+      return FusionFailureCode::kExternalPrivateUse;
+    case MatcherCode::kNonConvex:
+      return FusionFailureCode::kNonConvex;
+  }
+  ORT_THROW("Unknown matcher failure code.");
+}
+
+std::string_view MatcherFailureDetail(
+    function_extractor_internal::MatcherFailureCode code) {
+  using MatcherCode = function_extractor_internal::MatcherFailureCode;
+  switch (code) {
+    case MatcherCode::kOpMismatch:
+      return "pattern and target operation identities differ";
+    case MatcherCode::kOutputSlotMismatch:
+      return "pattern and target operation slots differ";
+    case MatcherCode::kRepeatedBindingMismatch:
+      return "repeated pattern value bindings differ";
+    case MatcherCode::kMissingEffectiveAttribute:
+      return "required effective attribute is missing";
+    case MatcherCode::kAttributeValueMismatch:
+      return "effective attribute values differ";
+    case MatcherCode::kLiteralMismatch:
+      return "tensor literal differs";
+    case MatcherCode::kExternalPrivateUse:
+      return "private pattern value has an external use";
+    case MatcherCode::kNonConvex:
+      return "matched pattern operation nodes are non-convex";
+  }
+  ORT_THROW("Unknown matcher failure code.");
+}
+
+common::Status ValidateReplacementCall(
+    const Graph& graph, const CompiledFusionRule& compiled,
+    const FusionReplacementPlan& plan);
+
 common::Status DiscoverSelectedPlans(
     const FusionRuleSetState& rule_set,
     Graph& graph,
     std::vector<CompiledFusionRule>& compiled_rules,
     std::vector<FusionReplacementPlan>& selected_plans,
     size_t& condition_evaluations,
+    size_t& rule_attempts,
     size_t epoch,
     FailureSink* failure_sink) {
   ORT_RETURN_IF_ERROR(ValidateGraphForDiscovery(graph));
@@ -124,8 +203,9 @@ common::Status DiscoverSelectedPlans(
   compiled_rules.reserve(rule_set.normalized_rules.size());
 
   std::vector<FusionReplacementPlan> discovered_plans;
-  size_t attempts = 0;
-  size_t tuple_ordinal = 0;
+  function_extractor_internal::TargetGraphSnapshot snapshot;
+  ORT_RETURN_IF_ERROR(function_extractor_internal::BuildTargetGraphSnapshot(
+      graph, MakeMatcherOptions(rule_set.options), snapshot));
   for (size_t registration_order = 0;
        registration_order < rule_set.normalized_rules.size();
        ++registration_order) {
@@ -134,10 +214,6 @@ common::Status DiscoverSelectedPlans(
     ORT_RETURN_IF_ERROR(CompileFusionRule(
         *rule_set.normalized_rules[registration_order], graph, compiled));
 
-    function_extractor_internal::TargetGraphSnapshot snapshot;
-    ORT_RETURN_IF_ERROR(function_extractor_internal::BuildTargetGraphSnapshot(
-        graph, compiled.compiled_pattern,
-        compiled.rule->matcher_options, snapshot));
     std::vector<function_extractor_internal::ReplacementPlan> base_plans;
     function_extractor_internal::CompleteBindingHook condition_hook =
         [&](const function_extractor_internal::MatchState& match,
@@ -167,10 +243,14 @@ common::Status DiscoverSelectedPlans(
               failure.constraint =
                   constraint_result.failed_constraint;
               failure.detail = constraint_result.detail;
+              failure.anchor_node = match.anchor_node;
+              failure.anchor_output_slot =
+                  match.anchor_output_slot;
               failure.pattern_nodes_matched =
-                  match.pattern_node_to_target.size();
+                  match.target_node_to_pattern.size();
               failure_sink->RecordFailure(
-                  failure, epoch, 0, tuple_ordinal);
+                  failure, epoch, match.anchor_rank,
+                  match.tuple_ordinal);
             }
             accepted = false;
             return common::Status::OK();
@@ -178,7 +258,7 @@ common::Status DiscoverSelectedPlans(
           if (compiled.rule->predicate) {
             FusionConditionResult predicate_result;
             ORT_RETURN_IF_ERROR(
-                onnxruntime::FusionRuleInternal::InvokePredicate(
+                onnxruntime::FusionPredicateInvoker::InvokePredicate(
                     compiled.rule->predicate,
                     *compiled.compiled_pattern.normalized_pattern,
                     compiled.compiled_pattern, match, match_snapshot,
@@ -191,8 +271,11 @@ common::Status DiscoverSelectedPlans(
                 failure.rule_id = compiled.rule->options.id;
                 failure.stage = FusionMatchStage::kCondition;
                 failure.code = FusionFailureCode::kCallbackRejected;
+                failure.anchor_node = match.anchor_node;
+                failure.anchor_output_slot =
+                    match.anchor_output_slot;
                 failure.pattern_nodes_matched =
-                    match.pattern_node_to_target.size();
+                    match.target_node_to_pattern.size();
                 if (predicate_result.failure.has_value()) {
                   failure.pattern_node =
                       predicate_result.failure->node;
@@ -202,7 +285,8 @@ common::Status DiscoverSelectedPlans(
                       predicate_result.failure->reason;
                 }
                 failure_sink->RecordFailure(
-                    failure, epoch, 0, tuple_ordinal);
+                    failure, epoch, match.anchor_rank,
+                    match.tuple_ordinal);
               }
               accepted = false;
               return common::Status::OK();
@@ -214,10 +298,48 @@ common::Status DiscoverSelectedPlans(
           accepted = true;
           return common::Status::OK();
         };
+    function_extractor_internal::MatchFailureHook matcher_failure_hook;
+    if (failure_sink != nullptr) {
+      matcher_failure_hook =
+          [&](const function_extractor_internal::MatcherFailure& rejection,
+              NodeIndex anchor_node, size_t anchor_output_slot,
+              size_t anchor_rank,
+              size_t rejection_tuple_ordinal) {
+            FusionFailureRecord failure;
+            failure.rule_id = compiled.rule->options.id;
+            failure.stage = ToFusionStage(rejection.stage);
+            failure.code = ToFusionCode(rejection.code);
+            failure.anchor_node = anchor_node;
+            failure.anchor_output_slot = anchor_output_slot;
+            failure.pattern_node = rejection.pattern_node;
+            failure.pattern_value = rejection.pattern_value;
+            failure.target_node = rejection.target_node;
+            failure.target_slot = rejection.target_slot;
+            failure.target_value_name =
+                rejection.target_value_name;
+            failure.pattern_nodes_matched =
+                rejection.pattern_nodes_matched;
+            failure.detail =
+                rejection.detail.empty()
+                    ? std::string{MatcherFailureDetail(rejection.code)}
+                    : rejection.detail;
+            failure_sink->RecordFailure(
+                failure, epoch, anchor_rank,
+                rejection_tuple_ordinal);
+          };
+    }
+    function_extractor_internal::MatcherExecutionOptions
+        matcher_execution_options;
+    matcher_execution_options.allow_omitted_optional_formal_inputs = true;
+    matcher_execution_options.total_attempts = &rule_attempts;
+    matcher_execution_options.max_attempts =
+        rule_set.options.max_rule_attempts;
+    matcher_execution_options.failure_hook =
+        failure_sink == nullptr ? nullptr : &matcher_failure_hook;
     ORT_RETURN_IF_ERROR(function_extractor_internal::DiscoverReplacementPlans(
         compiled.compiled_pattern, snapshot,
         compiled.rule->matcher_options, base_plans, nullptr,
-        &condition_hook));
+        &condition_hook, matcher_execution_options));
     if (base_plans.empty() && failure_sink != nullptr) {
       for (FusionPatternValueId value_id = 0;
            value_id < compiled.rule->normalized_pattern.values.size();
@@ -258,18 +380,36 @@ common::Status DiscoverSelectedPlans(
         failure.pattern_value = value_id;
         failure.target_value_name = value.name;
         failure_sink->RecordFailure(
-            failure, epoch, 0, tuple_ordinal);
+            failure, epoch, 0, rule_attempts);
         break;
       }
     }
     for (auto& base_plan : base_plans) {
-      ORT_RETURN_IF(attempts >= rule_set.options.max_rule_attempts,
-                    "FusionRuleSet rule-attempt budget exceeded.");
-      ++attempts;
+      const size_t plan_tuple_ordinal = base_plan.tuple_ordinal;
       FusionReplacementPlan plan;
       ORT_RETURN_IF_ERROR(MaterializeFusionReplacementPlan(
           compiled, std::move(base_plan), registration_order,
-          tuple_ordinal++, plan));
+          plan_tuple_ordinal, plan));
+      const auto validation_status =
+          ValidateReplacementCall(graph, compiled, plan);
+      if (!validation_status.IsOK()) {
+        if (failure_sink != nullptr) {
+          FusionFailureRecord failure;
+          failure.rule_id = plan.rule_id;
+          failure.stage = FusionMatchStage::kFinalValidation;
+          failure.code = FusionFailureCode::kOpMismatch;
+          failure.anchor_node = plan.base.anchor_node;
+          failure.anchor_output_slot =
+              plan.base.anchor_output_slot;
+          failure.pattern_nodes_matched =
+              plan.base.pattern_node_to_target.size();
+          failure.detail = validation_status.ErrorMessage();
+          failure_sink->RecordFailure(
+              failure, epoch, plan.base.anchor_rank,
+              plan.base.tuple_ordinal);
+        }
+        continue;
+      }
       discovered_plans.push_back(std::move(plan));
     }
   }
@@ -308,6 +448,75 @@ common::Status DiscoverSelectedPlans(
   return common::Status::OK();
 }
 
+common::Status ComputeReplacementInputArgCounts(
+    const ONNX_NAMESPACE::OpSchema& schema,
+    gsl::span<const NodeArg* const> inputs,
+    std::vector<int>& input_arg_count) {
+  input_arg_count.assign(schema.inputs().size(), 0);
+  size_t input_index = 0;
+  for (size_t formal_index = 0;
+       formal_index < schema.inputs().size(); ++formal_index) {
+    const auto& formal = schema.inputs()[formal_index];
+    if (formal.GetOption() == ONNX_NAMESPACE::OpSchema::Variadic) {
+      ORT_RETURN_IF(formal_index + 1 != schema.inputs().size(),
+                    "Fusion replacement variadic input must be last.");
+      const size_t variadic_count = inputs.size() - input_index;
+      ORT_RETURN_IF(variadic_count <
+                        static_cast<size_t>(formal.GetMinArity()),
+                    "Fusion replacement variadic input does not meet ",
+                    "its minimum arity.");
+      ORT_RETURN_IF(
+          variadic_count >
+              static_cast<size_t>(std::numeric_limits<int>::max()),
+          "Fusion replacement variadic input count is too large.");
+      input_arg_count[formal_index] =
+          static_cast<int>(variadic_count);
+      for (; input_index < inputs.size(); ++input_index) {
+        ORT_RETURN_IF(inputs[input_index] == nullptr ||
+                          !inputs[input_index]->Exists(),
+                      "Fusion replacement variadic input contains a ",
+                      "missing value.");
+      }
+      continue;
+    }
+
+    if (input_index == inputs.size()) {
+      ORT_RETURN_IF(formal.GetOption() ==
+                        ONNX_NAMESPACE::OpSchema::Single,
+                    "Fusion replacement is missing a required input.");
+      continue;
+    }
+
+    input_arg_count[formal_index] = 1;
+    const auto* input = inputs[input_index++];
+    ORT_RETURN_IF(
+        formal.GetOption() == ONNX_NAMESPACE::OpSchema::Single &&
+            (input == nullptr || !input->Exists()),
+        "Fusion replacement required input is missing.");
+  }
+  ORT_RETURN_IF(input_index != inputs.size(),
+                "Fusion replacement has excess inputs.");
+  return common::Status::OK();
+}
+
+common::Status ValidateReplacementCall(
+    const Graph& graph, const CompiledFusionRule& compiled,
+    const FusionReplacementPlan& plan) {
+  std::vector<const NodeArg*> inputs(
+      plan.call_inputs.begin(), plan.call_inputs.end());
+  std::vector<const NodeArg*> outputs(
+      plan.call_outputs.begin(), plan.call_outputs.end());
+  std::vector<int> input_arg_count;
+  ORT_RETURN_IF_ERROR(ComputeReplacementInputArgCounts(
+      *compiled.replacement_schema, inputs, input_arg_count));
+  std::vector<std::optional<ONNX_NAMESPACE::TypeProto>>
+      inferred_output_types;
+  return graph.ValidateAndInferNodeTypeAndShape(
+      plan.replacement_op_type, *compiled.replacement_schema,
+      inputs, input_arg_count, outputs, plan.call_attributes,
+      inferred_output_types);
+}
+
 common::Status PrevalidateSelectedPlans(
     const FusionRuleSetState&,
     const Graph& graph,
@@ -330,24 +539,8 @@ common::Status PrevalidateSelectedPlans(
             .rule->matcher_options.max_literal_bytes));
     const auto& compiled =
         compiled_rules[plan.registration_order];
-    std::vector<const NodeArg*> inputs(
-        plan.call_inputs.begin(), plan.call_inputs.end());
-    std::vector<const NodeArg*> outputs(
-        plan.call_outputs.begin(), plan.call_outputs.end());
-    std::vector<int> input_arg_count(
-        compiled.replacement_schema->inputs().size(), 0);
-    for (size_t index = 0;
-         index < inputs.size() &&
-         index < input_arg_count.size();
-         ++index) {
-      input_arg_count[index] = 1;
-    }
-    std::vector<std::optional<ONNX_NAMESPACE::TypeProto>>
-        inferred_output_types;
-    ORT_RETURN_IF_ERROR(graph.ValidateAndInferNodeTypeAndShape(
-        plan.replacement_op_type, *compiled.replacement_schema,
-        inputs, input_arg_count, outputs, plan.call_attributes,
-        inferred_output_types));
+    ORT_RETURN_IF_ERROR(
+        ValidateReplacementCall(graph, compiled, plan));
   }
   return common::Status::OK();
 }
@@ -381,12 +574,13 @@ FusionRewriteResult ApplyRuleSet(
       std::min(initial_node_count, rule_set.options.max_epochs));
   std::unordered_set<std::string> literal_initializers_to_preserve;
   size_t condition_evaluations = 0;
+  size_t rule_attempts = 0;
   for (size_t epoch = 0; epoch <= epoch_cap; ++epoch) {
     std::vector<CompiledFusionRule> compiled_rules;
     std::vector<FusionReplacementPlan> selected_plans;
     result.status = DiscoverSelectedPlans(
         rule_set, graph, compiled_rules, selected_plans,
-        condition_evaluations, epoch, failure_sink.get());
+        condition_evaluations, rule_attempts, epoch, failure_sink.get());
     if (!result.status.IsOK()) return result;
     if (selected_plans.empty()) {
       result.status = common::Status::OK();
@@ -423,9 +617,6 @@ FusionRewriteResult ApplyRuleSet(
 
     const size_t nodes_before =
         static_cast<size_t>(graph.NumberOfNodes());
-    std::vector<std::pair<std::string, InlinedHashSet<std::string>>>
-        emitted_attribute_names;
-    emitted_attribute_names.reserve(selected_plans.size());
     for (auto& plan : selected_plans) {
       if (result.replacements_applied >=
           rule_set.options.max_replacements) {
@@ -446,13 +637,6 @@ FusionRewriteResult ApplyRuleSet(
       apply_plan.call_attributes = plan.call_attributes;
       apply_plan.generated_call_name =
           graph.GenerateNodeName(plan.replacement_op_type);
-      InlinedHashSet<std::string> attribute_names;
-      for (const auto& [name, unused] : plan.call_attributes) {
-        ORT_UNUSED_PARAMETER(unused);
-        attribute_names.insert(name);
-      }
-      emitted_attribute_names.emplace_back(
-          apply_plan.generated_call_name, std::move(attribute_names));
       bool call_added = false;
       result.status =
           function_extractor_internal::ApplyReplacementPlan(
@@ -471,18 +655,6 @@ FusionRewriteResult ApplyRuleSet(
                         ? controls.resolve_graph(graph, resolve_options)
                         : graph.Resolve(resolve_options);
     if (!result.status.IsOK()) return result;
-    for (const auto& [node_name, attribute_names] :
-         emitted_attribute_names) {
-      for (auto& node : graph.Nodes()) {
-        if (node.Name() != node_name) continue;
-        auto& attributes = node.GetMutableAttributes();
-        std::erase_if(attributes, [&](const auto& entry) {
-          return attribute_names.find(entry.first) ==
-                 attribute_names.end();
-        });
-        break;
-      }
-    }
     const size_t nodes_after =
         static_cast<size_t>(graph.NumberOfNodes());
     if (nodes_after >= nodes_before) {
@@ -510,6 +682,13 @@ struct FusionTestPlan::Impl {
   FusionReplacementPlan plan;
 };
 
+FusionRewriteResult FusionRuleSetExecution::Apply(
+    const FusionRuleSet& rule_set, Graph& graph,
+    const FusionExecutionControls& controls,
+    FusionTraceCollector* trace) {
+  return ApplyRuleSet(*rule_set.impl_, graph, controls, trace);
+}
+
 FusionTestPlan::FusionTestPlan() = default;
 FusionTestPlan::~FusionTestPlan() = default;
 FusionTestPlan::FusionTestPlan(FusionTestPlan&&) noexcept = default;
@@ -522,9 +701,10 @@ common::Status FusionRuleSetTestAccess::DiscoverPlans(
   std::vector<CompiledFusionRule> compiled_rules;
   std::vector<FusionReplacementPlan> selected_plans;
   size_t condition_evaluations = 0;
+  size_t rule_attempts = 0;
   ORT_RETURN_IF_ERROR(DiscoverSelectedPlans(
       *rule_set.impl_, graph, compiled_rules, selected_plans,
-      condition_evaluations, 0, nullptr));
+      condition_evaluations, rule_attempts, 0, nullptr));
   plans.clear();
   plans.reserve(selected_plans.size());
   for (auto& selected : selected_plans) {
@@ -570,7 +750,8 @@ FusionRewriteResult FusionRuleSetTestAccess::Apply(
     const FusionRuleSet& rule_set, Graph& graph,
     const FusionExecutionControls& controls,
     FusionTraceCollector* trace) {
-  return ApplyRuleSet(*rule_set.impl_, graph, controls, trace);
+  return FusionRuleSetExecution::Apply(
+      rule_set, graph, controls, trace);
 }
 
 }  // namespace fusion_rewriter_internal
@@ -585,7 +766,7 @@ FusionRewriteResult FusionRuleSet::Apply(Model& model, FusionTraceCollector* tra
 }
 FusionRewriteResult FusionRuleSet::Apply(
     Graph& graph, FusionTraceCollector* trace) const {
-  return fusion_rewriter_internal::FusionRuleSetTestAccess::Apply(
+  return fusion_rewriter_internal::FusionRuleSetExecution::Apply(
       *this, graph, {}, trace);
 }
 

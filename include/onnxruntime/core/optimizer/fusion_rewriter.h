@@ -24,6 +24,8 @@ class Model;
 namespace fusion_rewriter_internal {
 class FusionRuleSetTestAccess;
 class FusionDiagnosticsTestAccess;
+class FusionRuleSetExecution;
+class FusionDiagnosticsAccess;
 }  // namespace fusion_rewriter_internal
 
 using PatternFunctionProto = ONNX_NAMESPACE::FunctionProto;
@@ -33,6 +35,7 @@ using FusionPatternNodeId = size_t;
 using FusionPatternValueId = size_t;
 using FusionFormalAttributeId = size_t;
 
+/** Controls whether an unknown fact rejects a positive constraint. */
 enum class FusionUnknownPolicy : uint8_t {
   kReject,
   kNotContradicted,
@@ -45,6 +48,7 @@ enum class FusionValueRefKind : uint8_t {
 };
 
 struct FusionValueRef {
+  /** References a formal or internal pattern value, never a target NodeArg. */
   FusionValueRefKind kind;
   size_t index;
 
@@ -54,6 +58,7 @@ struct FusionValueRef {
 };
 
 struct FusionNodeRef {
+  /** Identifies a pattern operation node. */
   FusionPatternNodeId id;
 };
 
@@ -79,6 +84,7 @@ struct FusionAttributeRef {
 };
 
 struct FusionDimensionEquivalenceClass {
+  /** All listed dimensions must be equal under `unknown_policy`. */
   std::string label;
   std::vector<FusionDimRef> dimensions;
   FusionUnknownPolicy unknown_policy{FusionUnknownPolicy::kReject};
@@ -86,6 +92,7 @@ struct FusionDimensionEquivalenceClass {
 
 class FusionConstraint final {
  public:
+  /** A composable declarative condition evaluated after complete binding. */
   FusionConstraint();
   ~FusionConstraint();
   FusionConstraint(const FusionConstraint&);
@@ -150,6 +157,7 @@ class FusionConstraint final {
 
 class FusionConstraintProgram final {
  public:
+  /** Combines dimension-unification classes with a constraint predicate. */
   FusionConstraintProgram(
       std::vector<FusionDimensionEquivalenceClass> dimension_classes,
       FusionConstraint predicate);
@@ -166,6 +174,7 @@ class FusionConstraintProgram final {
 };
 
 struct FusionReplacementInput {
+  /** Nullopt emits an omitted optional input position. */
   std::optional<size_t> formal_input_index;
 };
 
@@ -186,6 +195,7 @@ struct FusionReplacementAttribute {
 };
 
 struct FusionReplacementCall {
+  /** Replacement identity is independent of the pattern function identity. */
   std::string domain;
   std::string op_type;
   int since_version{-1};
@@ -201,6 +211,12 @@ enum class FusionDimensionKind : uint8_t {
   kSymbol,
 };
 
+/**
+ * Read-only dimension observed from the matched target graph.
+ *
+ * Instances are callback-only views. They and all data returned from them are
+ * valid only for the current FusionMatchPredicate invocation.
+ */
 class FusionDimensionView final {
  public:
   FusionDimensionKind Kind() const;
@@ -214,6 +230,7 @@ class FusionDimensionView final {
   friend class FusionShapeView;
 };
 
+/** Callback-only target shape view. An unknown shape has `HasRank() == false`. */
 class FusionShapeView final {
  public:
   bool HasRank() const;
@@ -228,6 +245,7 @@ class FusionShapeView final {
   friend class FusionMatchContext;
 };
 
+/** Callback-only target type view. Unknown and non-tensor types are explicit. */
 class FusionTypeView final {
  public:
   bool IsTensor() const;
@@ -241,6 +259,7 @@ class FusionTypeView final {
   friend class FusionMatchContext;
 };
 
+/** Callback-only canonical tensor-literal view. */
 class FusionTensorView final {
  public:
   int32_t ElementType() const;
@@ -255,6 +274,12 @@ class FusionTensorView final {
   friend class FusionLiteralView;
 };
 
+/**
+ * Callback-only target attribute view.
+ *
+ * `Exists() == false` is the missing-attribute sentinel; typed accessors then
+ * return std::nullopt.
+ */
 class FusionAttributeView final {
  public:
   bool Exists() const;
@@ -276,6 +301,7 @@ class FusionAttributeView final {
   friend class FusionMatchContext;
 };
 
+/** Callback-only normalized literal witness from the matched target graph. */
 class FusionLiteralView final {
  public:
   bool IsInitializer() const;
@@ -288,6 +314,12 @@ class FusionLiteralView final {
   friend class FusionMatchContext;
 };
 
+/**
+ * Callback-only target value view selected by a pattern value reference.
+ *
+ * `Exists() == false` represents a stably omitted optional binding. Its name is
+ * empty, type/shape are unknown, and producer accessors return std::nullopt.
+ */
 class FusionValueView final {
  public:
   std::string_view Name() const;
@@ -304,6 +336,10 @@ class FusionValueView final {
   friend class FusionMatchContext;
 };
 
+/**
+ * Callback-only target operation-node view selected by a pattern operation
+ * node ID. Inputs()/Outputs() return pattern value IDs for further lookup.
+ */
 class FusionNodeView final {
  public:
   NodeIndex Index() const;
@@ -322,11 +358,22 @@ class FusionNodeView final {
   friend class FusionMatchContext;
 };
 
+/**
+ * Complete match exposed to a FusionMatchPredicate.
+ *
+ * Accessor arguments identify pattern entities; returned views describe their
+ * bound target entities. This object and every view obtained from it must not
+ * be retained after the callback returns.
+ */
 class FusionMatchContext final {
  public:
+  /** Returns the target operation node bound to pattern operation node `id`. */
   FusionNodeView MatchedNode(FusionPatternNodeId id) const;
+  /** Returns the target value bound to an internal pattern value. */
   FusionValueView BoundValue(FusionPatternValueId id) const;
+  /** Returns the target value bound to a pattern formal input. */
   FusionValueView BoundInput(size_t index) const;
+  /** Returns the target value bound to a pattern formal output. */
   FusionValueView BoundOutput(size_t index) const;
   FusionLiteralView Literal(FusionPatternValueId id) const;
   FusionAttributeView BoundAttribute(FusionFormalAttributeId id) const;
@@ -337,7 +384,7 @@ class FusionMatchContext final {
   struct Impl;
   const Impl* impl_{};
   explicit FusionMatchContext(const Impl*);
-  friend struct FusionRuleInternal;
+  friend struct FusionPredicateInvoker;
 };
 
 enum class FusionConditionDecision : uint8_t {
@@ -363,9 +410,14 @@ using FusionMatchPredicate = std::function<common::Status(
 struct FusionRuleOptions {
   FusionRuleId id{};
   std::string name;
+  /**
+   * Tie-breaker among rules matching the same anchor. An anchor is the target
+   * operation node that produces the rule's primary pattern output group.
+   */
   int32_t anchor_local_priority{};
 };
 
+/** Immutable pattern, condition, and replacement-call definition. */
 class FusionRule final {
  public:
   FusionRule(const PatternFunctionProto& pattern,
@@ -385,6 +437,7 @@ class FusionRule final {
   friend class FusionRuleSet;
 };
 
+/** Controls diagnostic retention; kOff allocates and records nothing. */
 enum class FusionDiagnosticMode : uint8_t {
   kOff,
   kBestFailure,
@@ -423,6 +476,7 @@ enum class FusionFailureCode : uint16_t {
   kStalePlan,
 };
 
+/** Bounded diagnostic record for one unsuccessful or successful match. */
 struct FusionFailureRecord {
   FusionRuleId rule_id{};
   FusionMatchStage stage{};
@@ -439,6 +493,7 @@ struct FusionFailureRecord {
   std::string detail;
 };
 
+/** Invocation-owned bounded diagnostic collector. */
 class FusionTraceCollector final {
  public:
   FusionTraceCollector();
@@ -454,9 +509,11 @@ class FusionTraceCollector final {
   struct Impl;
   std::unique_ptr<Impl> impl_;
   friend class FusionRuleSet;
+  friend class fusion_rewriter_internal::FusionDiagnosticsAccess;
   friend class fusion_rewriter_internal::FusionDiagnosticsTestAccess;
 };
 
+/** Semantic, resource, fixpoint, and diagnostic limits for a FusionRuleSet. */
 struct FusionRuleSetOptions {
   size_t max_pattern_nodes{1024};
   size_t max_target_nodes{1'000'000};
@@ -477,12 +534,20 @@ struct FusionRuleSetOptions {
   FusionDiagnosticMode diagnostic_mode{FusionDiagnosticMode::kOff};
 };
 
+/** Exact mutation progress and terminal status from one Apply invocation. */
 struct FusionRewriteResult {
   common::Status status{common::Status::OK()};
   size_t replacements_applied{};
   size_t epochs_completed{};
 };
 
+/**
+ * Applies rules over immutable graph epochs until no replacement remains.
+ *
+ * Each epoch discovers all rules against one graph snapshot, selects
+ * non-conflicting plans consumer-anchor first, prevalidates the whole batch,
+ * applies it, resolves the graph, and requires a strict node-count decrease.
+ */
 class FusionRuleSet final {
  public:
   explicit FusionRuleSet(std::vector<FusionRule> rules,
@@ -496,6 +561,7 @@ class FusionRuleSet final {
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  friend class fusion_rewriter_internal::FusionRuleSetExecution;
   friend class fusion_rewriter_internal::FusionRuleSetTestAccess;
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(FusionRuleSet);
 };

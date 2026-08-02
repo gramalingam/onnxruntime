@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -43,8 +44,6 @@ struct TargetGraphSnapshot {
   InlinedHashSet<NodeIndex> control_edge_nodes;
   InlinedHashMap<std::string, const ONNX_NAMESPACE::TensorProto*> constant_initializers;
   size_t aggregate_work_units{};
-  // One bounded candidate list per formal-output producer group.
-  InlinedVector<InlinedVector<NodeIndex>> root_candidates_by_group;
 };
 
 enum class ValueVisitState : uint8_t {
@@ -70,6 +69,10 @@ struct MatchedAttributeOccurrence {
 // Schedule binds each pattern value once; Processed values are never expanded
 // again. The two node maps maintain an injective operation-node mapping.
 struct MatchState {
+  NodeIndex anchor_node{};
+  size_t anchor_output_slot{};
+  size_t anchor_rank{};
+  size_t tuple_ordinal{};
   InlinedVector<NodeIndex> pattern_node_to_target;
   InlinedHashMap<NodeIndex, PatternNodeId> target_node_to_pattern;
   InlinedVector<const NodeArg*> pattern_value_to_target;
@@ -86,7 +89,11 @@ struct MatchState {
 // Immutable mutation recipe. Every NodeArg is borrowed from the target Graph
 // and is valid only until that graph is mutated.
 struct ReplacementPlan {
+  NodeIndex anchor_node{};
+  size_t anchor_output_slot{};
   size_t primary_root_topological_position{};
+  size_t anchor_rank{};
+  size_t tuple_ordinal{};
   InlinedVector<NodeIndex> removable_node_indices;
   InlinedVector<NodeArg*> call_inputs;
   InlinedVector<NodeArg*> call_outputs;
@@ -118,6 +125,58 @@ struct MatcherDiagnostics {
   size_t accepted_candidates{};
 };
 
+enum class MatcherFailureStage : uint8_t {
+  kStructuralNode,
+  kStructuralEdge,
+  kValueBinding,
+  kAttributeBinding,
+  kLiteral,
+  kClosure,
+  kConvexity,
+  kFinalValidation,
+};
+
+enum class MatcherFailureCode : uint8_t {
+  kOpMismatch,
+  kOutputSlotMismatch,
+  kRepeatedBindingMismatch,
+  kMissingEffectiveAttribute,
+  kAttributeValueMismatch,
+  kLiteralMismatch,
+  kExternalPrivateUse,
+  kNonConvex,
+};
+
+struct MatcherFailure {
+  bool valid{};
+  MatcherFailureStage stage{MatcherFailureStage::kStructuralNode};
+  MatcherFailureCode code{MatcherFailureCode::kOpMismatch};
+  std::optional<PatternNodeId> pattern_node;
+  std::optional<PatternValueId> pattern_value;
+  std::optional<NodeIndex> target_node;
+  std::optional<size_t> target_slot;
+  std::string target_value_name;
+  size_t pattern_nodes_matched{};
+  std::string detail;
+};
+
+using MatchFailureHook = std::function<void(
+    const MatcherFailure&, NodeIndex anchor_node,
+    size_t anchor_output_slot, size_t anchor_rank,
+    size_t tuple_ordinal)>;
+
+struct MatcherExecutionOptions {
+  bool allow_omitted_optional_formal_inputs{};
+  size_t* total_attempts{};
+  size_t max_attempts{std::numeric_limits<size_t>::max()};
+  const MatchFailureHook* failure_hook{};
+};
+
+common::Status BuildTargetGraphSnapshot(
+    const Graph& graph,
+    const FunctionExtractorOptions& options,
+    TargetGraphSnapshot& snapshot);
+
 common::Status BuildTargetGraphSnapshot(
     const Graph& graph,
     const CompiledFunctionPattern& compiled_pattern,
@@ -130,7 +189,8 @@ common::Status DiscoverReplacementPlans(
     const FunctionExtractorOptions& options,
     std::vector<ReplacementPlan>& plans,
     MatcherDiagnostics* diagnostics = nullptr,
-    const CompleteBindingHook* complete_binding_hook = nullptr);
+    const CompleteBindingHook* complete_binding_hook = nullptr,
+    const MatcherExecutionOptions& execution_options = {});
 
 common::Status SelectNonConflictingPlans(
     gsl::span<const ReplacementPlan> plans,
