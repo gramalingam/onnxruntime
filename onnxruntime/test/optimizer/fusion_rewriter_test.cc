@@ -109,28 +109,39 @@ FunctionProto MakeAttributedPattern(std::string_view name = "Attributed") {
 
 std::string GeluBody(std::string_view tensor_type,
                      std::string_view coefficient) {
-  const std::string scalar_type{
-      tensor_type == "double" ? "double" : "float"};
-  return "  three = Constant <value = " + scalar_type +
-         " {3.0}> ()\n"
+  const auto literal = [tensor_type](
+                           std::string_view value,
+                           uint16_t float16_bits,
+                           uint16_t bfloat16_bits) {
+    const std::string data =
+        tensor_type == "float16"
+            ? std::to_string(float16_bits)
+        : tensor_type == "bfloat16"
+            ? std::to_string(bfloat16_bits)
+            : std::string{value};
+    return std::string{tensor_type} + " {" + data + "}";
+  };
+  return "  three = Constant <value = " +
+         literal("3.0", 16896, 16448) +
+         "> ()\n"
          "  x3 = Pow(x, three)\n"
          "  cubic_coefficient = Constant <value = " +
-         scalar_type + " {" + std::string{coefficient} +
-         "}> ()\n"
+         literal(coefficient, 10681, 15671) +
+         "> ()\n"
          "  cubic = Mul(cubic_coefficient, x3)\n"
          "  shifted = Add(x, cubic)\n"
          "  sqrt_two_over_pi = Constant <value = " +
-         scalar_type +
-         " {0.7978845608028654}> ()\n"
+         literal("0.7978845608028654", 14946, 16204) +
+         "> ()\n"
          "  scaled = Mul(sqrt_two_over_pi, shifted)\n"
          "  tanh = Tanh(scaled)\n"
          "  one = Constant <value = " +
-         scalar_type +
-         " {1.0}> ()\n"
+         literal("1.0", 15360, 16256) +
+         "> ()\n"
          "  plus_one = Add(tanh, one)\n"
          "  half = Constant <value = " +
-         scalar_type +
-         " {0.5}> ()\n"
+         literal("0.5", 14336, 16128) +
+         "> ()\n"
          "  halved = Mul(half, plus_one)\n"
          "  out = Mul(x, halved)\n";
 }
@@ -139,7 +150,7 @@ FunctionProto MakeGeluPattern(
     std::string_view tensor_type = "float",
     std::string_view name = "TanhGelu") {
   return ParseFunction(
-      "<opset_import: [\"\" : 13], domain: \"ort.pattern\">\n" +
+      "<opset_import: [\"\" : 15], domain: \"ort.pattern\">\n" +
       std::string{name} + " (x) => (out) {\n" +
       GeluBody(tensor_type, "0.044715") + "}");
 }
@@ -148,7 +159,7 @@ std::shared_ptr<Model> MakeGeluModel(
     std::string_view tensor_type = "float",
     std::string_view coefficient = "0.044715") {
   return MakeModelFromText(
-      "<ir_version: 8, opset_import: [\"\" : 13, "
+      "<ir_version: 8, opset_import: [\"\" : 15, "
       "\"com.microsoft\" : 1]>\n"
       "target_graph (" +
       std::string{tensor_type} + "[2, 3] x) => (" +
@@ -249,13 +260,10 @@ FusionRule MakeRule(
     FusionReplacementCall replacement,
     FusionConstraintProgram constraints = MakeConstraints(),
     FusionMatchPredicate predicate = {},
-    FusionRuleId id = 1,
-    int32_t priority = 0,
-    std::string name = "test-rule") {
+    FusionRuleOptions options = {1, "test-rule", 0}) {
   return FusionRule(
       pattern, std::move(replacement), std::move(constraints),
-      std::move(predicate),
-      FusionRuleOptions{id, std::move(name), priority});
+      std::move(predicate), std::move(options));
 }
 
 std::unique_ptr<FusionRuleSet> MakeRuleSet(
@@ -265,7 +273,7 @@ std::unique_ptr<FusionRuleSet> MakeRuleSet(
       std::move(rules), std::move(options));
 }
 
-std::unique_ptr<FusionRuleSet> MakeIdentityRuleSet(
+std::unique_ptr<FusionRuleSet> MakeTwoIdentityToFastGeluRuleSet(
     FusionConstraintProgram constraints = MakeConstraints(),
     FusionMatchPredicate predicate = {},
     FusionRuleSetOptions options = {},
@@ -273,7 +281,8 @@ std::unique_ptr<FusionRuleSet> MakeIdentityRuleSet(
   std::vector<FusionRule> rules;
   rules.push_back(MakeRule(
       MakeTwoIdentityPattern(), MakeFastGeluReplacement(),
-      std::move(constraints), std::move(predicate), id));
+      std::move(constraints), std::move(predicate),
+      FusionRuleOptions{id, "two-identity-to-fast-gelu", 0}));
   return MakeRuleSet(std::move(rules), std::move(options));
 }
 
@@ -324,12 +333,13 @@ std::string SerializeGraph(const Graph& graph) {
   return graph.ToGraphProto().SerializeAsString();
 }
 
-void ExpectSingleIdentityFusion(
+void ExpectTwoIdentityToFastGeluFusion(
     FusionConstraintProgram constraints,
     std::string_view type,
     bool should_fuse) {
   auto model = MakeTwoIdentityModel(type);
-  auto rule_set = MakeIdentityRuleSet(std::move(constraints));
+  auto rule_set =
+      MakeTwoIdentityToFastGeluRuleSet(std::move(constraints));
   const FusionRewriteResult result = rule_set->Apply(*model);
   ASSERT_STATUS_OK(result.status);
   EXPECT_EQ(result.replacements_applied, should_fuse ? 1u : 0u);
@@ -422,6 +432,79 @@ TEST_F(FusionRewriterTest, RejectsInvalidReplacementBoundaryMappings) {
   }
 }
 
+TEST_F(FusionRewriterTest, RejectsMissingRequiredReplacementInputs) {
+  auto model = MakeTwoIdentityModel();
+  const std::string before = SerializeGraph(model->MainGraph());
+  std::vector<FusionRule> rules;
+  rules.push_back(MakeRule(
+      MakeTwoIdentityPattern(),
+      MakeReplacementCall(
+          kMSDomain, "FastGelu", kFastGeluVersion, {}, {0})));
+
+  const FusionRewriteResult result =
+      MakeRuleSet(std::move(rules))->Apply(*model);
+
+  ASSERT_STATUS_OK(result.status);
+  EXPECT_EQ(result.replacements_applied, 0u);
+  EXPECT_EQ(SerializeGraph(model->MainGraph()), before);
+}
+
+TEST_F(FusionRewriterTest, ModelsVariadicReplacementActualInputCount) {
+  const FunctionProto pattern = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "ort.pattern">
+IdentityConcat (x, y) => (out) {
+  left = Identity(x)
+  out = Concat <axis = 0> (left, y)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13]>
+target_graph (float[1] x, float[1] y) => (float[2] out) {
+  left = Identity(x)
+  out = Concat <axis = 0> (left, y)
+})");
+  FusionReplacementCall replacement =
+      MakeReplacementCall(kOnnxDomain, "Concat", 13, {0, 1}, {0});
+  replacement.attributes.push_back(FusionReplacementAttribute{
+      "axis", FusionReplacementAttributeSource::kLiteral, 0,
+      ONNX_NAMESPACE::MakeAttribute("ignored", int64_t{0})});
+  std::vector<FusionRule> rules;
+  rules.push_back(MakeRule(pattern, std::move(replacement)));
+
+  const FusionRewriteResult result =
+      MakeRuleSet(std::move(rules))->Apply(*model);
+
+  ASSERT_STATUS_OK(result.status);
+  ASSERT_EQ(result.replacements_applied, 1u);
+  const Node& concat =
+      FindOnlyOp(model->MainGraph(), kOnnxDomain, "Concat");
+  ASSERT_EQ(concat.InputDefs().size(), 2u);
+  EXPECT_EQ(concat.InputDefs()[0]->Name(), "x");
+  EXPECT_EQ(concat.InputDefs()[1]->Name(), "y");
+}
+
+TEST_F(FusionRewriterTest, AllowsOmittedOptionalReplacementInput) {
+  const FunctionProto pattern = MakeAddIdentityPattern();
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "com.microsoft" : 1]>
+target_graph (float[2] x, float[2] bias) => (float[2] out) {
+  biased = Add(x, bias)
+  out = Identity(biased)
+})");
+  std::vector<FusionRule> rules;
+  rules.push_back(MakeRule(
+      pattern, MakeFastGeluReplacement()));
+
+  const FusionRewriteResult result =
+      MakeRuleSet(std::move(rules))->Apply(*model);
+
+  ASSERT_STATUS_OK(result.status);
+  ASSERT_EQ(result.replacements_applied, 1u);
+  const Node& fast_gelu =
+      FindOnlyOp(model->MainGraph(), kMSDomain, "FastGelu");
+  ASSERT_EQ(fast_gelu.InputDefs().size(), 1u);
+  EXPECT_EQ(fast_gelu.InputDefs()[0]->Name(), "x");
+}
+
 TEST_F(FusionRewriterTest, PositiveConstraintsDoNotAcceptPermissiveUnknownPolicy) {
   using RankFactory = FusionConstraint (*)(FusionValueRef, size_t);
   static_assert(std::is_same_v<
@@ -496,16 +579,18 @@ target_graph (float[2, 3] x, float[3, 4] y) => (float[2, 4] out) {
   EXPECT_GE(call.GetAttributes().size(), 2u);
   EXPECT_FLOAT_EQ(call.GetAttributes().at("alpha").f(), 0.5f);
   EXPECT_FLOAT_EQ(call.GetAttributes().at("beta").f(), 0.2f);
+  EXPECT_EQ(call.GetAttributes().at("transA").i(), 0);
+  EXPECT_EQ(call.GetAttributes().at("transB").i(), 0);
 }
 
 TEST_F(FusionRewriterTest, VirtualCallRejectsTypeContradictionBeforeMutation) {
   auto model = MakeTwoIdentityModel("int32[2]");
   const std::string before = SerializeGraph(model->MainGraph());
-  auto rule_set = MakeIdentityRuleSet();
+  auto rule_set = MakeTwoIdentityToFastGeluRuleSet();
 
   const FusionRewriteResult result = rule_set->Apply(*model);
 
-  EXPECT_FALSE(result.status.IsOK());
+  ASSERT_STATUS_OK(result.status);
   EXPECT_EQ(result.replacements_applied, 0u);
   EXPECT_EQ(SerializeGraph(model->MainGraph()), before);
 }
@@ -521,7 +606,7 @@ TEST_F(FusionRewriterTest, VirtualCallRejectsOutputShapeContradictionBeforeMutat
   const FusionRewriteResult result =
       MakeRuleSet(std::move(rules))->Apply(*model);
 
-  EXPECT_FALSE(result.status.IsOK());
+  ASSERT_STATUS_OK(result.status);
   EXPECT_EQ(result.replacements_applied, 0u);
   EXPECT_EQ(SerializeGraph(model->MainGraph()), before);
 }
@@ -546,17 +631,17 @@ TEST_F(FusionRewriterTest, AllowsUnknownCompatibleReplacementShape) {
 
 TEST_F(FusionRewriterTest, RankIsPassFailUnknown) {
   const FusionValueRef input = FusionValueRef::FormalInput(0);
-  ExpectSingleIdentityFusion(
+  ExpectTwoIdentityToFastGeluFusion(
       MakeConstraints(FusionConstraint::RankIs(input, 2)),
       "float[2, 3]", true);
-  ExpectSingleIdentityFusion(
+  ExpectTwoIdentityToFastGeluFusion(
       MakeConstraints(FusionConstraint::RankIs(input, 2)),
       "float[2]", false);
 
   auto model = MakeTwoIdentityModel("float[N, M]");
   model->MainGraph().GetNodeArg("x")->ClearShape();
   ASSERT_STATUS_OK(model->MainGraph().Resolve());
-  auto rule_set = MakeIdentityRuleSet(
+  auto rule_set = MakeTwoIdentityToFastGeluRuleSet(
       MakeConstraints(FusionConstraint::RankIs(input, 2)));
   const FusionRewriteResult result = rule_set->Apply(*model);
   ASSERT_STATUS_OK(result.status);
@@ -565,20 +650,20 @@ TEST_F(FusionRewriterTest, RankIsPassFailUnknown) {
 
 TEST_F(FusionRewriterTest, ElementTypeIsAndIn) {
   const FusionValueRef input = FusionValueRef::FormalInput(0);
-  ExpectSingleIdentityFusion(
+  ExpectTwoIdentityToFastGeluFusion(
       MakeConstraints(FusionConstraint::ElementTypeIs(
           input, ONNX_NAMESPACE::TensorProto_DataType_FLOAT)),
       "float[2]", true);
-  ExpectSingleIdentityFusion(
+  ExpectTwoIdentityToFastGeluFusion(
       MakeConstraints(FusionConstraint::ElementTypeIs(
           input, ONNX_NAMESPACE::TensorProto_DataType_FLOAT)),
       "float16[2]", false);
-  ExpectSingleIdentityFusion(
+  ExpectTwoIdentityToFastGeluFusion(
       MakeConstraints(FusionConstraint::ElementTypeIn(
           input, {ONNX_NAMESPACE::TensorProto_DataType_FLOAT,
                   ONNX_NAMESPACE::TensorProto_DataType_FLOAT16})),
       "float16[2]", true);
-  ExpectSingleIdentityFusion(
+  ExpectTwoIdentityToFastGeluFusion(
       MakeConstraints(FusionConstraint::ElementTypeIn(
           input, {ONNX_NAMESPACE::TensorProto_DataType_FLOAT,
                   ONNX_NAMESPACE::TensorProto_DataType_FLOAT16})),
@@ -630,13 +715,14 @@ TEST_F(FusionRewriterTest, ShapeEqualsConcreteAndSymbolic) {
 TEST_F(FusionRewriterTest, NegativeAxisRequiresKnownRank) {
   const FusionConstraint dim_constraint = FusionConstraint::DimValueIs(
       FusionDimRef{FusionValueRef::FormalInput(0), -1}, 3);
-  ExpectSingleIdentityFusion(
+  ExpectTwoIdentityToFastGeluFusion(
       MakeConstraints(dim_constraint), "float[2, 3]", true);
 
   auto model = MakeTwoIdentityModel("float[N, M]");
   model->MainGraph().GetNodeArg("x")->ClearShape();
   ASSERT_STATUS_OK(model->MainGraph().Resolve());
-  auto rule_set = MakeIdentityRuleSet(MakeConstraints(dim_constraint));
+  auto rule_set =
+      MakeTwoIdentityToFastGeluRuleSet(MakeConstraints(dim_constraint));
   const FusionRewriteResult result = rule_set->Apply(*model);
   ASSERT_STATUS_OK(result.status);
   EXPECT_EQ(result.replacements_applied, 0u);
@@ -760,7 +846,7 @@ target_graph (float[2] x) => (float[2] out) {
 TEST_F(FusionRewriterTest, EvaluatesTypeRankAndDimensionPredicates) {
   const FusionValueRef input = FusionValueRef::FormalInput(0);
   const FusionValueRef output = FusionValueRef::FormalOutput(0);
-  ExpectSingleIdentityFusion(
+  ExpectTwoIdentityToFastGeluFusion(
       MakeConstraints(FusionConstraint::AllOf({
           FusionConstraint::TypeEquals(input, output),
           FusionConstraint::SameElementType(input, output),
@@ -907,7 +993,7 @@ target_graph (float[2] x) => (float[2] out, float[2] side) {
 })");
   FusionRuleSetOptions options;
   options.diagnostic_mode = FusionDiagnosticMode::kBestFailure;
-  auto rule_set = MakeIdentityRuleSet(
+  auto rule_set = MakeTwoIdentityToFastGeluRuleSet(
       MakeConstraints(FusionConstraint::ElementTypeIs(
           FusionValueRef::FormalInput(0),
           ONNX_NAMESPACE::TensorProto_DataType_FLOAT16)),
@@ -926,7 +1012,7 @@ target_graph (float[2] x) => (float[2] out, float[2] side) {
             FusionFailureCode::kConstraintFalse);
 }
 
-TEST_F(FusionRewriterTest, CallbackSeesCompleteOpaqueBinding) {
+TEST_F(FusionRewriterTest, CallbackReadsBoundValuesAndMatchedNodes) {
   auto model = MakeTwoIdentityModel("float[B, 3]", "input");
   size_t call_count = 0;
   FusionMatchPredicate predicate =
@@ -955,7 +1041,8 @@ TEST_F(FusionRewriterTest, CallbackSeesCompleteOpaqueBinding) {
     return Status::OK();
   };
   auto rule_set =
-      MakeIdentityRuleSet(MakeConstraints(), std::move(predicate));
+      MakeTwoIdentityToFastGeluRuleSet(
+          MakeConstraints(), std::move(predicate));
 
   const FusionRewriteResult result = rule_set->Apply(*model);
 
@@ -982,7 +1069,8 @@ TEST_F(FusionRewriterTest, CallbackRejectionAndErrorPreserveGraph) {
       return Status::OK();
     };
     auto rule_set =
-        MakeIdentityRuleSet(MakeConstraints(), std::move(predicate));
+        MakeTwoIdentityToFastGeluRuleSet(
+            MakeConstraints(), std::move(predicate));
     FusionTraceCollector trace;
     const FusionRewriteResult result =
         rule_set->Apply(*model, return_error ? nullptr : &trace);
@@ -994,7 +1082,7 @@ TEST_F(FusionRewriterTest, CallbackRejectionAndErrorPreserveGraph) {
   run(true);
 }
 
-TEST_F(FusionRewriterTest, OpaqueViewsExposeNoGraphTypes) {
+TEST_F(FusionRewriterTest, OpaqueViewsDoNotConvertToMutableGraphObjects) {
   static_assert(std::is_same_v<
                 decltype(std::declval<FusionNodeView>().Index()),
                 NodeIndex>);
@@ -1014,7 +1102,7 @@ TEST_F(FusionRewriterTest, OpaqueViewsExposeNoGraphTypes) {
 
 TEST_F(FusionRewriterTest, ShortCircuitRecordsOnlyObservedDependencies) {
   auto model = MakeTwoIdentityModel("float[2, 3]");
-  auto rule_set = MakeIdentityRuleSet(
+  auto rule_set = MakeTwoIdentityToFastGeluRuleSet(
       MakeConstraints(FusionConstraint::AnyOf({
           FusionConstraint::ElementTypeIs(
               FusionValueRef::FormalInput(0),
@@ -1058,7 +1146,8 @@ TEST_F(FusionRewriterTest, StaleObservedDimensionRejectsWholeBatch) {
     return Status::OK();
   };
   auto rule_set =
-      MakeIdentityRuleSet(MakeConstraints(), std::move(predicate));
+      MakeTwoIdentityToFastGeluRuleSet(
+          MakeConstraints(), std::move(predicate));
   std::vector<FusionTestPlan> plans;
   ASSERT_STATUS_OK(FusionRuleSetTestAccess::DiscoverPlans(
       *rule_set, model->MainGraph(), plans));
@@ -1097,7 +1186,8 @@ TEST_F(FusionRewriterTest, StaleObservedTypeRejectsWholeBatch) {
     return Status::OK();
   };
   auto rule_set =
-      MakeIdentityRuleSet(MakeConstraints(), std::move(predicate));
+      MakeTwoIdentityToFastGeluRuleSet(
+          MakeConstraints(), std::move(predicate));
   std::vector<FusionTestPlan> plans;
   ASSERT_STATUS_OK(FusionRuleSetTestAccess::DiscoverPlans(
       *rule_set, model->MainGraph(), plans));
@@ -1227,23 +1317,21 @@ TEST_F(FusionRewriterTest, GeluPatternIdentityIsNotFastGeluIdentity) {
   EXPECT_EQ(result.replacements_applied, 1u);
 }
 
-TEST_F(FusionRewriterTest, GeluRulesUseDtypeSpecificLiterals) {
-  {
-    auto model = MakeGeluModel("double");
+TEST_F(FusionRewriterTest, GeluRulesMatchDtypeSpecificLiterals) {
+  struct DtypeCase {
+    std::string_view tensor_type;
+    std::string_view rule_name;
+  };
+  for (const auto& dtype : {
+           DtypeCase{"float", "TanhGeluFloat"},
+           DtypeCase{"double", "TanhGeluDouble"},
+           DtypeCase{"float16", "TanhGeluFloat16"},
+           DtypeCase{"bfloat16", "TanhGeluBFloat16"},
+       }) {
+    auto model = MakeGeluModel(dtype.tensor_type);
     std::vector<FusionRule> rules;
     rules.push_back(MakeRule(
-        MakeGeluPattern("float", "TanhGeluFloat"),
-        MakeFastGeluReplacement()));
-    const FusionRewriteResult result =
-        MakeRuleSet(std::move(rules))->Apply(*model);
-    ASSERT_STATUS_OK(result.status);
-    EXPECT_EQ(result.replacements_applied, 0u);
-  }
-  {
-    auto model = MakeGeluModel("double");
-    std::vector<FusionRule> rules;
-    rules.push_back(MakeRule(
-        MakeGeluPattern("double", "TanhGeluDouble"),
+        MakeGeluPattern(dtype.tensor_type, dtype.rule_name),
         MakeFastGeluReplacement()));
     const FusionRewriteResult result =
         MakeRuleSet(std::move(rules))->Apply(*model);
@@ -1252,6 +1340,19 @@ TEST_F(FusionRewriterTest, GeluRulesUseDtypeSpecificLiterals) {
     EXPECT_EQ(CountOp(
                   model->MainGraph(), kMSDomain, "FastGelu"),
               1u);
+  }
+
+  for (const std::string_view target_type :
+       {"double", "float16", "bfloat16"}) {
+    auto model = MakeGeluModel(target_type);
+    std::vector<FusionRule> rules;
+    rules.push_back(MakeRule(
+        MakeGeluPattern("float", "TanhGeluFloat"),
+        MakeFastGeluReplacement()));
+    const FusionRewriteResult result =
+        MakeRuleSet(std::move(rules))->Apply(*model);
+    ASSERT_STATUS_OK(result.status);
+    EXPECT_EQ(result.replacements_applied, 0u);
   }
 }
 
@@ -1263,8 +1364,8 @@ TEST_F(FusionRewriterTest, GeluCoefficientOneBitNearMiss) {
   std::vector<FusionRule> rules;
   rules.push_back(MakeRule(
       MakeGeluPattern(), MakeFastGeluReplacement(),
-      MakeConstraints(), {}, 17, 0,
-      "TanhGeluFloatToFastGelu"));
+      MakeConstraints(), {},
+      FusionRuleOptions{17, "TanhGeluFloatToFastGelu", 0}));
   FusionTraceCollector trace;
   const FusionRewriteResult result =
       MakeRuleSet(std::move(rules), options)->Apply(*model, &trace);
@@ -1291,7 +1392,7 @@ TEST_F(FusionRewriterTest, GeluRankConditionNearMiss) {
       MakeGeluPattern(), MakeFastGeluReplacement(),
       MakeConstraints(FusionConstraint::RankIn(
           FusionValueRef::FormalInput(0), 1, 1)),
-      {}, 18, 0, "RankLimitedGelu"));
+      {}, FusionRuleOptions{18, "RankLimitedGelu", 0}));
   FusionTraceCollector trace;
 
   const FusionRewriteResult result =
@@ -1303,6 +1404,119 @@ TEST_F(FusionRewriterTest, GeluRankConditionNearMiss) {
   EXPECT_EQ(trace.BestFailures()[0].stage,
             FusionMatchStage::kCondition);
   EXPECT_TRUE(trace.BestFailures()[0].constraint.has_value());
+}
+
+TEST_F(FusionRewriterTest, BestFailuresIncludeMatcherRejectionReasons) {
+  const auto expect_failure =
+      [](const FunctionProto& pattern,
+         std::shared_ptr<Model> model,
+         FusionReplacementCall replacement,
+         FusionMatchStage expected_stage,
+         std::optional<FusionFailureCode> expected_code,
+         std::optional<NodeIndex> expected_anchor = std::nullopt) {
+        FusionRuleSetOptions options;
+        options.diagnostic_mode = FusionDiagnosticMode::kBestFailure;
+        std::vector<FusionRule> rules;
+        rules.push_back(MakeRule(
+            pattern, std::move(replacement), MakeConstraints(), {},
+            FusionRuleOptions{31, "matcher-near-miss", 0}));
+        FusionTraceCollector trace;
+
+        const FusionRewriteResult result =
+            MakeRuleSet(std::move(rules), options)->Apply(*model, &trace);
+
+        ASSERT_STATUS_OK(result.status);
+        EXPECT_EQ(result.replacements_applied, 0u);
+        ASSERT_EQ(trace.BestFailures().size(), 1u);
+        EXPECT_EQ(trace.BestFailures()[0].stage, expected_stage);
+        if (expected_code.has_value()) {
+          EXPECT_EQ(trace.BestFailures()[0].code, *expected_code);
+        }
+        if (expected_anchor.has_value()) {
+          EXPECT_EQ(trace.BestFailures()[0].anchor_node, *expected_anchor);
+        }
+        EXPECT_FALSE(trace.BestFailures()[0].detail.empty());
+      };
+
+  const FunctionProto structural_pattern = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "ort.pattern">
+ReluIdentity (x) => (out) {
+  activated = Relu(x)
+  out = Identity(activated)
+})");
+  auto structural_model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "com.microsoft" : 1]>
+target_graph (float[2] x, float[2] y) => (float[2] out) {
+  sum = Add(x, y)
+  out = Identity(sum)
+})");
+  const Node* expected_structural_anchor =
+      structural_model->MainGraph().GetProducerNode("out");
+  ASSERT_NE(expected_structural_anchor, nullptr);
+  const NodeIndex expected_structural_anchor_index =
+      expected_structural_anchor->Index();
+  expect_failure(
+      structural_pattern, std::move(structural_model),
+      MakeFastGeluReplacement(),
+      FusionMatchStage::kStructuralNode,
+      FusionFailureCode::kOpMismatch,
+      expected_structural_anchor_index);
+
+  const FunctionProto repeated_binding_pattern = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "ort.pattern">
+RepeatedAdd (x) => (out) {
+  sum = Add(x, x)
+  out = Identity(sum)
+})");
+  auto repeated_binding_model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "com.microsoft" : 1]>
+target_graph (float[2] x, float[2] y) => (float[2] out) {
+  sum = Add(x, y)
+  out = Identity(sum)
+})");
+  expect_failure(
+      repeated_binding_pattern, std::move(repeated_binding_model),
+      MakeFastGeluReplacement(),
+      FusionMatchStage::kValueBinding,
+      FusionFailureCode::kRepeatedBindingMismatch);
+
+  auto closure_model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "com.microsoft" : 1]>
+target_graph (float[2] x) => (float[2] out, float[2] side) {
+  intermediate = Identity(x)
+  out = Identity(intermediate)
+  side = Relu(intermediate)
+})");
+  expect_failure(
+      MakeTwoIdentityPattern(), std::move(closure_model),
+      MakeFastGeluReplacement(),
+      FusionMatchStage::kClosure,
+      FusionFailureCode::kExternalPrivateUse);
+
+  const FunctionProto non_convex_pattern = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "ort.pattern">
+NonConvex (x, reentry) => (first, out) {
+  first = Identity(x)
+  out = Add(first, reentry)
+})");
+  auto non_convex_model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "com.microsoft" : 1]>
+target_graph (float[2] x) => (float[2] first, float[2] out) {
+  first = Identity(x)
+  reentry = Relu(first)
+  out = Add(first, reentry)
+})");
+  expect_failure(
+      non_convex_pattern, std::move(non_convex_model),
+      MakeReplacementCall(
+          kOnnxDomain, "Dropout", 13, {0}, {0, 1}),
+      FusionMatchStage::kConvexity,
+      FusionFailureCode::kNonConvex);
+
+  expect_failure(
+      MakeTwoIdentityPattern(), MakeTwoIdentityModel("float[2, 3]"),
+      MakeReplacementCall(kOnnxDomain, "Transpose", 13),
+      FusionMatchStage::kFinalValidation, std::nullopt);
 }
 
 FusionFailureRecord MakeFailure(
@@ -1393,7 +1607,7 @@ TEST_F(FusionRewriterTest, DryRunReportsSuccessWithoutMutation) {
   const std::string before = SerializeGraph(model->MainGraph());
   FusionRuleSetOptions options;
   options.diagnostic_mode = FusionDiagnosticMode::kDryRun;
-  auto rule_set = MakeIdentityRuleSet(
+  auto rule_set = MakeTwoIdentityToFastGeluRuleSet(
       MakeConstraints(), {}, options, 9);
   FusionTraceCollector trace;
 
@@ -1415,7 +1629,7 @@ TEST_F(FusionRewriterTest, DiagnosticsDoNotConsumeSemanticBudget) {
     FusionRuleSetOptions options;
     options.max_rule_attempts = 0;
     options.diagnostic_mode = mode;
-    auto rule_set = MakeIdentityRuleSet(
+    auto rule_set = MakeTwoIdentityToFastGeluRuleSet(
         MakeConstraints(), {}, options);
     FusionTraceCollector trace;
     const FusionRewriteResult result = rule_set->Apply(
@@ -1438,11 +1652,13 @@ TEST_F(FusionRewriterTest, TriesAllApplicableRulesAtAnchor) {
   rules.push_back(MakeRule(
       MakeTwoIdentityPattern("Rejecting"),
       MakeReplacementCall(kOnnxDomain, "Relu", 13),
-      MakeConstraints(), std::move(reject), 1, -1));
+      MakeConstraints(), std::move(reject),
+      FusionRuleOptions{1, "rejecting", -1}));
   rules.push_back(MakeRule(
       MakeTwoIdentityPattern("Accepting"),
       MakeFastGeluReplacement(),
-      MakeConstraints(), {}, 2, 0));
+      MakeConstraints(), {},
+      FusionRuleOptions{2, "accepting", 0}));
 
   const FusionRewriteResult result =
       MakeRuleSet(std::move(rules))->Apply(*model);
@@ -1460,11 +1676,13 @@ TEST_F(FusionRewriterTest, AnchorLocalPriorityBreaksSameAnchorConflict) {
   rules.push_back(MakeRule(
       MakeTwoIdentityPattern("LaterPriority"),
       MakeFastGeluReplacement(),
-      MakeConstraints(), {}, 1, 10));
+      MakeConstraints(), {},
+      FusionRuleOptions{1, "later-priority", 10}));
   rules.push_back(MakeRule(
       MakeTwoIdentityPattern("EarlierPriority"),
       MakeReplacementCall(kOnnxDomain, "Relu", 13),
-      MakeConstraints(), {}, 2, -10));
+      MakeConstraints(), {},
+      FusionRuleOptions{2, "earlier-priority", -10}));
 
   const FusionRewriteResult result =
       MakeRuleSet(std::move(rules))->Apply(*model);
@@ -1488,11 +1706,13 @@ target_graph (float[2] x) => (float[2] out) {
   rules.push_back(MakeRule(
       MakeTwoIdentityPattern("Upstream"),
       MakeReplacementCall(kOnnxDomain, "Relu", 13),
-      MakeConstraints(), {}, 1, -100));
+      MakeConstraints(), {},
+      FusionRuleOptions{1, "upstream", -100}));
   rules.push_back(MakeRule(
       MakeIdentityReluPattern("Downstream"),
       MakeFastGeluReplacement(),
-      MakeConstraints(), {}, 2, 100));
+      MakeConstraints(), {},
+      FusionRuleOptions{2, "downstream", 100}));
 
   const FusionRewriteResult result =
       MakeRuleSet(std::move(rules))->Apply(*model);
@@ -1519,10 +1739,12 @@ target_graph (float[2] x, float[2] y) =>
   std::vector<FusionRule> rules;
   rules.push_back(MakeRule(
       MakeTwoIdentityPattern(),
-      MakeFastGeluReplacement(), MakeConstraints(), {}, 1));
+      MakeFastGeluReplacement(), MakeConstraints(), {},
+      FusionRuleOptions{1, "two-identity", 0}));
   rules.push_back(MakeRule(
       MakeIdentityReluPattern(),
-      MakeFastGeluReplacement(), MakeConstraints(), {}, 2));
+      MakeFastGeluReplacement(), MakeConstraints(), {},
+      FusionRuleOptions{2, "identity-relu", 0}));
 
   const FusionRewriteResult result =
       MakeRuleSet(std::move(rules))->Apply(*model);
@@ -1543,7 +1765,7 @@ target_graph (float[2] x) => (float[2] out) {
   third = Identity(second)
   out = Identity(third)
 })");
-  auto rule_set = MakeIdentityRuleSet();
+  auto rule_set = MakeTwoIdentityToFastGeluRuleSet();
 
   const FusionRewriteResult result = rule_set->Apply(*model);
 
@@ -1566,10 +1788,12 @@ target_graph (float[2] x) => (float[2] out) {
   rules.push_back(MakeRule(
       MakeTwoIdentityPattern(),
       MakeReplacementCall(kOnnxDomain, "Relu", 13),
-      MakeConstraints(), {}, 1));
+      MakeConstraints(), {},
+      FusionRuleOptions{1, "two-identity", 0}));
   rules.push_back(MakeRule(
       MakeIdentityReluPattern(),
-      MakeFastGeluReplacement(), MakeConstraints(), {}, 2));
+      MakeFastGeluReplacement(), MakeConstraints(), {},
+      FusionRuleOptions{2, "identity-relu", 0}));
 
   const FusionRewriteResult result =
       MakeRuleSet(std::move(rules))->Apply(*model);
@@ -1582,10 +1806,45 @@ target_graph (float[2] x) => (float[2] out) {
       CountOp(model->MainGraph(), kMSDomain, "FastGelu"), 1u);
 }
 
+TEST_F(FusionRewriterTest, RuleAttemptBudgetIsCumulativeAcrossEpochs) {
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "com.microsoft" : 1]>
+target_graph (float[2] x) => (float[2] out) {
+  first = Identity(x)
+  second = Identity(first)
+  out = Identity(second)
+})");
+  FusionMatchPredicate reject =
+      [](const FusionMatchContext&,
+         FusionConditionResult& result) -> common::Status {
+    result.decision = FusionConditionDecision::kNotSatisfied;
+    return Status::OK();
+  };
+  std::vector<FusionRule> rules;
+  rules.push_back(MakeRule(
+      MakeTwoIdentityPattern(),
+      MakeReplacementCall(kOnnxDomain, "Relu", 13),
+      MakeConstraints(), {},
+      FusionRuleOptions{1, "enable-next-epoch", 0}));
+  rules.push_back(MakeRule(
+      MakeIdentityReluPattern(),
+      MakeFastGeluReplacement(), MakeConstraints(), std::move(reject),
+      FusionRuleOptions{2, "reject-next-epoch", 0}));
+  FusionRuleSetOptions options;
+  options.max_rule_attempts = 4;
+
+  const FusionRewriteResult result =
+      MakeRuleSet(std::move(rules), options)->Apply(*model);
+
+  EXPECT_FALSE(result.status.IsOK());
+  EXPECT_EQ(result.replacements_applied, 1u);
+  EXPECT_EQ(result.epochs_completed, 1u);
+}
+
 TEST_F(FusionRewriterTest, DoesNotUseStaleIteratorOrNodeHandle) {
   constexpr size_t kRegionCount = 32;
   auto model = MakeIndependentRegionsModel(kRegionCount);
-  auto rule_set = MakeIdentityRuleSet();
+  auto rule_set = MakeTwoIdentityToFastGeluRuleSet();
 
   const FusionRewriteResult result = rule_set->Apply(*model);
 
@@ -1620,7 +1879,7 @@ target_graph (float[2] x) => (float[2] out) {
   third = Identity(second)
   out = Identity(third)
 })");
-  auto rule_set = MakeIdentityRuleSet();
+  auto rule_set = MakeTwoIdentityToFastGeluRuleSet();
   std::vector<EpochObservation> observations;
   FusionExecutionControls controls;
   controls.epoch_observer = RecordEpoch;
@@ -1646,11 +1905,13 @@ TEST_F(FusionRewriterTest, DeterministicAcrossUnrelatedRuleNoise) {
       rules.push_back(MakeRule(
           MakeIdentityReluPattern("Noise"),
           MakeReplacementCall(kOnnxDomain, "Relu", 13),
-          MakeConstraints(), {}, 99, -100));
+          MakeConstraints(), {},
+          FusionRuleOptions{99, "noise", -100}));
     }
     rules.push_back(MakeRule(
         MakeTwoIdentityPattern(),
-        MakeFastGeluReplacement(), MakeConstraints(), {}, 1));
+        MakeFastGeluReplacement(), MakeConstraints(), {},
+        FusionRuleOptions{1, "two-identity", 0}));
     const FusionRewriteResult result =
         MakeRuleSet(std::move(rules))->Apply(*model);
     EXPECT_STATUS_OK(result.status);
@@ -1665,7 +1926,7 @@ TEST_F(FusionRewriterTest, ZeroRuleAttemptBudgetDoesNoWork) {
   const std::string before = SerializeGraph(model->MainGraph());
   FusionRuleSetOptions options;
   options.max_rule_attempts = 0;
-  auto rule_set = MakeIdentityRuleSet(
+  auto rule_set = MakeTwoIdentityToFastGeluRuleSet(
       MakeConstraints(), {}, options);
 
   const FusionRewriteResult result = rule_set->Apply(*model);
@@ -1680,7 +1941,7 @@ TEST_F(FusionRewriterTest, ReplacementBudgetFailsBeforeCurrentBatchMutates) {
   const std::string before = SerializeGraph(bounded_model->MainGraph());
   FusionRuleSetOptions bounded_options;
   bounded_options.max_replacements = 1;
-  auto bounded_rule_set = MakeIdentityRuleSet(
+  auto bounded_rule_set = MakeTwoIdentityToFastGeluRuleSet(
       MakeConstraints(), {}, bounded_options);
   const FusionRewriteResult bounded_result =
       bounded_rule_set->Apply(*bounded_model);
@@ -1691,7 +1952,7 @@ TEST_F(FusionRewriterTest, ReplacementBudgetFailsBeforeCurrentBatchMutates) {
   auto permissive_model = MakeIndependentRegionsModel(2);
   FusionRuleSetOptions permissive_options;
   permissive_options.max_replacements = 2;
-  auto permissive_rule_set = MakeIdentityRuleSet(
+  auto permissive_rule_set = MakeTwoIdentityToFastGeluRuleSet(
       MakeConstraints(), {}, permissive_options);
   const FusionRewriteResult permissive_result =
       permissive_rule_set->Apply(*permissive_model);
@@ -1710,7 +1971,7 @@ TEST_F(FusionRewriterTest, ConditionBudgetCountsRejectedCandidates) {
     result.decision = FusionConditionDecision::kNotSatisfied;
     return Status::OK();
   };
-  auto rule_set = MakeIdentityRuleSet(
+  auto rule_set = MakeTwoIdentityToFastGeluRuleSet(
       MakeConstraints(), std::move(reject), options);
 
   const FusionRewriteResult result = rule_set->Apply(*model);
@@ -1725,7 +1986,7 @@ TEST_F(FusionRewriterTest, ConstraintConstructionBudgetsRejectOversizedPrograms)
     auto model = MakeTwoIdentityModel();
     FusionRuleSetOptions options;
     options.max_constraint_nodes = 2;
-    auto rule_set = MakeIdentityRuleSet(
+    auto rule_set = MakeTwoIdentityToFastGeluRuleSet(
         MakeConstraints(FusionConstraint::AllOf({
             FusionConstraint::IsTensor(
                 FusionValueRef::FormalInput(0)),
@@ -1746,7 +2007,7 @@ TEST_F(FusionRewriterTest, ConstraintConstructionBudgetsRejectOversizedPrograms)
         {{FusionValueRef::FormalInput(0), 0},
          {FusionValueRef::FormalOutput(0), 0}},
         FusionUnknownPolicy::kReject};
-    auto rule_set = MakeIdentityRuleSet(
+    auto rule_set = MakeTwoIdentityToFastGeluRuleSet(
         MakeConstraints(
             FusionConstraint::AllOf({}), {std::move(dimensions)}),
         {}, options);
@@ -1805,10 +2066,12 @@ target_graph (float[2] x) => (float[2] out) {
   rules.push_back(MakeRule(
       MakeTwoIdentityPattern(),
       MakeReplacementCall(kOnnxDomain, "Relu", 13),
-      MakeConstraints(), {}, 1));
+      MakeConstraints(), {},
+      FusionRuleOptions{1, "two-identity", 0}));
   rules.push_back(MakeRule(
       MakeIdentityReluPattern(),
-      MakeFastGeluReplacement(), MakeConstraints(), {}, 2));
+      MakeFastGeluReplacement(), MakeConstraints(), {},
+      FusionRuleOptions{2, "identity-relu", 0}));
   FusionRuleSetOptions options;
   options.max_epochs = 1;
 
@@ -1829,7 +2092,7 @@ common::Status InjectResolveFailure(
 
 TEST_F(FusionRewriterTest, PostMutationResolveFailureReportsAppliedCount) {
   auto model = MakeTwoIdentityModel();
-  auto rule_set = MakeIdentityRuleSet();
+  auto rule_set = MakeTwoIdentityToFastGeluRuleSet();
   FusionExecutionControls controls;
   controls.resolve_graph = InjectResolveFailure;
 
@@ -1890,6 +2153,65 @@ target_graph (float[2] x) => (float[2] out) {
             extractor_call.InputDefs()[0]->Name());
   EXPECT_EQ(fusion_call.OutputDefs()[0]->Name(),
             extractor_call.OutputDefs()[0]->Name());
+}
+
+TEST_F(FusionRewriterTest, FunctionExtractorRejectsPresentAndOmittedRepeatedFormal) {
+  const FunctionProto function = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "ort.pattern">
+RepeatedOptionalClip (x, minimum) => (out) {
+  first = Clip(x, minimum)
+  out = Clip(first, minimum)
+})");
+  const std::array<FunctionProto, 1> functions{function};
+  for (const std::string_view body : {
+           R"(  minimum = Constant <value = float {-1.0}> ()
+  first = Clip(x, minimum)
+  out = Clip(first)
+)",
+           R"(  minimum = Constant <value = float {-1.0}> ()
+  first = Clip(x)
+  out = Clip(first, minimum)
+)",
+       }) {
+    auto model = MakeModelFromText(
+        "<ir_version: 8, opset_import: [\"\" : 13, "
+        "\"ort.pattern\" : 1]>\n"
+        "target_graph (float[2] x) => (float[2] out) {\n" +
+            std::string{body} + "}",
+        functions);
+    const std::string before = SerializeGraph(model->MainGraph());
+
+    const FunctionExtractionResult result =
+        FunctionExtractor(function).Extract(model->MainGraph());
+
+    ASSERT_STATUS_OK(result.status);
+    EXPECT_EQ(result.replacements_applied, 0u);
+    EXPECT_EQ(SerializeGraph(model->MainGraph()), before);
+  }
+}
+
+TEST_F(FusionRewriterTest, FusionRuleSetAcceptsOmittedOptionalFormalInput) {
+  const FunctionProto function = ParseFunction(
+      R"(<opset_import: ["" : 13], domain: "ort.pattern">
+OptionalClip (x, minimum) => (out) {
+  clipped = Clip(x, minimum)
+  out = Identity(clipped)
+})");
+  auto model = MakeModelFromText(
+      R"(<ir_version: 8, opset_import: ["" : 13, "com.microsoft" : 1]>
+target_graph (float[2] x) => (float[2] out) {
+  clipped = Clip(x)
+  out = Identity(clipped)
+})");
+  std::vector<FusionRule> rules;
+  rules.push_back(MakeRule(
+      function, MakeFastGeluReplacement()));
+
+  const FusionRewriteResult result =
+      MakeRuleSet(std::move(rules))->Apply(*model);
+
+  ASSERT_STATUS_OK(result.status);
+  EXPECT_EQ(result.replacements_applied, 1u);
 }
 
 TEST_F(FusionRewriterTest, FunctionExtractorStillRequiresRegisteredIdentity) {
