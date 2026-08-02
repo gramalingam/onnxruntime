@@ -354,7 +354,8 @@ void AddSchemaDefaults(const ONNX_NAMESPACE::OpSchema& schema,
 bool IsAllowedOnnxPureOp(std::string_view op_type) {
   static const InlinedHashSet<std::string> pure_ops{
       "Identity", "Add", "Sub", "Mul", "Div", "Relu", "Cast", "MatMul",
-      "Transpose", "Reshape", "Clip", "Concat", "MaxPool", "LeakyRelu"};
+      "Transpose", "Reshape", "Clip", "Concat", "MaxPool", "LeakyRelu",
+      "Pow", "Tanh"};
   return pure_ops.find(op_type) != pure_ops.end();
 }
 

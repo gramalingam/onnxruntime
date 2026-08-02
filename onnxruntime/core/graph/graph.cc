@@ -2875,6 +2875,84 @@ class InferenceContextImpl : public ONNX_NAMESPACE::InferenceContext {
   mutable InlinedVector<std::unique_ptr<ONNX_NAMESPACE::TensorProto>> temp_tensor_protos_;
 };
 
+class VirtualNodeInferenceContext final
+    : public ONNX_NAMESPACE::InferenceContext {
+ public:
+  VirtualNodeInferenceContext(
+      const Graph& graph,
+      gsl::span<const NodeArg* const> inputs,
+      size_t output_count,
+      const NodeAttributes& attributes)
+      : graph_(graph),
+        inputs_(inputs),
+        output_types_(output_count),
+        attributes_(attributes) {}
+
+  const AttributeProto* getAttribute(
+      const std::string& name) const override {
+    const auto it = attributes_.find(name);
+    return it == attributes_.end() ? nullptr : &it->second;
+  }
+
+  size_t getNumInputs() const noexcept override {
+    return inputs_.size();
+  }
+
+  const TypeProto* getInputType(size_t index) const override {
+    if (index >= inputs_.size()) return nullptr;
+    const auto* input = inputs_[index];
+    return input != nullptr && input->Exists()
+               ? input->TypeAsProto()
+               : nullptr;
+  }
+
+  size_t getNumOutputs() const noexcept override {
+    return output_types_.size();
+  }
+
+  TypeProto* getOutputType(size_t index) override {
+    if (index >= output_types_.size()) {
+      fail_type_inference(
+          "output index ", index, " is out of range; virtual node has ",
+          output_types_.size(), " outputs");
+    }
+    return &output_types_[index];
+  }
+
+  const TensorProto* getInputData(size_t index) const override {
+    if (index >= inputs_.size() || inputs_[index] == nullptr ||
+        !inputs_[index]->Exists()) {
+      return nullptr;
+    }
+    return graph_.GetConstantInitializer(inputs_[index]->Name(), true);
+  }
+
+  const TensorShapeProto* getSymbolicInput(size_t) const override {
+    return nullptr;
+  }
+
+  GraphInferencer* getGraphAttributeInferencer(
+      const std::string& attribute_name) override {
+    fail_type_inference(
+        "virtual replacement validation does not support graph attribute ",
+        attribute_name);
+  }
+
+  const SparseTensorProto* getInputSparseData(size_t) const override {
+    return nullptr;
+  }
+
+  const std::vector<TypeProto>& OutputTypes() const noexcept {
+    return output_types_;
+  }
+
+ private:
+  const Graph& graph_;
+  gsl::span<const NodeArg* const> inputs_;
+  std::vector<TypeProto> output_types_;
+  const NodeAttributes& attributes_;
+};
+
 // An implementation of the DataPropagationContext interface optional by operator-specific
 // shape inference for onnxruntime graphs.
 // Please see the description and usage of ONNX's data propagation here:
@@ -3205,6 +3283,143 @@ Status Graph::UpdateShapeInference(Node& node) {
   // Whilst the type inferencing will run again we don't allow type overrides due to using the default
   // ResolveOptions settings, so essentially this can only change the shape information.
   return InferAndVerifyTypeMatch(node, *node.Op(), {});
+}
+
+Status Graph::ValidateAndInferNodeTypeAndShape(
+    std::string_view diagnostic_node_name,
+    const OpSchema& schema,
+    gsl::span<const NodeArg* const> input_defs,
+    gsl::span<const int> input_arg_count,
+    gsl::span<const NodeArg* const> expected_output_defs,
+    const NodeAttributes& attributes,
+    std::vector<std::optional<TypeProto>>& inferred_output_types) const {
+  ORT_RETURN_IF(
+      input_defs.size() < static_cast<size_t>(schema.min_input()) ||
+          input_defs.size() > static_cast<size_t>(schema.max_input()),
+      "Virtual node (", diagnostic_node_name,
+      ") has an invalid input count for operator ", schema.Name(), ".");
+  ORT_RETURN_IF(
+      expected_output_defs.size() <
+              static_cast<size_t>(schema.min_output()) ||
+          expected_output_defs.size() >
+              static_cast<size_t>(schema.max_output()),
+      "Virtual node (", diagnostic_node_name,
+      ") has an invalid output count for operator ", schema.Name(), ".");
+  ORT_RETURN_IF(input_arg_count.size() != schema.inputs().size(),
+                "Virtual node input arity metadata does not match schema.");
+
+  for (const auto& [name, definition] : schema.attributes()) {
+    const auto attribute = attributes.find(name);
+    ORT_RETURN_IF(
+        definition.required && attribute == attributes.end(),
+        "Virtual node (", diagnostic_node_name,
+        ") is missing required attribute '", name, "'.");
+    ORT_RETURN_IF(
+        attribute != attributes.end() &&
+            attribute->second.type() != definition.type,
+        "Virtual node (", diagnostic_node_name, ") attribute '", name,
+        "' has the wrong type.");
+  }
+  for (const auto& [name, _] : attributes) {
+    ORT_RETURN_IF(schema.attributes().find(name) ==
+                      schema.attributes().end(),
+                  "Virtual node (", diagnostic_node_name,
+                  ") has unknown attribute '", name, "'.");
+  }
+
+  std::unordered_map<std::string, DataType>
+      type_parameter_to_type_map;
+  size_t input_index = 0;
+  for (size_t formal_index = 0;
+       formal_index < input_arg_count.size(); ++formal_index) {
+    const auto& formal = schema.inputs()[formal_index];
+    for (int occurrence = 0;
+         occurrence < input_arg_count[formal_index];
+         ++occurrence, ++input_index) {
+      ORT_RETURN_IF(input_index >= input_defs.size(),
+                    "Virtual node input arity metadata is invalid.");
+      const auto* input = input_defs[input_index];
+      if (input == nullptr || !input->Exists()) continue;
+      const DataType input_type = input->Type();
+      ORT_RETURN_IF(input_type == nullptr,
+                    "Virtual node input '", input->Name(),
+                    "' has no type.");
+      ORT_RETURN_IF(formal.GetTypes().count(input_type) == 0,
+                    "Type '", *input_type, "' of virtual node input '",
+                    input->Name(), "' is invalid for operator ",
+                    schema.Name(), ".");
+      if (formal.GetIsHomogeneous()) {
+        const auto [it, inserted] =
+            type_parameter_to_type_map.emplace(
+                formal.GetTypeStr(), input_type);
+        ORT_RETURN_IF(!inserted && it->second != input_type,
+                      "Virtual node type parameter '",
+                      formal.GetTypeStr(),
+                      "' is bound to different input types.");
+      }
+    }
+  }
+  ORT_RETURN_IF(input_index != input_defs.size(),
+                "Virtual node input arity metadata is incomplete.");
+
+  VirtualNodeInferenceContext context(
+      *this, input_defs, expected_output_defs.size(), attributes);
+  auto inference_status = Status::OK();
+  ORT_TRY {
+    schema.GetTypeAndShapeInferenceFunction()(context);
+  }
+  ORT_CATCH(const std::exception& ex) {
+    ORT_HANDLE_EXCEPTION([&]() {
+      inference_status = ORT_MAKE_STATUS(
+          ONNXRUNTIME, FAIL, "Virtual node (", diagnostic_node_name,
+          ") operator (", schema.Name(), ") ", ex.what());
+    });
+  }
+  ORT_RETURN_IF_ERROR(inference_status);
+
+  inferred_output_types.clear();
+  inferred_output_types.reserve(expected_output_defs.size());
+  for (size_t output_index = 0;
+       output_index < expected_output_defs.size(); ++output_index) {
+    const auto& inferred = context.OutputTypes()[output_index];
+    const auto* expected = expected_output_defs[output_index];
+    ORT_RETURN_IF(expected == nullptr || !expected->Exists(),
+                  "Virtual node has a missing required output.");
+    const size_t formal_index = std::min(
+        output_index, schema.outputs().size() - 1);
+    const auto& formal = schema.outputs()[formal_index];
+    DataType inferred_type = nullptr;
+    const auto bound =
+        type_parameter_to_type_map.find(formal.GetTypeStr());
+    if (formal.GetIsHomogeneous() &&
+        bound != type_parameter_to_type_map.end()) {
+      inferred_type = bound->second;
+    } else if (formal.GetTypes().size() == 1) {
+      inferred_type = *formal.GetTypes().begin();
+    } else if (FullyDefinedType(inferred)) {
+      inferred_type = DataTypeUtils::ToType(inferred);
+    }
+    ORT_RETURN_IF(
+        expected->Type() != nullptr && inferred_type != nullptr &&
+            expected->Type() != inferred_type,
+        "Virtual node output '", expected->Name(),
+        "' type does not match the replacement schema.");
+
+    if (utils::HasShape(inferred) && expected->Shape() != nullptr) {
+      TypeProto merge_target;
+      if (expected->TypeAsProto() != nullptr) {
+        merge_target = *expected->TypeAsProto();
+      }
+      ORT_RETURN_IF_ERROR(MergeShapeInfo(
+          expected->Name(), inferred, merge_target,
+          true, logger_));
+    }
+    inferred_output_types.emplace_back(
+        inferred.ByteSizeLong() == 0
+            ? std::optional<TypeProto>{}
+            : std::optional<TypeProto>{inferred});
+  }
+  return Status::OK();
 }
 
 // Implementation of type-inference and type-checking for a single node

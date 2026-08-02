@@ -1539,6 +1539,18 @@ class Graph {  // NOLINT(clang-analyzer-optin.performance.Padding): preserve exi
   */
   Status UpdateShapeInference(Node& node);
 
+#if !defined(ORT_MINIMAL_BUILD)
+  common::Status ValidateAndInferNodeTypeAndShape(
+      std::string_view diagnostic_node_name,
+      const ONNX_NAMESPACE::OpSchema& schema,
+      gsl::span<const NodeArg* const> input_defs,
+      gsl::span<const int> input_arg_count,
+      gsl::span<const NodeArg* const> expected_output_defs,
+      const NodeAttributes& attributes,
+      std::vector<std::optional<ONNX_NAMESPACE::TypeProto>>&
+          inferred_output_types) const;
+#endif
+
   // Options to control Graph::Resolve.
   struct ResolveOptions {
     // Whether to override existing types with inferred types.

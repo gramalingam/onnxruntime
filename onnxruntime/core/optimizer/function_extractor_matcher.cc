@@ -73,9 +73,17 @@ bool NodeSignatureMatches(const ResolvedPatternNode& pattern_node, const Node& t
   if (pattern_node.op_type != target_node.OpType() ||
       pattern_node.overload != target_node.Overload() ||
       pattern_node.since_version != target_node.SinceVersion() ||
-      pattern_node.input_arity != target_node.InputDefs().size() ||
+      pattern_node.input_arity < target_node.InputDefs().size() ||
       pattern_node.output_arity != target_node.OutputDefs().size()) {
     return false;
+  }
+  for (size_t input_index = target_node.InputDefs().size();
+       input_index < pattern_node.input_arity; ++input_index) {
+    if (input_index >= pattern_node.schema->inputs().size() ||
+        pattern_node.schema->inputs()[input_index].GetOption() !=
+            ONNX_NAMESPACE::OpSchema::Optional) {
+      return false;
+    }
   }
   for (const auto& [name, pattern_attribute] : pattern_node.effective_attributes) {
     const auto* target_attribute = EffectiveTargetAttribute(target_node, name);
@@ -177,6 +185,7 @@ struct CandidateMatcher {
   size_t& attribute_payload_bytes_inspected;
   size_t& aggregate_work_units;
   size_t primary_output_group;
+  const CompleteBindingHook* complete_binding_hook;
   MatchState state;
 
   Status ConsumeWork() {
@@ -353,7 +362,10 @@ struct CandidateMatcher {
     for (size_t input_index = 0; input_index < pattern_node.input_value_ids.size(); ++input_index) {
       ORT_RETURN_IF_ERROR(ConsumeWork());
       const auto pattern_input = pattern_node.input_value_ids[input_index];
-      const auto* target_input = target_node->InputDefs()[input_index];
+      const auto* target_input =
+          input_index < target_node->InputDefs().size()
+              ? target_node->InputDefs()[input_index]
+              : nullptr;
       if (pattern_input == kMissingPatternValue) {
         if (target_input != nullptr && target_input->Exists()) {
           matched = false;
@@ -362,6 +374,11 @@ struct CandidateMatcher {
         continue;
       }
       if (target_input == nullptr || !target_input->Exists()) {
+        if (normalized.values[pattern_input].is_formal_input) {
+          state.value_visit_states[pattern_input] =
+              ValueVisitState::Processed;
+          continue;
+        }
         matched = false;
         return Status::OK();
       }
@@ -455,7 +472,20 @@ struct CandidateMatcher {
       }
     }
 
-    return ValidateCandidateAndBuildPlan(plan, matched);
+    std::shared_ptr<void> extension_data;
+    if (complete_binding_hook != nullptr) {
+      bool accepted = true;
+      ORT_RETURN_IF_ERROR((*complete_binding_hook)(
+          state, snapshot, accepted, extension_data));
+      if (!accepted) {
+        matched = false;
+        return Status::OK();
+      }
+    }
+
+    ORT_RETURN_IF_ERROR(ValidateCandidateAndBuildPlan(plan, matched));
+    if (matched) plan.extension_data = std::move(extension_data);
+    return Status::OK();
   }
 
   Status ValidateCandidateAndBuildPlan(ReplacementPlan& plan, bool& matched) {
@@ -671,15 +701,6 @@ Status BuildTargetGraphSnapshot(
   snapshot.topological_node_indices.assign(topological_order.begin(), topological_order.end());
   snapshot.root_candidates_by_group.resize(
       compiled_pattern.formal_output_producer_groups.size());
-  InlinedHashMap<std::string, InlinedVector<size_t>> groups_by_signature;
-  for (size_t group_index = 0;
-       group_index < compiled_pattern.formal_output_producer_groups.size();
-       ++group_index) {
-    const auto pattern_node_id =
-        compiled_pattern.formal_output_producer_groups[group_index].producer_node_id;
-    groups_by_signature[SignatureKey(compiled_pattern.resolved_nodes[pattern_node_id])]
-        .push_back(group_index);
-  }
   InlinedHashMap<std::string, NodeIndex> node_indices_by_name;
   for (const auto node_index : snapshot.topological_node_indices) {
     const auto* node = snapshot.graph_viewer->GetNode(node_index);
@@ -718,20 +739,28 @@ Status BuildTargetGraphSnapshot(
         snapshot.implicit_consumers[implicit_input].push_back(node_index);
       }
     }
-    const auto compatible_groups = groups_by_signature.find(SignatureKey(*node));
-    if (compatible_groups != groups_by_signature.end()) {
-      for (const auto group_index : compatible_groups->second) {
-        ORT_RETURN_IF(snapshot.aggregate_work_units >= options.max_worklist_bindings,
-                      "FunctionExtractor aggregate root-index work budget exceeded.");
-        ++snapshot.aggregate_work_units;
-        const auto pattern_node_id =
-            compiled_pattern.formal_output_producer_groups[group_index].producer_node_id;
-        if (!NodeSignatureMatches(compiled_pattern.resolved_nodes[pattern_node_id], *node)) continue;
-        ORT_RETURN_IF(candidate_entry_count >= options.max_output_root_tuples,
-                      "FunctionExtractor root candidate-entry budget exceeded.");
-        snapshot.root_candidates_by_group[group_index].push_back(node_index);
-        ++candidate_entry_count;
+    for (size_t group_index = 0;
+         group_index <
+         compiled_pattern.formal_output_producer_groups.size();
+         ++group_index) {
+      ORT_RETURN_IF(snapshot.aggregate_work_units >=
+                        options.max_worklist_bindings,
+                    "FunctionExtractor aggregate root-index work budget exceeded.");
+      ++snapshot.aggregate_work_units;
+      const auto pattern_node_id =
+          compiled_pattern.formal_output_producer_groups[group_index]
+              .producer_node_id;
+      if (!NodeSignatureMatches(
+              compiled_pattern.resolved_nodes[pattern_node_id],
+              *node)) {
+        continue;
       }
+      ORT_RETURN_IF(candidate_entry_count >=
+                        options.max_output_root_tuples,
+                    "FunctionExtractor root candidate-entry budget exceeded.");
+      snapshot.root_candidates_by_group[group_index].push_back(
+          node_index);
+      ++candidate_entry_count;
     }
   }
   for (const auto* output : snapshot.graph_viewer->GetOutputs()) {
@@ -750,7 +779,8 @@ Status DiscoverReplacementPlans(
     const TargetGraphSnapshot& snapshot,
     const FunctionExtractorOptions& options,
     std::vector<ReplacementPlan>& plans,
-    MatcherDiagnostics* diagnostics) {
+    MatcherDiagnostics* diagnostics,
+    const CompleteBindingHook* complete_binding_hook) {
   plans.clear();
   const auto& groups = compiled_pattern.formal_output_producer_groups;
   ORT_RETURN_IF(groups.empty(), "FunctionExtractor pattern has no formal output producer.");
@@ -791,7 +821,7 @@ Status DiscoverReplacementPlans(
       CandidateMatcher matcher{compiled_pattern, snapshot, options, diagnostics,
                                literal_bytes_compared, attribute_payload_bytes_inspected,
                                aggregate_work_units,
-                               primary_output_group};
+                               primary_output_group, complete_binding_hook};
       ReplacementPlan plan;
       bool matched = false;
       enumeration_status = matcher.Run(tuple, plan, matched);
@@ -844,11 +874,20 @@ Status SelectNonConflictingPlans(
   return Status::OK();
 }
 
+bool ReplacementPlansConflict(
+    const ReplacementPlan& lhs,
+    const ReplacementPlan& rhs) {
+  return PlansConflict(lhs, rhs);
+}
+
 Status PrevalidatePlans(
     const Graph& graph,
     const CompiledFunctionPattern& compiled_pattern,
-    gsl::span<const ReplacementPlan> plans) {
-  ORT_RETURN_IF_ERROR(ValidateRegisteredFunction(*compiled_pattern.normalized_pattern, graph));
+    gsl::span<const ReplacementPlan> plans,
+    bool require_registered_pattern) {
+  if (require_registered_pattern) {
+    ORT_RETURN_IF_ERROR(ValidateRegisteredFunction(*compiled_pattern.normalized_pattern, graph));
+  }
   FunctionExtractorOptions snapshot_options;
   snapshot_options.max_target_nodes = std::numeric_limits<size_t>::max();
   TargetGraphSnapshot snapshot;
@@ -942,7 +981,8 @@ Status PrevalidatePlans(
     ORT_RETURN_IF_NOT(edges_equal(current_output_edges, plan.explicit_output_edges),
                       "Replacement plan output edges changed.");
     for (const auto* input : plan.call_inputs) {
-      ORT_RETURN_IF(input == nullptr || !input->Exists(), "Replacement plan has a stale call input.");
+      ORT_RETURN_IF(input != nullptr && !input->Exists(),
+                    "Replacement plan has a stale call input.");
     }
     for (const auto* output : plan.call_outputs) {
       ORT_RETURN_IF(output == nullptr || !output->Exists(), "Replacement plan has a stale call output.");

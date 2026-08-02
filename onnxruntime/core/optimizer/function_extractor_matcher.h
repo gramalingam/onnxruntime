@@ -3,6 +3,7 @@
 #if !defined(ORT_MINIMAL_BUILD)
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -102,7 +103,12 @@ struct ReplacementPlan {
   InlinedHashSet<const NodeArg*> graph_outputs;
   std::string layering_annotation;
   std::string generated_call_name;
+  std::shared_ptr<void> extension_data;
 };
+
+using CompleteBindingHook = std::function<common::Status(
+    const MatchState&, const TargetGraphSnapshot&, bool&,
+    std::shared_ptr<void>&)>;
 
 struct MatcherDiagnostics {
   size_t output_root_tuples_considered{};
@@ -123,16 +129,31 @@ common::Status DiscoverReplacementPlans(
     const TargetGraphSnapshot& snapshot,
     const FunctionExtractorOptions& options,
     std::vector<ReplacementPlan>& plans,
-    MatcherDiagnostics* diagnostics = nullptr);
+    MatcherDiagnostics* diagnostics = nullptr,
+    const CompleteBindingHook* complete_binding_hook = nullptr);
 
 common::Status SelectNonConflictingPlans(
     gsl::span<const ReplacementPlan> plans,
     std::vector<size_t>& selected_plan_indices);
 
+bool ReplacementPlansConflict(
+    const ReplacementPlan& lhs,
+    const ReplacementPlan& rhs);
+
 common::Status PrevalidatePlans(
     const Graph& graph,
     const CompiledFunctionPattern& compiled_pattern,
-    gsl::span<const ReplacementPlan> plans);
+    gsl::span<const ReplacementPlan> plans,
+    bool require_registered_pattern = true);
+
+common::Status ApplyReplacementPlan(
+    Graph& graph,
+    const ReplacementPlan& plan,
+    std::string_view op_type,
+    std::string_view domain,
+    std::string_view overload,
+    std::string_view description,
+    bool& call_added);
 
 using GraphResolveFunction = common::Status (*)(Graph&, const Graph::ResolveOptions&);
 

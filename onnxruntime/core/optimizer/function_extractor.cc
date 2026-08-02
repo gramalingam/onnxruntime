@@ -13,15 +13,15 @@
 #include "core/optimizer/function_extractor_pattern.h"
 
 namespace onnxruntime {
-namespace {
-
-using function_extractor_internal::CompiledFunctionPattern;
-using function_extractor_internal::ReplacementPlan;
+namespace function_extractor_internal {
 
 common::Status ApplyReplacementPlan(
     Graph& graph,
-    const ONNX_NAMESPACE::FunctionProto& function_proto,
     const ReplacementPlan& plan,
+    std::string_view op_type,
+    std::string_view domain,
+    std::string_view overload,
+    std::string_view description,
     bool& call_added) {
   call_added = false;
   InlinedHashSet<NodeIndex> removable(plan.removable_node_indices.begin(),
@@ -42,19 +42,26 @@ common::Status ApplyReplacementPlan(
                       "FunctionExtractor failed to remove a planned node.");
   }
 
+  auto call_inputs = plan.call_inputs;
+  for (auto*& input : call_inputs) {
+    if (input == nullptr) {
+      input = &graph.GetOrCreateNodeArg("", nullptr);
+    }
+  }
   Node& call = graph.AddNode(plan.generated_call_name,
-                             function_proto.name(),
-                             "Function call created by FunctionExtractor",
-                             plan.call_inputs,
+                             std::string{op_type},
+                             std::string{description},
+                             call_inputs,
                              plan.call_outputs,
                              &plan.call_attributes,
-                             function_proto.domain());
+                             std::string{domain});
   call_added = true;
-  call.SetOverload(function_proto.overload());
+  call.SetOverload(std::string{overload});
   call.SetLayeringAnnotation(plan.layering_annotation);
 
   for (size_t input_index = 0; input_index < plan.call_inputs.size(); ++input_index) {
     const auto* input = plan.call_inputs[input_index];
+    if (input == nullptr) continue;
     const auto producer_edge = std::find_if(
         plan.explicit_input_edges.begin(), plan.explicit_input_edges.end(),
         [&](const graph_utils::GraphEdge& edge) { return edge.arg_name == input->Name(); });
@@ -78,7 +85,7 @@ common::Status ApplyReplacementPlan(
   return common::Status::OK();
 }
 
-}  // namespace
+}  // namespace function_extractor_internal
 
 namespace function_extractor_internal {
 
@@ -165,8 +172,13 @@ FunctionExtractionResult ExtractGraph(
         }
       }
       bool call_added = false;
-      result.status =
-          ApplyReplacementPlan(graph, normalized_pattern.function_proto, plan, call_added);
+      result.status = ApplyReplacementPlan(
+          graph, plan,
+          normalized_pattern.function_proto.name(),
+          normalized_pattern.function_proto.domain(),
+          normalized_pattern.function_proto.overload(),
+          "Function call created by FunctionExtractor",
+          call_added);
       if (call_added) ++result.replacements_applied;
       if (!result.status.IsOK()) return result;
     }
