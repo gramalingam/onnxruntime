@@ -19,6 +19,27 @@ Status MatcherError(const std::string& message) {
   return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "FunctionExtractor matcher: ", message);
 }
 
+std::string RootSignatureKey(std::string_view domain,
+                             std::string_view op_type,
+                             std::string_view overload,
+                             int since_version,
+                             size_t output_arity) {
+  return MakeString(domain.size(), ':', domain,
+                    op_type.size(), ':', op_type,
+                    overload.size(), ':', overload,
+                    since_version, ':', output_arity);
+}
+
+std::string RootSignatureKey(const ResolvedPatternNode& node) {
+  return RootSignatureKey(node.canonical_domain, node.op_type, node.overload,
+                          node.since_version, node.output_arity);
+}
+
+std::string RootSignatureKey(const Node& node) {
+  return RootSignatureKey(node.Domain(), node.OpType(), node.Overload(),
+                          node.SinceVersion(), node.OutputDefs().size());
+}
+
 bool PatternTypeCompatible(const PatternValue& pattern_value, const NodeArg& target_value) {
   if (!pattern_value.has_type || target_value.TypeAsProto() == nullptr) return true;
   const auto& lhs = pattern_value.type;
@@ -804,6 +825,8 @@ Status BuildTargetGraphSnapshot(
     ORT_RETURN_IF(node == nullptr || node->Op() == nullptr,
                   "FunctionExtractor requires a resolved target graph.");
     node_indices_by_name.emplace(node->Name(), node_index);
+    snapshot.nodes_by_root_signature[RootSignatureKey(*node)].push_back(
+        node_index);
   }
   for (size_t position = 0; position < snapshot.topological_node_indices.size(); ++position) {
     const auto node_index = snapshot.topological_node_indices[position];
@@ -875,14 +898,23 @@ Status DiscoverReplacementPlans(
       compiled_pattern.normalized_pattern->pattern_attribute_payload_bytes;
   ORT_RETURN_IF(attribute_payload_bytes_inspected > options.max_attribute_bytes,
                 "FunctionExtractor attribute byte budget exceeded.");
-  size_t aggregate_work_units = snapshot.aggregate_work_units;
-  for (const auto node_index : snapshot.topological_node_indices) {
-    const auto* node = snapshot.graph_viewer->GetNode(node_index);
-    for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
+  size_t local_work_units = snapshot.aggregate_work_units;
+  size_t& aggregate_work_units =
+      execution_options.total_work_units == nullptr
+          ? local_work_units
+          : *execution_options.total_work_units;
+  for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
+    const auto pattern_node_id = groups[group_index].producer_node_id;
+    const auto signature_candidates = snapshot.nodes_by_root_signature.find(
+        RootSignatureKey(compiled_pattern.resolved_nodes[pattern_node_id]));
+    if (signature_candidates == snapshot.nodes_by_root_signature.end()) {
+      continue;
+    }
+    for (const auto node_index : signature_candidates->second) {
       ORT_RETURN_IF(aggregate_work_units >= options.max_worklist_bindings,
                     "FunctionExtractor aggregate root-index work budget exceeded.");
       ++aggregate_work_units;
-      const auto pattern_node_id = groups[group_index].producer_node_id;
+      const auto* node = snapshot.graph_viewer->GetNode(node_index);
       if (!NodeSignatureMatches(
               compiled_pattern.resolved_nodes[pattern_node_id], *node)) {
         continue;

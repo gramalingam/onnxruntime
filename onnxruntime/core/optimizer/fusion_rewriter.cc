@@ -195,6 +195,7 @@ common::Status DiscoverSelectedPlans(
     std::vector<FusionReplacementPlan>& selected_plans,
     size_t& condition_evaluations,
     size_t& rule_attempts,
+    size_t& work_units,
     size_t epoch,
     FailureSink* failure_sink) {
   ORT_RETURN_IF_ERROR(ValidateGraphForDiscovery(graph));
@@ -206,6 +207,12 @@ common::Status DiscoverSelectedPlans(
   function_extractor_internal::TargetGraphSnapshot snapshot;
   ORT_RETURN_IF_ERROR(function_extractor_internal::BuildTargetGraphSnapshot(
       graph, MakeMatcherOptions(rule_set.options), snapshot));
+  ORT_RETURN_IF(
+      work_units > rule_set.options.max_work_units ||
+          snapshot.aggregate_work_units >
+              rule_set.options.max_work_units - work_units,
+      "FusionRuleSet aggregate matcher work budget exceeded.");
+  work_units += snapshot.aggregate_work_units;
   for (size_t registration_order = 0;
        registration_order < rule_set.normalized_rules.size();
        ++registration_order) {
@@ -334,6 +341,7 @@ common::Status DiscoverSelectedPlans(
     matcher_execution_options.total_attempts = &rule_attempts;
     matcher_execution_options.max_attempts =
         rule_set.options.max_rule_attempts;
+    matcher_execution_options.total_work_units = &work_units;
     matcher_execution_options.failure_hook =
         failure_sink == nullptr ? nullptr : &matcher_failure_hook;
     ORT_RETURN_IF_ERROR(function_extractor_internal::DiscoverReplacementPlans(
@@ -575,12 +583,14 @@ FusionRewriteResult ApplyRuleSet(
   std::unordered_set<std::string> literal_initializers_to_preserve;
   size_t condition_evaluations = 0;
   size_t rule_attempts = 0;
+  size_t work_units = 0;
   for (size_t epoch = 0; epoch <= epoch_cap; ++epoch) {
     std::vector<CompiledFusionRule> compiled_rules;
     std::vector<FusionReplacementPlan> selected_plans;
     result.status = DiscoverSelectedPlans(
         rule_set, graph, compiled_rules, selected_plans,
-        condition_evaluations, rule_attempts, epoch, failure_sink.get());
+        condition_evaluations, rule_attempts, work_units, epoch,
+        failure_sink.get());
     if (!result.status.IsOK()) return result;
     if (selected_plans.empty()) {
       result.status = common::Status::OK();
@@ -702,9 +712,10 @@ common::Status FusionRuleSetTestAccess::DiscoverPlans(
   std::vector<FusionReplacementPlan> selected_plans;
   size_t condition_evaluations = 0;
   size_t rule_attempts = 0;
+  size_t work_units = 0;
   ORT_RETURN_IF_ERROR(DiscoverSelectedPlans(
       *rule_set.impl_, graph, compiled_rules, selected_plans,
-      condition_evaluations, rule_attempts, 0, nullptr));
+      condition_evaluations, rule_attempts, work_units, 0, nullptr));
   plans.clear();
   plans.reserve(selected_plans.size());
   for (auto& selected : selected_plans) {

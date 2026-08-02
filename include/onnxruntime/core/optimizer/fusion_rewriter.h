@@ -230,7 +230,12 @@ class FusionDimensionView final {
   friend class FusionShapeView;
 };
 
-/** Callback-only target shape view. An unknown shape has `HasRank() == false`. */
+/**
+ * Callback-only target shape view.
+ *
+ * An unknown shape has `HasRank() == false`; `Rank()` then returns 0, which is
+ * also the valid rank of a scalar. Call `HasRank()` before interpreting 0.
+ */
 class FusionShapeView final {
  public:
   bool HasRank() const;
@@ -437,7 +442,14 @@ class FusionRule final {
   friend class FusionRuleSet;
 };
 
-/** Controls diagnostic retention; kOff allocates and records nothing. */
+/**
+ * Controls diagnostics and dry-run behavior.
+ *
+ * `kOff` allocates and records nothing. `kBestFailure` retains the best failure
+ * for each unsuccessful rule. `kAllFailures` retains bounded failure and
+ * success records. `kDryRun` records as `kAllFailures` but suppresses graph
+ * mutation after discovery and prevalidation.
+ */
 enum class FusionDiagnosticMode : uint8_t {
   kOff,
   kBestFailure,
@@ -493,7 +505,13 @@ struct FusionFailureRecord {
   std::string detail;
 };
 
-/** Invocation-owned bounded diagnostic collector. */
+/**
+ * Caller-owned bounded diagnostic collector.
+ *
+ * Apply resets a supplied collector before each invocation. The collector must
+ * be non-null whenever diagnostics are enabled and may be null only for
+ * `kOff`.
+ */
 class FusionTraceCollector final {
  public:
   FusionTraceCollector();

@@ -36,6 +36,8 @@ struct TargetGraphSnapshot {
   const Graph* graph{};
   std::unique_ptr<GraphViewer> graph_viewer;
   InlinedVector<NodeIndex> topological_node_indices;
+  InlinedHashMap<std::string, InlinedVector<NodeIndex>>
+      nodes_by_root_signature;
   InlinedHashMap<NodeIndex, size_t> topological_positions;
   InlinedHashMap<const NodeArg*, ProducerSlot> producers;
   InlinedHashMap<const NodeArg*, InlinedVector<ConsumerSlot>> explicit_consumers;
@@ -169,6 +171,7 @@ struct MatcherExecutionOptions {
   bool allow_omitted_optional_formal_inputs{};
   size_t* total_attempts{};
   size_t max_attempts{std::numeric_limits<size_t>::max()};
+  size_t* total_work_units{};
   const MatchFailureHook* failure_hook{};
 };
 
