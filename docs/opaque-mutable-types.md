@@ -136,18 +136,70 @@ Parallel execution remains conservative: the test's parallel plan does not reuse
 the opaque state. Matching types alone never enable indiscriminate reuse of
 non-tensor values.
 
-### Allocation, ownership, and kernel behavior
+### Object representation and type-specific factories
 
-For a safe opaque `AllocKind::kReuse` plan, the
-[execution frame](../onnxruntime/core/framework/execution_frame.cc) ensures that
-the reused value is allocated and assigns its `OrtValue` to the output. This shares
-ownership of the same object, not merely its address. Releasing one value does not
-destroy an object still owned by another; the deleter runs once when the last owner
-releases it.
+[`OrtValue`](../include/onnxruntime/core/framework/ort_value.h) stores a
+`std::shared_ptr<void>` and an `MLDataType`, which is a `const DataTypeImpl*`.
+For the PRNG, the shared pointer points directly to the concrete `TestPrng` object.
+There is no extra heap-allocated PRNG handle and no tensor holding a pointer.
+The shared pointer has an ownership control block; the datatype pointer refers to
+shared type metadata rather than metadata allocated for each value.
 
-When reuse is not selected, the existing non-tensor factory creates a distinct
-output object. The kernel handles both cases by comparing object addresses. The
-following pseudocode corresponds to the test kernel, with counters omitted:
+The type designer supplies the concrete class. In-tree datatype registration maps
+the model's opaque domain and name to its runtime type descriptor. The existing
+[datatype templates](../include/onnxruntime/core/framework/data_types.h) connect
+that descriptor to the class: `OpaqueType<T, ...>` inherits `NonTensorType<T>`,
+whose `GetCreateFunc()` returns a factory performing `new T()` and whose
+`GetDeleteFunc()` returns a deleter performing `delete static_cast<T*>(p)`.
+
+The generic framework invokes these functions; it neither knows the concrete class
+nor infers which constructor to call. The factory belongs to the type descriptor,
+not an existing object, so it can create the first instance. Using the in-tree
+implementation rather than a plugin does not remove these existing factories.
+
+This template factory requires a default-constructible class. Its result is a
+fully constructed object in the class-defined initial state, not uninitialized
+storage. Classes requiring constructor arguments or custom allocation need a
+suitable datatype implementation or a richer creation interface; this change
+does not add such an interface.
+
+### Output allocation and lifetime
+
+The kernel requests its output by calling
+[`OpKernelContext::Output<T>()`](../include/onnxruntime/core/framework/op_kernel_context.h).
+That request reaches the
+[execution frame](../onnxruntime/core/framework/execution_frame.cc), which consults
+the allocation plan if the output has not already been allocated:
+
+- For a safe opaque `AllocKind::kReuse` plan, the frame ensures the reused value
+  is allocated and assigns its `OrtValue` to the output. Normally the producer has
+  already created the object, so this shares the existing object and control block
+  without allocating another one.
+- Otherwise, the frame uses `AllocateTraditionalMLValue` to invoke the datatype's
+  factory and initialize the output `OrtValue` with the resulting object and deleter.
+
+Thus the framework supplies an output object **on the kernel's request**, rather
+than constructing a new object unconditionally at kernel entry. Sharing an
+`OrtValue` shares ownership, not just an address: releasing one value does not
+destroy an object still owned by another. The registered deleter invokes the
+object's destructor once the last owner releases it.
+
+The class remains responsible for its private resources and internal buffer
+allocation. ORT does not automatically pool those buffers like tensor storage.
+A complex class can use a cheap default-constructed shell and allocate resources
+when needed, but this does not imply automatic resource sharing or cloning.
+
+The [optimizer execution frame](../onnxruntime/core/optimizer/optimizer_execution_frame.cc)
+continues to allocate distinct objects using the same factory/deleter facilities;
+it needs no opaque-specific allocation change.
+
+### Runtime responsibilities versus kernel semantics
+
+The runtime manages allocation, lifetime, and permission to alias. The kernel
+implements the operation's semantics. The `Seed` kernel requests an output object
+and then calls `Seed(...)` to initialize its logical state from the input seed.
+The `Generate` kernel compares input and output addresses and handles both planner
+decisions. The following code corresponds to the test kernel, with counters omitted:
 
 ```cpp
 const auto* input = ctx->Input<TestPrng>(0);
@@ -158,14 +210,34 @@ if (input != output) {
 *ctx->Output(0, TensorShape{})->MutableData<float>() = output->Next();
 ```
 
-Copying must preserve the input's logical state independently: merely copying a
+On the distinct-output path, this is **default construction followed by explicit
+`CopyFrom`**, not copy construction or C++ copy assignment. `TestPrng` disables
+copy and move operations; `CopyFrom` explicitly copies its private state.
+On the alias path, the kernel advances the existing object without copying.
+
+There is no generic runtime cloning step. When output and input are distinct,
+the kernel must leave the input's logical state unchanged. Copy-then-update is
+one strategy; another kernel could compute the output state directly without
+copying first. Any copying must preserve logical independence: merely copying a
 pointer to shared mutable internals would not provide a correct fallback.
 
-The existing [opaque datatype facilities](../include/onnxruntime/core/framework/data_types.h)
-provide creation and deletion. The
-[optimizer execution frame](../onnxruntime/core/optimizer/optimizer_execution_frame.cc)
-continues to allocate distinct objects using those same facilities; it needs no
-opaque-specific allocation change.
+### Wrapping and allocation costs
+
+Fresh opaque allocation involves a concrete object allocation and shared-pointer
+control-block storage. Aliasing avoids new object/control-block allocation in
+the normal case, but still involves `OrtValue` assignment and reference-count
+bookkeeping.
+
+Tensor values already use the same outer `OrtValue` wrapper. Their shared pointer
+points to a [`Tensor` header](../onnxruntime/core/framework/tensor.cc) describing
+shape, element type, and a data buffer, rather than directly to a PRNG object.
+Ordinary tensor buffer reuse can still create a new tensor header and control
+block; opaque reuse here shares the entire object.
+
+These are qualitative costs, not a claim of measured negligible overhead.
+For a tiny PRNG, allocations and ownership bookkeeping may be significant relative
+to the state update. For a larger abstraction, internal allocation or copying may
+dominate instead. The appropriate tradeoff depends on the class and workload.
 
 ## Tests as an executable example
 
