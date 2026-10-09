@@ -103,10 +103,6 @@ Opaque values can also represent state that persists across model runs. For exam
 a caller may hold a PRNG or key-value cache object, pass its current state into a
 model, and receive its next state as an output.
 
-> **Status:** The boundary contracts in this section describe proposed extensions.
-> The current implementation preserves caller-owned graph inputs and does not yet
-> interpret equal input/output object identity as permission to mutate them.
-
 The graph remains functional:
 
 ```text
@@ -116,10 +112,81 @@ Generate(state: PRNG) -> (value: scalar tensor(float), next_state: PRNG)
 The question at the API boundary is whether `state` and `next_state` may be backed
 by the same mutable object.
 
+### Existing tensor precedent: key-value caches
+
+ORT already uses this pattern for tensor-backed state such as key-value caches.
+For example, the
+[`TensorScatter` kernel](../onnxruntime/core/providers/cpu/llm/tensorscatter.cc)
+declares:
+
+```cpp
+def.MayInplace(0, 0);
+```
+
+The declaration says that `present_cache` may reuse `past_cache`. The kernel requests
+its output normally, compares the input and output data addresses, copies the old
+cache only when the addresses differ, and then applies the update to the output.
+Its
+[`InPlace_IOBinding` test](../onnxruntime/test/providers/cpu/llm/tensorscatter_op_test.cc)
+binds the same tensor `OrtValue` as both `past_cache` and `present_cache`, runs the
+model, and verifies that the caller's buffer was updated in place.
+
+CUDA and WebGPU `GroupQueryAttention` kernels use the same basic convention for
+key and value caches:
+
+```cpp
+def.MayInplace(3, 1);  // past_key -> present_key
+def.MayInplace(4, 2);  // past_value -> present_value
+```
+
+The [CUDA implementation](../onnxruntime/contrib_ops/cuda/bert/group_query_attention.cc)
+detects the shared-buffer path by comparing the past and present data pointers. Its
+[I/O-binding test](../onnxruntime/test/contrib_ops/group_query_attention_op_test.cc)
+binds each past cache tensor as its corresponding present output. Attention
+operators may also have attributes such as `past_present_share_buffer` that define
+fixed-capacity cache shapes or select specialized kernels. Those details are
+operator-specific; they are not the fundamental input/output alias mechanism.
+
+There are also operator-specific side-effect conventions. For example, an operator
+with omitted cache outputs can directly update an input cache. That is useful for
+specialized stateful operators, but it is not a good general contract for opaque
+values. Explicit functional input and output values preserve the model's dataflow
+and provide a natural distinct-output fallback.
+
+### How caller-provided aliasing works today
+
+When a caller supplies inputs and preallocated outputs, the execution frame places
+those `OrtValue`s in their graph value slots before any kernel executes. Copying an
+`OrtValue` shares ownership of its underlying tensor or object. If the caller binds
+the same value as an input and output, the two slots therefore refer to the same
+underlying storage.
+
+When the producing kernel requests that output, the execution frame returns the
+already allocated value rather than allocating another one. For tensors, it also
+checks that the supplied output shape matches the shape requested by the kernel.
+The kernel can then recognize the alias through pointer equality and take its
+in-place path.
+
+This caller-provided boundary alias is related to, but distinct from, reuse created
+by the allocation planner:
+
+- **Caller-provided alias:** Binding the same preallocated value makes the graph
+  input and graph output share storage for that run.
+- **Planner-selected alias:** `MayInplace` permits ORT to reuse storage for
+  graph-internal values when liveness, observability, execution-order, type, and
+  location checks allow it.
+
+The planner deliberately protects graph inputs from planner-selected reuse because
+they are caller-owned. That protection does not prevent a caller from explicitly
+supplying the same value as an output. Existing cache kernels rely on the caller
+using this facility only with an operator that supports the alias. ORT does not yet
+provide a general validation rule that connects a caller-provided graph-boundary
+alias to the kernel's `MayInplace` declaration.
+
 ### Common case: bind the same object as input and output
 
-The intended low-friction interface is for the caller to supply the same concrete
-opaque object as both the input and the preallocated output:
+The corresponding low-friction interface for an opaque type is for the caller to
+supply the same concrete object as both the input and the preallocated output:
 
 ```text
 state_value = OrtValue(PRNG object)
@@ -153,11 +220,16 @@ This provides reference-parameter behavior without a separate annotation for the
 common linear-state case. It is a permission to mutate the caller-owned object,
 not proof that the graph is linear or that mutation is automatically safe.
 
+For a model in which one state-update kernel directly connects the graph input to
+the graph output, the existing execution-frame behavior can already return the
+caller-supplied opaque object from `Output<T>()`. The kernel can use the same
+address comparison and distinct-output fallback as a tensor cache kernel. No new
+opaque allocation mechanism is required for that direct case.
+
 The contract describes the final logical output and object identity; it need not
-forbid every internal copy. A straightforward linear chain should reuse the supplied
-object through the chain without copying state. In a more complex graph, ORT and the
-kernels may use temporary distinct objects as long as all graph values remain correct
-and the designated output is ultimately produced in the caller-supplied object.
+forbid every internal copy. In a more complex graph, ORT and the kernels may use
+temporary distinct objects as long as all graph values remain correct and the
+designated output is ultimately produced in the caller-supplied object.
 
 There is an important practical limitation: ORT has no generic opaque copy-back
 operation. If the result is computed in another object, the runtime cannot transfer
@@ -166,31 +238,48 @@ kernel. The final producing kernel must be able to write the correct result into
 object through a safe plan. Otherwise, ORT should reject the aliasing configuration
 before executing kernels rather than silently return a different object.
 
-#### Why current input/output binding is not enough by itself
+#### Why the existing mechanism needs a general contract
 
 ORT already accepts caller-supplied inputs and preallocated outputs, including
-non-tensor `OrtValue`s. However, independently binding the same object as an input
-and output does not currently establish a planner-approved mutable relationship.
+non-tensor `OrtValue`s, and direct opaque input/output aliasing follows naturally
+from the same execution-frame behavior used by tensor caches. However, the current
+facility is permissive: preallocating an output with the same underlying value does
+not by itself prove that the producing kernel supports aliasing or that a longer
+input-to-output path can safely preserve the requested identity.
 
-The existing planner deliberately treats graph inputs as caller-owned and adds an
-external use so they cannot be reused during inference. Graph outputs are similarly
-allocated as externally observable results. These protections must be relaxed only
-for a validated input/output pair and safe reuse chain. Simply exposing equal object
-addresses to a kernel would bypass the reasoning that makes mutation safe.
+A representation-independent contract should unify tensor and opaque state:
 
-The common-case implementation should therefore:
+1. A kernel declares `MayInplace(input_index, output_index)`.
+2. The kernel produces correct results with either aliased or distinct values.
+3. A caller may bind the same underlying `OrtValue` to the corresponding graph
+   input and output to request boundary mutation.
+4. ORT validates that the requested boundary alias maps to a supported relationship
+   before execution and rejects unsupported or conflicting bindings.
+5. Type-specific validation remains where necessary: tensor element type, shape,
+   and location versus opaque domain, name, and location.
 
-1. Identify straightforward opaque state paths whose kernels declare compatible
-   `MayInplace` transitions.
-2. At run time, detect that a supplied input and preallocated output share the same
-   concrete object.
-3. Select per-run allocation behavior that connects the validated path through the
-   model boundary without modifying a session-wide plan used by concurrent runs.
-4. Reject conflicting or unsupported alias patterns before execution.
+Under this contract, `MayInplace` has two related uses: it permits planner-selected
+reuse for internal values and declares that caller-provided aliasing is supported by
+the kernel. It remains permission rather than a requirement; a kernel still needs a
+correct distinct-output path.
 
-The target overhead for a supported linear path is a boundary identity check and
-selection of prepared allocation behavior, not per-run graph analysis or additional
-caller annotations.
+The direct one-kernel boundary case should be the first supported generalization
+because it matches existing cache usage and requires little runtime change. A longer
+linear path is a separate optimization problem. For example:
+
+```text
+input_state -> Generate -> state1 -> Generate -> output_state
+```
+
+The planner protects `input_state`, so the first transition may create and copy into
+`state1`. The final kernel may be able to copy the result into the caller-provided
+`output_state`, but generic ORT cannot perform that opaque copy-back. Achieving
+zero-copy aliasing through the whole chain requires per-run alias-aware allocation
+behavior or a prepared alternative plan. This optimization should not be required
+to support the common direct state-update case.
+
+The target overhead for the direct path is boundary identity and compatibility
+validation, not per-run whole-graph analysis or additional caller annotations.
 
 ### Extensions for more general usage
 
