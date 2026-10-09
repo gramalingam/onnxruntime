@@ -97,6 +97,150 @@ a last-use consumer may safely reuse the original object. Conversely, a linear c
 does not guarantee reuse if the input remains observable or other planner constraints
 prevent it.
 
+## Mutable opaque objects at the model boundary
+
+Opaque values can also represent state that persists across model runs. For example,
+a caller may hold a PRNG or key-value cache object, pass its current state into a
+model, and receive its next state as an output.
+
+> **Status:** The boundary contracts in this section describe proposed extensions.
+> The current implementation preserves caller-owned graph inputs and does not yet
+> interpret equal input/output object identity as permission to mutate them.
+
+The graph remains functional:
+
+```text
+Generate(state: PRNG) -> (value: scalar tensor(float), next_state: PRNG)
+```
+
+The question at the API boundary is whether `state` and `next_state` may be backed
+by the same mutable object.
+
+### Common case: bind the same object as input and output
+
+The intended low-friction interface is for the caller to supply the same concrete
+opaque object as both the input and the preallocated output:
+
+```text
+state_value = OrtValue(PRNG object)
+
+BindInput("state", state_value)
+BindOutput("next_state", state_value)
+Run()
+```
+
+The exact API spelling may vary by language binding. The important signal is object
+identity: the input and caller-supplied output `OrtValue`s refer to the same concrete
+object. They do not need to be the same `OrtValue` wrapper because copying an
+`OrtValue` shares ownership of its underlying object.
+
+For a supported binding, this should mean:
+
+- The caller permits ORT to overwrite the object's initial state during the run.
+- On successful completion, that same object contains the logical value of
+  `next_state`.
+- Other model results have their ordinary functional meaning. Aliasing the boundary
+  values does not change the graph's semantics.
+- The caller must not read, modify, or use the object in another run until execution
+  completes, including through another alias or a shared mutable resource owned by
+  the object.
+- A validation failure before execution leaves the object unchanged. A failure after
+  execution starts may leave it partially advanced; no rollback is promised.
+- Supplying distinct input and output objects retains the ordinary behavior in which
+  the input remains unchanged.
+
+This provides reference-parameter behavior without a separate annotation for the
+common linear-state case. It is a permission to mutate the caller-owned object,
+not proof that the graph is linear or that mutation is automatically safe.
+
+The contract describes the final logical output and object identity; it need not
+forbid every internal copy. A straightforward linear chain should reuse the supplied
+object through the chain without copying state. In a more complex graph, ORT and the
+kernels may use temporary distinct objects as long as all graph values remain correct
+and the designated output is ultimately produced in the caller-supplied object.
+
+There is an important practical limitation: ORT has no generic opaque copy-back
+operation. If the result is computed in another object, the runtime cannot transfer
+arbitrary opaque state into the supplied object without help from the datatype or
+kernel. The final producing kernel must be able to write the correct result into that
+object through a safe plan. Otherwise, ORT should reject the aliasing configuration
+before executing kernels rather than silently return a different object.
+
+#### Why current input/output binding is not enough by itself
+
+ORT already accepts caller-supplied inputs and preallocated outputs, including
+non-tensor `OrtValue`s. However, independently binding the same object as an input
+and output does not currently establish a planner-approved mutable relationship.
+
+The existing planner deliberately treats graph inputs as caller-owned and adds an
+external use so they cannot be reused during inference. Graph outputs are similarly
+allocated as externally observable results. These protections must be relaxed only
+for a validated input/output pair and safe reuse chain. Simply exposing equal object
+addresses to a kernel would bypass the reasoning that makes mutation safe.
+
+The common-case implementation should therefore:
+
+1. Identify straightforward opaque state paths whose kernels declare compatible
+   `MayInplace` transitions.
+2. At run time, detect that a supplied input and preallocated output share the same
+   concrete object.
+3. Select per-run allocation behavior that connects the validated path through the
+   model boundary without modifying a session-wide plan used by concurrent runs.
+4. Reject conflicting or unsupported alias patterns before execution.
+
+The target overhead for a supported linear path is a boundary identity check and
+selection of prepared allocation behavior, not per-run graph analysis or additional
+caller annotations.
+
+### Extensions for more general usage
+
+Object identity covers the most common in/out case but cannot express every useful
+permission. Future APIs or annotations could support broader contracts without
+complicating the simple path.
+
+#### Consumable input with a separately returned object
+
+A caller might permit ORT to consume or mutate an input while accepting that the
+returned state is a different object:
+
+```text
+ConsumeInput("state")
+Run() -> next_state
+```
+
+This can enable reuse without requiring a same-object output. It is a weaker identity
+contract but a broader ownership permission. It should remain distinct from the
+same-object in/out contract so callers know whether to retain or replace their state
+handle after each run.
+
+#### Explicit input/output relationships
+
+Annotations could name an input/output pair when object identity is unavailable at
+planning time, when ORT allocates the output, or when a language binding cannot
+conveniently express shared object identity. Such an annotation grants permission;
+it does not override liveness, type, location, execution-order, or observability
+requirements.
+
+#### Copy or assignment support
+
+More complex graphs could benefit from an optional type-specific way to copy or
+assign opaque state. That would let ORT compute into a temporary object and copy the
+final value into a caller-supplied output. This would be a new datatype capability,
+not generic behavior inferred by the runtime. Types for which copying is unsupported
+or expensive could omit it and accept a more restricted set of in/out plans.
+
+#### Branches, control flow, and devices
+
+Forked graphs may still be valid. Kernels can preserve earlier logical states in
+temporary objects and mutate the caller's object only at its last safe use. However,
+guaranteeing that a particular output receives the original object may require
+scheduling constraints or additional copies. An initial implementation should
+support simple sequential CPU paths and reject unsupported branching, control-flow,
+parallel, or cross-device cases rather than weaken graph semantics.
+
+These extensions should be additive. They should not impose annotations, generic
+copy callbacks, or per-run planning costs on the common same-object linear path.
+
 ## How ONNX Runtime handles it
 
 ### In-tree type and kernel registration
