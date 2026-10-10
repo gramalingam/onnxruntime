@@ -113,6 +113,7 @@ class OpaqueReuseTest : public testing::Test {
     schemas.push_back(seed);
     RegisterGenerate<TestPrng, TestPrng>(schemas, "Generate");
     RegisterGenerate<TestPrng, TestPrng>(schemas, "GenerateCopy", false);
+    RegisterGenerate<TestPrng, TestPrng>(schemas, "GenerateMust", false, true);
     RegisterGenerate<TestPrng, OtherNamePrng>(schemas, "ToOtherName");
     RegisterGenerate<OtherNamePrng, TestPrng>(schemas, "FromOtherName");
     RegisterGenerate<TestPrng, OtherDomainPrng>(schemas, "ToOtherDomain");
@@ -138,7 +139,8 @@ class OpaqueReuseTest : public testing::Test {
   }
 
   template <typename InputState, typename OutputState>
-  void RegisterGenerate(std::vector<OpSchema>& schemas, const char* name, bool may_inplace = true) {
+  void RegisterGenerate(std::vector<OpSchema>& schemas, const char* name, bool may_inplace = true,
+                        bool must_inplace = false) {
     const auto* input_type = DataTypeImpl::GetType<InputState>();
     const auto* output_type = DataTypeImpl::GetType<OutputState>();
     OpSchema generate(name, __FILE__, __LINE__);
@@ -153,6 +155,7 @@ class OpaqueReuseTest : public testing::Test {
     def.SetName(name).SetDomain(kPrngDomain).SinceVersion(1).Provider(kCpuExecutionProvider);
     def.TypeConstraint("TInput", input_type).TypeConstraint("TOutput", output_type);
     if (may_inplace) def.MayInplace(0, 1);
+    if (must_inplace) def.MustInplace(0, 1);
     ASSERT_STATUS_OK(registry_->RegisterCustomKernel(
         def, [](FuncManager&, const OpKernelInfo& info, std::unique_ptr<OpKernel>& kernel) {
           kernel = std::make_unique<GeneratePrng<InputState, OutputState>>(info);
@@ -414,6 +417,70 @@ TEST_F(OpaqueReuseTest, GraphInputOutputAliasRequiresLinearUse) {
   EXPECT_EQ(state.Get<TestPrng>().State(), 42u);
   EXPECT_EQ(TestPrng::reused.load(), 0);
   EXPECT_EQ(TestPrng::copied.load(), 0);
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceInternalStateReusesForGraphOutput) {
+  AddSeed();
+  AddGenerate("s0", "v1", "s1", "GenerateMust");
+  auto session = Initialize({"v1", "s1"});
+  EXPECT_EQ(Plan(*session, "s1").alloc_kind, AllocKind::kReuse);
+
+  auto values = Run(*session, SeedFeed(), {"v1", "s1"});
+
+  EXPECT_EQ(values[1].Get<TestPrng>().State(), 42u + 0x9e3779b97f4a7c15ULL);
+  EXPECT_EQ(TestPrng::reused.load(), 1);
+  EXPECT_EQ(TestPrng::copied.load(), 0);
+  EXPECT_EQ(TestPrng::created.load(), 1);
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceGraphInputMutatesWithoutPreallocatedOutput) {
+  AddGenerate("s0", "v1", "s1", "GenerateMust");
+  auto session = Initialize({"v1", "s1"});
+  OrtValue state = PrngValue(42);
+  const auto* object = &state.Get<TestPrng>();
+
+  auto values = Run(*session, {{"s0", state}}, {"v1", "s1"});
+
+  EXPECT_EQ(&values[1].Get<TestPrng>(), object);
+  EXPECT_EQ(&state.Get<TestPrng>(), object);
+  EXPECT_EQ(state.Get<TestPrng>().State(), 42u + 0x9e3779b97f4a7c15ULL);
+  EXPECT_EQ(TestPrng::reused.load(), 1);
+  EXPECT_EQ(TestPrng::copied.load(), 0);
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsDistinctPreallocatedOutputBeforeExecution) {
+  AddGenerate("s0", "v1", "s1", "GenerateMust");
+  auto session = Initialize({"v1", "s1"});
+  OrtValue input = PrngValue(42);
+  OrtValue output = PrngValue(0);
+  std::vector<OrtValue> fetches(2);
+  fetches[1] = output;
+  const NameMLValMap feeds{{"s0", input}};
+  const std::vector<std::string> outputs{"v1", "s1"};
+
+  const auto status = session->Run(RunOptions{}, feeds, outputs, &fetches);
+
+  EXPECT_EQ(status.Code(), common::INVALID_ARGUMENT);
+  EXPECT_THAT(status.ErrorMessage(), testing::HasSubstr("kernel declares MustInplace"));
+  EXPECT_EQ(input.Get<TestPrng>().State(), 42u);
+  EXPECT_EQ(output.Get<TestPrng>().State(), 0u);
+  EXPECT_EQ(TestPrng::reused.load(), 0);
+  EXPECT_EQ(TestPrng::copied.load(), 0);
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsForkAtSessionInitialization) {
+  AddSeed();
+  AddGenerate("s0", "v1", "s1", "GenerateMust");
+  AddGenerate("s0", "v2", "s2");
+
+  EXPECT_THROW(Initialize({"v1", "v2", "s1", "s2"}), OnnxRuntimeException);
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsParallelExecutionAtSessionInitialization) {
+  AddSeed();
+  AddGenerate("s0", "v1", "s1", "GenerateMust");
+
+  EXPECT_THROW(Initialize({"v1", "s1"}, ExecutionMode::ORT_PARALLEL), OnnxRuntimeException);
 }
 
 TEST_F(OpaqueReuseTest, MatchingTypeWithoutMayInplaceDoesNotReuse) {

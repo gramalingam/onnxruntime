@@ -370,6 +370,43 @@ Parallel execution remains conservative: the test's parallel plan does not reuse
 the opaque state. Matching types alone never enable indiscriminate reuse of
 non-tensor values.
 
+### Requiring linear mutable use
+
+Some opaque classes cannot be cloned or evaluated into a distinct output. A kernel
+for such a class can declare a required mutable relationship:
+
+```cpp
+def.MustInplace(0, 1);
+```
+
+`MustInplace` is intentionally separate from ORT's existing `Alias` declaration.
+`Alias` is for content-preserving views such as `Identity` and `Reshape`; it assumes
+that sharing storage does not modify the input's logical value. `MustInplace`
+explicitly permits mutation and requires output 1 to be the same physical value as
+input 0.
+
+The initial implementation supports opaque values. ORT validates the requirement
+while creating the allocation plan. Session initialization fails if:
+
+- the input or output index is invalid or absent;
+- their types, shapes, or planned locations are incompatible;
+- the input is an initializer or is also an observable graph output;
+- the input has another consumer, including a fork in the graph;
+- one required input is mapped to multiple outputs; or
+- execution uses parallel or multi-stream planning.
+
+After successful initialization, an internal output shares its input's allocation
+unconditionally. A graph input is consequently a destructive input: running the
+model advances the caller's object even when the caller does not preallocate the
+corresponding graph output. If the caller does preallocate that output, it must bind
+the same underlying object. ORT rejects a distinct preallocated object before any
+kernel executes.
+
+This makes unsupported non-linear models fail at session creation rather than
+silently copying or corrupting an earlier logical state. `MayInplace` remains the
+preferred declaration when a kernel has a correct distinct-output fallback and can
+support ordinary functional use.
+
 ### Object representation and type-specific factories
 
 [`OrtValue`](../include/onnxruntime/core/framework/ort_value.h) stores a
@@ -489,6 +526,9 @@ covers both functional correctness and the optimization:
   exactly-once destruction.
 - Negative cases cover a kernel without `MayInplace`, parallel execution, and
   different opaque domains or names.
+- `MustInplace` cases cover required internal and model-boundary reuse, destructive
+  graph inputs, initialization-time rejection of forks and parallel execution, and
+  pre-run rejection of a distinct preallocated output.
 - An optimizer-frame test verifies distinct allocation and shared ownership lifetime.
 
 The central distinction is between **logical immutability** and **physical mutation**.

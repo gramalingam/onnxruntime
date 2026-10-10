@@ -906,6 +906,8 @@ class SequenceTensorType : public SequenceTensorTypeBase {
  *          opaque input/output types. When the planner proves reuse is safe,
  *          both OrtValues share the same object and its ownership. Kernels must
  *          also handle distinct output objects without modifying the input.
+ *          MustInplace is available for kernels that cannot support a distinct
+ *          output; session initialization rejects unsafe or non-linear usage.
  *
  */
 template <typename T, const char D[], const char N[]>

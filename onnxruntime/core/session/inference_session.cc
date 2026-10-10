@@ -3559,10 +3559,15 @@ bool IsOpaqueValue(const OrtValue& value) {
          type_proto->value_case() == ONNX_NAMESPACE::TypeProto::ValueCase::kOpaqueType;
 }
 
-bool HasMayInplace(const KernelDef& kernel_def, size_t input_index, size_t output_index) {
+bool HasMutableAlias(const KernelDef& kernel_def, size_t input_index, size_t output_index) {
+  const std::pair<int, int> mapping{narrow<int>(input_index), narrow<int>(output_index)};
   const auto& may_inplace = kernel_def.MayInplace();
-  return std::find(may_inplace.begin(), may_inplace.end(),
-                   std::pair<int, int>{narrow<int>(input_index), narrow<int>(output_index)}) != may_inplace.end();
+  if (std::find(may_inplace.begin(), may_inplace.end(), mapping) != may_inplace.end()) {
+    return true;
+  }
+
+  const auto& must_inplace = kernel_def.MustInplace();
+  return std::find(must_inplace.begin(), must_inplace.end(), mapping) != must_inplace.end();
 }
 
 }  // namespace
@@ -3583,6 +3588,38 @@ common::Status InferenceSession::ValidateOpaqueInputOutputAliases(
     const auto& fetch = fetches[output_idx];
     if (!fetch.IsAllocated() || !IsOpaqueValue(fetch)) {
       continue;
+    }
+
+    InlinedVector<SessionState::NodeInfo> output_node_info;
+    ORT_RETURN_IF_ERROR(session_state_->GetOutputNodeInfo(output_names[output_idx], output_node_info));
+    if (output_node_info.size() == 1 && output_node_info.front().p_node != nullptr &&
+        output_node_info.front().kci != nullptr) {
+      const auto& output_info = output_node_info.front();
+      for (const auto& mapping : output_info.kci->kernel_def->MustInplace()) {
+        if (mapping.second != narrow<int>(output_info.index)) {
+          continue;
+        }
+
+        const auto& input_defs = output_info.p_node->InputDefs();
+        ORT_RETURN_IF(mapping.first < 0 || static_cast<size_t>(mapping.first) >= input_defs.size(),
+                      "Kernel '", output_info.p_node->Name(), "' (", output_info.p_node->OpType(),
+                      ") has an invalid MustInplace input index ", mapping.first, ".");
+        const auto& required_input_name = input_defs[mapping.first]->Name();
+        const auto feed_it = std::find(feed_names.begin(), feed_names.end(), required_input_name);
+        if (feed_it == feed_names.end()) {
+          return ORT_MAKE_STATUS(
+              ONNXRUNTIME, INVALID_ARGUMENT, "Preallocated opaque output '", output_names[output_idx],
+              "' overrides a MustInplace allocation from internal input '", required_input_name, "'.");
+        }
+
+        const size_t feed_idx = static_cast<size_t>(std::distance(feed_names.begin(), feed_it));
+        if (!fetch.SharesDataWith(feeds[feed_idx])) {
+          return ORT_MAKE_STATUS(
+              ONNXRUNTIME, INVALID_ARGUMENT, "Opaque output '", output_names[output_idx],
+              "' must share its object with input '", required_input_name,
+              "' because the kernel declares MustInplace.");
+        }
+      }
     }
 
     std::optional<size_t> matched_feed_idx;
@@ -3619,9 +3656,7 @@ common::Status InferenceSession::ValidateOpaqueInputOutputAliases(
     }
 
     InlinedVector<SessionState::NodeInfo> input_node_info;
-    InlinedVector<SessionState::NodeInfo> output_node_info;
     ORT_RETURN_IF_ERROR(session_state_->GetInputNodeInfo(input_name, input_node_info));
-    ORT_RETURN_IF_ERROR(session_state_->GetOutputNodeInfo(output_name, output_node_info));
 
     if (input_node_info.size() != 1 || output_node_info.size() != 1) {
       return ORT_MAKE_STATUS(
@@ -3642,10 +3677,10 @@ common::Status InferenceSession::ValidateOpaqueInputOutputAliases(
           ONNXRUNTIME, INVALID_ARGUMENT, "Opaque input '", input_name, "' and output '", output_name,
           "' must have the same planned device when sharing an object.");
     }
-    if (!HasMayInplace(*input_info.kci->kernel_def, input_info.index, output_info.index)) {
+    if (!HasMutableAlias(*input_info.kci->kernel_def, input_info.index, output_info.index)) {
       return ORT_MAKE_STATUS(
           ONNXRUNTIME, INVALID_ARGUMENT, "Kernel '", input_info.p_node->Name(), "' (", input_info.p_node->OpType(),
-          ") does not declare MayInplace for opaque input '", input_name,
+          ") does not declare MayInplace or MustInplace for opaque input '", input_name,
           "' and output '", output_name, "'.");
     }
   }
