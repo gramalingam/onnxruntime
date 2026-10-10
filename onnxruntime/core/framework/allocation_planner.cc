@@ -570,11 +570,91 @@ class PlannerImpl {
 
   bool SameSize(const onnxruntime::NodeArg& arg1, const onnxruntime::NodeArg& arg2) {
     if ((!arg1.Exists()) || (!arg2.Exists())) return false;
+    const auto* type1 = arg1.TypeAsProto();
+    const auto* type2 = arg2.TypeAsProto();
+    if (type1 && type2 && (type1->has_opaque_type() || type2->has_opaque_type())) {
+      // Opaque objects have no tensor shape. This only establishes compatibility;
+      // MayInplace and the caller's liveness checks still authorize mutation.
+      return type1->has_opaque_type() && type2->has_opaque_type() &&
+             type1->opaque_type().domain() == type2->opaque_type().domain() &&
+             type1->opaque_type().name() == type2->opaque_type().name() &&
+             AllocPlan(arg1.Name()).location == AllocPlan(arg2.Name()).location;
+    }
     auto p_shape1 = context_->GetShape(arg1);
     auto p_shape2 = context_->GetShape(arg2);
     // If the shapes are unknown, we conservatively assume they may be of different size.
     if ((nullptr == p_shape1) || (nullptr == p_shape2)) return false;
     return SameSize(*p_shape1, arg1, *p_shape2, arg2);
+  }
+
+  Status ValidateMustInplace(const Node& node, size_t output_index, OrtValueIndex& required_input,
+                             bool& must_inplace) {
+    must_inplace = false;
+    const auto& ci = GetKernelCreateInfo(kernel_create_info_map_, node.Index());
+    if (ci.kernel_def == nullptr) {
+      return Status::OK();
+    }
+
+    const auto& mappings = ci.kernel_def->MustInplace();
+    const std::pair<int, int>* mapping = nullptr;
+    for (const auto& candidate : mappings) {
+      if (candidate.second != narrow<int>(output_index)) {
+        continue;
+      }
+
+      ORT_RETURN_IF(mapping != nullptr, "Kernel '", node.Name(), "' (", node.OpType(),
+                    ") has multiple MustInplace mappings for output ", output_index, ".");
+      mapping = &candidate;
+    }
+
+    if (mapping == nullptr) {
+      return Status::OK();
+    }
+
+    must_inplace = true;
+    ORT_RETURN_IF(context_->IsParallelExecutionEnabled(), "Kernel '", node.Name(), "' (", node.OpType(),
+                  ") requires MustInplace, which is not supported with parallel or multi-stream execution.");
+    ORT_RETURN_IF(mapping->first < 0 || static_cast<size_t>(mapping->first) >= node.InputDefs().size(),
+                  "Kernel '", node.Name(), "' (", node.OpType(),
+                  ") has an invalid MustInplace input index ", mapping->first, ".");
+
+    const auto* input = node.InputDefs()[mapping->first];
+    const auto* output = node.OutputDefs()[output_index];
+    ORT_RETURN_IF_NOT(input->Exists() && output->Exists(), "Kernel '", node.Name(), "' (", node.OpType(),
+                      ") requires MustInplace input and output values to be present.");
+    const auto* input_type = input->TypeAsProto();
+    const auto* output_type = output->TypeAsProto();
+    ORT_RETURN_IF_NOT(input_type != nullptr && output_type != nullptr &&
+                          input_type->has_opaque_type() && output_type->has_opaque_type(),
+                      "Kernel '", node.Name(), "' (", node.OpType(),
+                      ") uses MustInplace, which currently supports opaque values only.");
+    ORT_RETURN_IF(graph_viewer_.IsInitializedTensor(input->Name()), "Kernel '", node.Name(), "' (", node.OpType(),
+                  ") cannot apply MustInplace to initializer '", input->Name(), "'.");
+    ORT_RETURN_IF_NOT(SameSize(*input, *output), "Kernel '", node.Name(), "' (", node.OpType(),
+                      ") has incompatible MustInplace input '", input->Name(), "' and output '", output->Name(), "'.");
+
+    const auto consumers = graph_viewer_.GetConsumerNodes(input->Name());
+    ORT_RETURN_IF_NOT(consumers.size() == 1 && consumers.front() == &node, "Kernel '", node.Name(), "' (",
+                      node.OpType(), ") requires exclusive linear use of MustInplace input '", input->Name(), "'.");
+    const auto input_occurrences = std::count(node.InputDefs().begin(), node.InputDefs().end(), input) +
+                                   std::count(node.ImplicitInputDefs().begin(), node.ImplicitInputDefs().end(), input);
+    ORT_RETURN_IF_NOT(input_occurrences == 1, "Kernel '", node.Name(), "' (", node.OpType(),
+                      ") uses MustInplace input '", input->Name(), "' more than once.");
+
+    const auto& graph_outputs = graph_viewer_.GetOutputs();
+    ORT_RETURN_IF(std::find(graph_outputs.begin(), graph_outputs.end(), input) != graph_outputs.end(),
+                  "Kernel '", node.Name(), "' (", node.OpType(), ") cannot mutate MustInplace input '",
+                  input->Name(), "' because it is also a graph output.");
+
+    size_t input_mapping_count = 0;
+    for (const auto& candidate : mappings) {
+      input_mapping_count += candidate.first == mapping->first ? 1u : 0u;
+    }
+    ORT_RETURN_IF_NOT(input_mapping_count == 1, "Kernel '", node.Name(), "' (", node.OpType(),
+                      ") maps MustInplace input ", mapping->first, " to multiple outputs.");
+
+    required_input = Index(input->Name());
+    return Status::OK();
   }
 
   // Find if freelist contains a buffer of the same size as output_arg
@@ -1568,6 +1648,14 @@ class PlannerImpl {
       const auto* pnode = graph_viewer_.GetNode(node_index);
       // node outputs.
       const auto& output_defs = pnode->OutputDefs();
+      const auto& kernel_create_info = GetKernelCreateInfo(kernel_create_info_map_, pnode->Index());
+      ORT_RETURN_IF_NOT(kernel_create_info.kernel_def != nullptr, "KernelDef is null for node '", pnode->Name(), "'.");
+      for (const auto& mapping : kernel_create_info.kernel_def->MustInplace()) {
+        ORT_RETURN_IF(mapping.first < 0 || static_cast<size_t>(mapping.first) >= pnode->InputDefs().size() ||
+                          mapping.second < 0 || static_cast<size_t>(mapping.second) >= output_defs.size(),
+                      "Kernel '", pnode->Name(), "' (", pnode->OpType(),
+                      ") has invalid MustInplace mapping (", mapping.first, ", ", mapping.second, ").");
+      }
       // External outputs flag.
       bool has_external_outputs = HasExternalOutputs(*pnode);
       // output_arg_def_index is the index of ArgDefs in pnode's output list.
@@ -1576,15 +1664,23 @@ class PlannerImpl {
       // optional-missing outputs (aka values with empty names).
       for (size_t output_arg_def_index = 0, end = output_defs.size(); output_arg_def_index < end; ++output_arg_def_index) {
         const auto& node_output = output_defs[output_arg_def_index];
+        OrtValueIndex reused;
+        bool must_inplace = false;
+        ORT_RETURN_IF_ERROR(ValidateMustInplace(*pnode, output_arg_def_index, reused, must_inplace));
         if (!node_output->Exists()) continue;
         // OrtValue index of the considered output NodeArg.
         const auto current = Index(node_output->Name());
         AllocPlan(current).value_type = utils::GetMLDataType(*node_output);
         // Declare OrtValue index of the reused buffer.
         // The the OrtValue indexed by current may reuse the memory in the OrtValue indexed by reused.
-        OrtValueIndex reused;
         bool is_strided_tensor = false;
-        if (has_external_outputs) {
+        if (must_inplace) {
+          Reuse(reused, current, AllocKind::kReuse);
+          ort_value_info_[current].is_inplace_reuse = true;
+#if !defined(ORT_MINIMAL_BUILD) && defined(ORT_MEMORY_PROFILE)
+          InplaceReuse(reused, current);
+#endif
+        } else if (has_external_outputs) {
           ORT_ENFORCE(!IsNonTensor(*node_output), "Only tensors are supported for external outputs for now.");
           AllocPlan(current).alloc_kind = AllocKind::kAllocatedExternally;
         } else if (std::find(graph_outputs.begin(), graph_outputs.end(), node_output) != graph_outputs.end()) {
@@ -1626,7 +1722,7 @@ class PlannerImpl {
         } else if (!context_->IsParallelExecutionEnabled() &&
                    FindReusableInput(graph_viewer_, *pnode, static_cast<int>(output_arg_def_index),
                                      &reused, &is_strided_tensor)) {
-          // Re-using inputs is applicable for tensors, sequence tensors,
+          // Re-using inputs is applicable for tensors, sequence tensors, opaque objects,
           // and optional types if the kernel has marked certain inputs as
           // possible candidates for re-use
           Reuse(reused, current, AllocKind::kReuse);

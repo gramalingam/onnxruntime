@@ -902,7 +902,12 @@ class SequenceTensorType : public SequenceTensorTypeBase {
  * \tparam const char N[] - name must be extern to be unique
  *
  * \details Only one CPP type can be associated with a particular
- *          OpaqueType registration
+ *          OpaqueType registration. Kernels may declare MayInplace for matching
+ *          opaque input/output types. When the planner proves reuse is safe,
+ *          both OrtValues share the same object and its ownership. Kernels must
+ *          also handle distinct output objects without modifying the input.
+ *          MustInplace is available for kernels that cannot support a distinct
+ *          output; session initialization rejects unsafe or non-linear usage.
  *
  */
 template <typename T, const char D[], const char N[]>
