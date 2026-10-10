@@ -185,8 +185,9 @@ alias to the kernel's `MayInplace` declaration.
 
 ### Common case: bind the same object as input and output
 
-The corresponding low-friction interface for an opaque type is for the caller to
-supply the same concrete object as both the input and the preallocated output:
+The corresponding low-friction interface for an opaque type is implemented for a
+direct linear state-update path. The caller supplies the same concrete object as
+both the input and the preallocated output:
 
 ```text
 state_value = OrtValue(PRNG object)
@@ -221,10 +222,9 @@ common linear-state case. It is a permission to mutate the caller-owned object,
 not proof that the graph is linear or that mutation is automatically safe.
 
 For a model in which one state-update kernel directly connects the graph input to
-the graph output, the existing execution-frame behavior can already return the
-caller-supplied opaque object from `Output<T>()`. The kernel can use the same
-address comparison and distinct-output fallback as a tensor cache kernel. No new
-opaque allocation mechanism is required for that direct case.
+the graph output, the execution frame returns the caller-supplied opaque object from
+`Output<T>()`. The kernel uses the same address comparison and distinct-output
+fallback as a tensor cache kernel. No new opaque allocation mechanism is required.
 
 The contract describes the final logical output and object identity; it need not
 forbid every internal copy. In a more complex graph, ORT and the kernels may use
@@ -247,14 +247,16 @@ facility is permissive: preallocating an output with the same underlying value d
 not by itself prove that the producing kernel supports aliasing or that a longer
 input-to-output path can safely preserve the requested identity.
 
-A representation-independent contract should unify tensor and opaque state:
+The boundary validation implements the following contract for opaque state and is
+designed to align with the existing tensor convention:
 
 1. A kernel declares `MayInplace(input_index, output_index)`.
 2. The kernel produces correct results with either aliased or distinct values.
 3. A caller may bind the same underlying `OrtValue` to the corresponding graph
    input and output to request boundary mutation.
-4. ORT validates that the requested boundary alias maps to a supported relationship
-   before execution and rejects unsupported or conflicting bindings.
+4. For opaque objects, ORT validates that the requested boundary alias is a direct
+   linear relationship covered by `MayInplace` before execution and rejects
+   unsupported or conflicting bindings.
 5. Type-specific validation remains where necessary: tensor element type, shape,
    and location versus opaque domain, name, and location.
 
@@ -263,9 +265,8 @@ reuse for internal values and declares that caller-provided aliasing is supporte
 the kernel. It remains permission rather than a requirement; a kernel still needs a
 correct distinct-output path.
 
-The direct one-kernel boundary case should be the first supported generalization
-because it matches existing cache usage and requires little runtime change. A longer
-linear path is a separate optimization problem. For example:
+The implemented direct one-kernel boundary case matches existing cache usage. A
+longer linear path remains a separate optimization problem. For example:
 
 ```text
 input_state -> Generate -> state1 -> Generate -> output_state
