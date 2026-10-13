@@ -71,9 +71,9 @@ All four commands passed for the recorded follow-up measurements.
 
 ## Multi-node replacement and parse-once follow-up
 
-The current replacement-plan implementation was measured using the same build,
+The initial replacement-plan implementation was measured using the same build,
 machine and decoder matrix, refreshed after the PR feedback that moves fixed
-HardSwish/RMSNorm constants into pattern literals. Raw current decoder results are in
+HardSwish/RMSNorm constants into pattern literals. Raw decoder results for that revision are in
 [Pattern_Rewriter_Replacement_Benchmark.csv](Pattern_Rewriter_Replacement_Benchmark.csv).
 These measurements include parsing the six example patterns and two textual
 replacement plans in preparation, plus per-rule compilation of replacement input
@@ -146,6 +146,75 @@ Both commands passed. The replacement microbenchmark also prints its 27 measured
 rows to stdout, prefixed `replacement_row,`. Decoder matrix completeness, deterministic counters and
 reference/indexed agreement were checked by the summarizer.
 All timings and extrapolations are empirical, never worst-case guarantees.
+
+## Runtime attribute-binding follow-up
+
+The extra-binding implementation was measured with the same machine/build,
+decoder topology and 120-group matrix, two warmups and nine repeats.
+Raw results are in
+[Pattern_Rewriter_Extra_Bindings_Benchmark.csv](Pattern_Rewriter_Extra_Bindings_Benchmark.csv)
+and [Pattern_Rewriter_Extra_Bindings_Plans.csv](Pattern_Rewriter_Extra_Bindings_Plans.csv).
+Preparation now includes five textual replacement plans among the six example
+rules. MatMulDiv and RMSNorm capture reusable plans and compute their attributes
+through `Match::update`; TransposeMatMul uses a directly compiled literal plan.
+The synthetic distinct-pattern benchmark now supplies its own unused
+Identity recipe rather than retaining a recipe from an unrelated example.
+Its guard always rejects; this changes no matches, rewrites or graph topology.
+
+At 32 layers / 2241 nodes / 500 rules, times are milliseconds:
+
+| Workload | Reference engine median | Indexed preparation median | Indexed engine median | Indexed engine max | Indexed Resolve median | Indexed total median | Indexed total max |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Active match-only | 175.0040 | 4.4293 | 17.5090 | 18.7343 | 0.0185 | 21.9411 | 23.3651 |
+| Adversarial semantic misses | 163.3550 | 4.4323 | 17.7574 | 18.3372 | 0.0218 | 22.3052 | 22.8374 |
+| Successful rewriting | 184.9420 | 4.4839 | 21.0134 | 22.5267 | 18.6339 | 44.3469 | 47.5773 |
+| Synthetic distinct structural misses | 179.8110 | 10.4713 | 74.8953 | 85.2906 | 0.0290 | 85.5168 | 96.3855 |
+
+All 1080 rows pass the summarizer's matrix, repetition, deterministic-counter
+and reference/indexed agreement checks. The indexed active workloads retain
+27,264 structural checks and 10,688 guards at this scale. Active match-only
+records 128 matches and no rewrites; successful rewriting records 128 rewrites,
+2464 live visits and 1793 output nodes. Synthetic misses record 160,000
+structural checks, no guards/matches/rewrites and 2241 output nodes.
+
+The unchanged synthetic 4000-node replacement-plan microbenchmark produced
+27 rows, nine repetitions per mode, with deterministic 1000 rewrites:
+
+| Mode | Preparation median ms | Engine median ms | Resolve median ms | Output nodes |
+|---|---:|---:|---:|---:|
+| Callback-built HardSwish | 0.1636 | 49.9262 | 39.7976 | 1000 |
+| Parsed HardSwish | 0.1648 | 46.2917 | 37.1298 | 1000 |
+| Parsed HardSigmoid/Mul sequence | 0.1660 | 65.8021 | 44.9093 | 2000 |
+
+The decoder is the workload exercising computed bindings; this synthetic
+microbenchmark still compares literal plans. Separate-run timings vary broadly
+on the shared host, including the unchanged reference implementation. These
+measurements establish current cost and correctness, not a controlled estimate
+of extra-binding overhead or a universal speedup. Historical extrapolation
+budgets above remain historical, not recalibrated guarantees.
+
+Validation: CPU Release incremental build **passed**; **55 correctness/regression
+tests passed** (44 rewriter, 11 existing optimizer); both benchmarks **passed**
+(57 tests total). New coverage includes float/int/list bindings, string binding
+storage, renamed attributes, multiple bound attributes in a two-node plan,
+repeated updates, cross-graph plan reuse, missing bindings, schema rollback,
+name collisions, invalid parser references, rejected-rule isolation and
+match-only nonexecution. Executed MatMulDiv, RMSNorm and decoder tests exercise
+the migrated plans. Decode max absolute error remains 0; prefill max absolute
+error remains 2.98023e-08, with floored relative error 2.73599e-07.
+No full ORT suite or GPU build was run.
+
+Reproduction (the build, combined test/benchmark and summarizer commands all passed):
+
+```powershell
+.\.venv\Scripts\python.exe tools\ci_build\build.py --build_dir build\rewriter --config Release --build --parallel 4 --target onnxruntime_test_all --skip_tests
+$env:ORT_REWRITER_BENCHMARK_CSV = Join-Path (Get-Location) 'docs\Pattern_Rewriter_Extra_Bindings_Benchmark.csv'
+$env:ORT_REWRITER_REPLACEMENT_CSV = Join-Path (Get-Location) 'docs\Pattern_Rewriter_Extra_Bindings_Plans.csv'
+Push-Location build\rewriter\Release\Release
+.\onnxruntime_test_all.exe --gtest_also_run_disabled_tests --gtest_filter="PatternRewriterTests.*:GraphTransformationTests.MatMulScaleFusion*:GraphTransformationTests.QuickGelu*:PatternRewriterBenchmark.DISABLED_Decoder:PatternRewriterBenchmark.DISABLED_ReplacementPlans"
+Pop-Location
+.\.venv\Scripts\python.exe tools\ci_build\summarize_rewriter_benchmark.py docs\Pattern_Rewriter_Extra_Bindings_Benchmark.csv
+```
 
 ## Configuration and scope
 

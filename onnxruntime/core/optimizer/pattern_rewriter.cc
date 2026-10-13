@@ -142,6 +142,10 @@ Status Replace(Graph& graph, const Pattern& pattern, const Match& match, const R
   InlinedVector<InlinedVector<NodeArg*>> external_inputs;
   for (size_t i = 0; i < nodes.size(); ++i) {
     const auto& node = nodes[i];
+    for (const auto& [name, binding] : node.attribute_bindings) {
+      ORT_RETURN_IF(name.empty() || node.attributes.count(name), "Invalid or duplicate replacement attribute: ", name);
+      match.attributeOf(binding);
+    }
     const auto& domain = node.domain == kOnnxDomainAlias ? kOnnxDomain : node.domain;
     ORT_RETURN_IF(node.op.empty() || node.inputs.size() > 64 || node.output_count == 0 || node.output_count > 64,
                   "Invalid replacement operator or arity.");
@@ -227,8 +231,19 @@ Status Replace(Graph& graph, const Pattern& pattern, const Match& match, const R
     }
     const auto& node = nodes[i];
     const auto& domain = node.domain == kOnnxDomainAlias ? kOnnxDomain : node.domain;
+    NodeAttributes resolved_attributes;
+    const NodeAttributes* attributes = &node.attributes;
+    if (!node.attribute_bindings.empty()) {
+      resolved_attributes = node.attributes;
+      for (const auto& [name, binding] : node.attribute_bindings) {
+        auto value = match.attributeOf(binding);
+        value.set_name(name);
+        resolved_attributes.emplace(name, std::move(value));
+      }
+      attributes = &resolved_attributes;
+    }
     Node& replacement = graph.AddNode(graph.GenerateNodeName("rewrite"), node.op, "PatternRewriter", inputs, outputs,
-                                      root, &node.attributes, domain);
+                                      root, attributes, domain);
     added.push_back(replacement.Index());
     if (!graph.SetOpSchemaFromRegistryForNode(replacement)) {
       rollback();
@@ -407,8 +422,9 @@ bool Pattern::IsInput(Value value) const {
 namespace {
 class PatternParser {
  public:
-  explicit PatternParser(std::string_view text, InlinedVector<NodeAttributes, 1>* attributes = nullptr)
-      : text_(text), replacement_attributes_(attributes) {}
+  explicit PatternParser(std::string_view text, InlinedVector<NodeAttributes, 1>* attributes = nullptr,
+                         InlinedVector<InlinedHashMap<std::string, std::string>, 1>* bindings = nullptr)
+      : text_(text), replacement_attributes_(attributes), replacement_bindings_(bindings) {}
 
   Status Parse(Pattern& destination) {
     ORT_RETURN_IF_ERROR(Next());
@@ -469,6 +485,7 @@ class PatternParser {
     ORT_RETURN_IF(!returned, Error("missing return"));
     InlinedHashSet<int> reachable;
     for (Value output : pattern_.Nodes().back().outputs) reachable.insert(output.handle);
+    for (int handle : attribute_inputs_) reachable.insert(handle);
     for (auto it = pattern_.Nodes().rbegin(); it != pattern_.Nodes().rend(); ++it) {
       ORT_RETURN_IF(std::none_of(it->outputs.begin(), it->outputs.end(),
                                  [&](Value output) { return reachable.count(output.handle); }),
@@ -579,11 +596,19 @@ class PatternParser {
       ORT_RETURN_IF(kind_ != Kind::Identifier, Error("expected qualified operator name"));
       op.name = token_;
       ORT_RETURN_IF_ERROR(Next());
+    } else if (replacement_attributes_) {
+      auto dot = op.name.rfind('.');
+      if (dot != std::string::npos) {
+        op.domain = op.name.substr(0, dot);
+        op.name.erase(0, dot + 1);
+        ORT_RETURN_IF(op.name.empty(), Error("expected qualified operator name"));
+      }
     }
     ORT_RETURN_IF_ERROR(Expect("("));
     InlinedVector<Value> inputs;
     InlinedVector<AttributeMatcher, 1> attributes;
     NodeAttributes literal_attributes;
+    InlinedHashMap<std::string, std::string> bindings;
     InlinedHashSet<std::string> attribute_names;
     bool keyword = false;
     if (token_ != ")") {
@@ -595,7 +620,14 @@ class PatternParser {
             keyword = true;
             ORT_RETURN_IF(!attribute_names.insert(name).second, Error("duplicate attribute"));
             ORT_RETURN_IF_ERROR(Next());
-            if (kind_ == Kind::String) {
+            if (replacement_bindings_ && kind_ == Kind::Identifier) {
+              auto found = symbols_.find(token_);
+              ORT_RETURN_IF(found == symbols_.end() || !pattern_.IsInput(found->second),
+                            Error("attribute binding must reference a declared replacement input"));
+              bindings.emplace(name, token_);
+              attribute_inputs_.insert(found->second.handle);
+              ORT_RETURN_IF_ERROR(Next());
+            } else if (kind_ == Kind::String) {
               attributes.push_back(AttributeMatcher::Equal(name, token_));
               auto& attr = literal_attributes[name];
               attr.set_name(name);
@@ -642,6 +674,7 @@ class PatternParser {
     auto values = pattern_.MultiOp(std::move(op), gsl::span<const Value>(inputs), outputs);
     pattern_.Attributes(std::move(attributes));
     if (replacement_attributes_) replacement_attributes_->push_back(std::move(literal_attributes));
+    if (replacement_bindings_) replacement_bindings_->push_back(std::move(bindings));
     for (size_t i = 0; i < names.size(); ++i) {
       pattern_.Name(values[i], names[i]);
       symbols_.emplace(names[i], pattern_.NamedValue(names[i]));
@@ -664,6 +697,8 @@ class PatternParser {
   Pattern pattern_;
   InlinedHashMap<std::string, Value> symbols_;
   InlinedVector<NodeAttributes, 1>* replacement_attributes_ = nullptr;
+  InlinedVector<InlinedHashMap<std::string, std::string>, 1>* replacement_bindings_ = nullptr;
+  InlinedHashSet<int> attribute_inputs_;
 };
 }  // namespace
 
@@ -677,12 +712,17 @@ Replacement::Replacement(InlinedVector<NodeRecipe, 1> nodes) {
 Replacement::Replacement(std::string_view text) {
   Pattern parsed;
   InlinedVector<NodeAttributes, 1> parsed_attributes;
-  ORT_THROW_IF_ERROR(PatternParser(text, &parsed_attributes).Parse(parsed));
+  InlinedVector<InlinedHashMap<std::string, std::string>, 1> parsed_bindings;
+  ORT_THROW_IF_ERROR(PatternParser(text, &parsed_attributes, &parsed_bindings).Parse(parsed));
   InlinedHashMap<int, Output> outputs;
   InlinedVector<NodeRecipe, 1> nodes;
+  InlinedHashSet<std::string> attribute_names;
+  InlinedHashSet<std::string> tensor_names;
   for (size_t i = 0; i < parsed.Nodes().size(); ++i) {
     const auto& node = parsed.Nodes()[i];
     NodeRecipe recipe{node.op.name, node.op.domain, {}, std::move(parsed_attributes[i]), node.outputs.size()};
+    recipe.attribute_bindings = std::move(parsed_bindings[i]);
+    for (const auto& [name, binding] : recipe.attribute_bindings) attribute_names.insert(binding);
     for (const Value& input : node.inputs) {
       auto literal = parsed.Constants().find(input.handle);
       if (literal != parsed.Constants().end()) {
@@ -690,11 +730,14 @@ Replacement::Replacement(std::string_view text) {
         continue;
       }
       auto found = outputs.find(input.handle);
-      if (found == outputs.end())
+      if (found == outputs.end()) {
+        tensor_names.insert(input.name);
         recipe.inputs.push_back(input.name);
-      else
+      } else
         recipe.inputs.push_back(found->second);
     }
+    for (const auto& name : attribute_names)
+      ORT_ENFORCE(!tensor_names.count(name), "Replacement input cannot be both a tensor and an attribute: ", name);
     for (size_t slot = 0; slot < node.outputs.size(); ++slot)
       outputs.emplace(node.outputs[slot].handle, Output{nodes.size(), slot});
     nodes.push_back(std::move(recipe));
@@ -710,6 +753,25 @@ const NodeArg* Match::valueOf(std::string_view name) const {
   ORT_ENFORCE(value->handle >= 0 && static_cast<size_t>(value->handle) < values.size() && values[value->handle],
               "Pattern value is not bound: ", name);
   return values[value->handle];
+}
+
+void Match::update(std::string_view name, ONNX_NAMESPACE::AttributeProto value) const {
+  ORT_ENFORCE(!name.empty() && value.type() != ONNX_NAMESPACE::AttributeProto_AttributeType_UNDEFINED &&
+                  !value.has_ref_attr_name(),
+              "Extra bindings require a name and a concrete attribute value.");
+  if (pattern) {
+    ORT_ENFORCE(std::none_of(pattern->values_.begin(), pattern->values_.end(),
+                             [&](const Value& binding) { return binding.name == name; }),
+                "Extra attribute binding cannot overwrite a pattern value: ", name);
+  }
+  value.set_name(std::string(name));
+  extra_attributes_.insert_or_assign(std::string(name), std::move(value));
+}
+
+const ONNX_NAMESPACE::AttributeProto& Match::attributeOf(std::string_view name) const {
+  auto found = extra_attributes_.find(std::string(name));
+  ORT_ENFORCE(!name.empty() && found != extra_attributes_.end(), "Missing replacement attribute binding: ", name);
+  return found->second;
 }
 
 PatternRewriter::PatternRewriter(Rules rules, Options options)
@@ -736,6 +798,11 @@ PatternRewriter::PatternRewriter(Rules rules, Options options)
       for (auto& node : nodes) {
         if (node.domain == kOnnxDomainAlias) node.domain = kOnnxDomain;
         ORT_ENFORCE(domains.count(node.domain), "Missing rule opset requirement for replacement domain: ", node.domain);
+        for (const auto& [name, binding] : node.attribute_bindings) {
+          ORT_ENFORCE(std::none_of(rule.pattern.values_.begin(), rule.pattern.values_.end(),
+                                   [&](const Value& value) { return value.name == binding; }),
+                      "Replacement attribute binding conflicts with a pattern value: ", binding);
+        }
         for (auto& input : node.inputs) {
           if (const auto* name = std::get_if<std::string>(&input)) {
             auto value = rule.pattern.NamedValue(*name);
@@ -828,6 +895,7 @@ Status PatternRewriter::Run(Graph& graph, Statistics& statistics) const {
       for (size_t id : rule_ids) {
         if (!options_.match_only && id >= winner) break;
         match.pattern = &rules_[id].pattern;
+        match.ClearUpdates();
         ++statistics.guards;
         if (!rules_[id].guard(graph, match)) continue;
         if (options_.match_only) ++statistics.matches;
@@ -864,6 +932,7 @@ Status PatternRewriter::Run(Graph& graph, Statistics& statistics) const {
       if (it != producers.end()) affected.push_back(it->second);
     }
     InlinedVector<NodeIndex> added;
+    winning_match.ClearUpdates();
     auto recipe = rules_[winner].replacement(graph, winning_match);
     auto declared = [&](const std::string& node_domain) {
       const auto& domain = node_domain == kOnnxDomainAlias ? kOnnxDomain : node_domain;

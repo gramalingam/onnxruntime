@@ -694,6 +694,163 @@ TEST(PatternRewriterTests, ReplacementPlanBindingAndSequenceInvalidation) {
   }
 }
 
+TEST(PatternRewriterTests, ReplacementExtraAttributeBindings) {
+  auto make_attribute = [](ONNX_NAMESPACE::AttributeProto_AttributeType type) {
+    ONNX_NAMESPACE::AttributeProto attr;
+    attr.set_name("ignored_source_name");
+    attr.set_type(type);
+    return attr;
+  };
+  Match empty;
+  EXPECT_THROW(empty.attributeOf("missing"), OnnxRuntimeException);
+  auto alpha = make_attribute(ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT);
+  alpha.set_f(0.25f);
+  EXPECT_THROW(empty.update("", alpha), OnnxRuntimeException);
+  EXPECT_THROW(empty.update("alpha", {}), OnnxRuntimeException);
+  auto reference = alpha;
+  reference.set_ref_attr_name("other");
+  EXPECT_THROW(empty.update("alpha", reference), OnnxRuntimeException);
+  empty.update("alpha", alpha);
+  EXPECT_FLOAT_EQ(empty.attributeOf("alpha").f(), 0.25f);
+  alpha.set_f(0.5f);
+  empty.update("alpha", alpha);
+  EXPECT_FLOAT_EQ(empty.attributeOf("alpha").f(), 0.5f);
+  auto text_attribute = make_attribute(ONNX_NAMESPACE::AttributeProto_AttributeType_STRING);
+  text_attribute.set_s("none");
+  empty.update("approximate", text_attribute);
+  EXPECT_EQ(empty.attributeOf("approximate").s(), "none");
+  empty.ClearUpdates();
+  EXPECT_THROW(empty.attributeOf("alpha"), OnnxRuntimeException);
+
+  for (auto text : {"(x)=>HardSigmoid(x,alpha=unknown)",
+                    "(x,a)=>HardSigmoid(x,alpha=x)",
+                    "(x)=>a=Identity(x);return HardSigmoid(a,alpha=a)",
+                    "(x,a)=>HardSigmoid(x,alpha=a,alpha=0.5)"})
+    EXPECT_THROW(Replacement{text}, OnnxRuntimeException);
+  EXPECT_THROW(Pattern{"(x,a)=>return HardSigmoid(x,alpha=a)"}, OnnxRuntimeException);
+  Replacement dotted("(x,alpha)=>com.microsoft.FusedMatMul(x,x,alpha=alpha)");
+  EXPECT_EQ(dotted.Plan()->front().domain, kMSDomain);
+  EXPECT_EQ(dotted.Plan()->front().op, "FusedMatMul");
+  EXPECT_EQ(dotted.Plan()->front().attribute_bindings.at("alpha"), "alpha");
+
+  for (bool indexed : {false, true}) {
+    for (int scenario = 0; scenario < 5; ++scenario) {
+      TestGraph test;
+      BuildHardSwish(test.builder);
+      test.builder.SetGraphOutputs();
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      auto first = MakeExampleRules()[0];
+      auto second = first;
+      // Deliberate guard misuse verifies that rejected candidates cannot leak updates.
+      first.guard = [alpha](const Graph&, const Match& m) {
+        m.update("alpha", alpha);
+        return false;
+      };
+      Replacement plan("(x,alpha,beta)=>h=HardSigmoid(x,alpha=alpha,beta=beta);return Mul(h,x)");
+      second.replacement = [plan, scenario, make_attribute](const Graph&, const Match& m) {
+        auto beta = make_attribute(ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT);
+        beta.set_f(0.5f);
+        m.update("beta", beta);
+        if (scenario == 1) return plan;  // alpha is missing; must not leak from the rejected rule.
+        if (scenario == 2) m.update("x", beta);
+        auto alpha_value = make_attribute(scenario == 3 ? ONNX_NAMESPACE::AttributeProto_AttributeType_INT
+                                                        : ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT);
+        alpha_value.set_f(1.0f / 6.0f);
+        m.update("alpha", alpha_value);
+        if (scenario == 4) {
+          auto malformed = plan;
+          malformed.attributes.emplace("extra", beta);
+          return malformed;
+        }
+        return plan;
+      };
+      PatternRewriter rewriter({first, second}, {.indexed = indexed});
+      Statistics stats;
+      if (scenario == 1 || scenario == 2) {
+        EXPECT_THROW((void)rewriter.Run(test.graph, stats), OnnxRuntimeException);
+      } else {
+        EXPECT_EQ(rewriter.Run(test.graph, stats).IsOK(), scenario == 0);
+      }
+      EXPECT_EQ(test.graph.NumberOfNodes(), scenario == 0 ? 2u : 4u);
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      if (scenario == 0) {
+        for (const auto& node : test.graph.Nodes()) {
+          if (node.OpType() != "HardSigmoid") continue;
+          EXPECT_EQ(node.GetAttributes().at("alpha").name(), "alpha");
+          EXPECT_FLOAT_EQ(node.GetAttributes().at("alpha").f(), 1.0f / 6.0f);
+          EXPECT_FLOAT_EQ(node.GetAttributes().at("beta").f(), 0.5f);
+        }
+      }
+    }
+  }
+}
+
+TEST(PatternRewriterTests, ReplacementExtraBindingsVaryPerMatchAndAttributeTypes) {
+  for (bool indexed : {false, true}) {
+    auto rule = IdentityPair();
+    rule.pattern = Pattern("(x)=>a=Identity(x);b=Identity(a);return Identity(b)");
+    Replacement plan("(x,axis)=>Softmax(x,axis=axis)");
+    int calls = 0;
+    rule.replacement = [plan, &calls](const Graph&, const Match& m) {
+      ONNX_NAMESPACE::AttributeProto axis;
+      axis.set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_INT);
+      axis.set_i(calls++ == 0 ? 0 : 1);
+      m.update("axis", axis);
+      return plan;
+    };
+    PatternRewriter matcher({rule}, {.match_only = true, .indexed = indexed});
+    PatternRewriter rewriter({rule}, {.indexed = indexed});
+    for (int repeat = 0; repeat < 2; ++repeat) {
+      TestGraph test;
+      auto* x = test.builder.MakeInput<float>({2, 2}, -1.0f, 1.0f);
+      auto* a = test.builder.MakeIntermediate();
+      auto* b = test.builder.MakeIntermediate();
+      test.builder.AddNode("Identity", {x}, {a});
+      test.builder.AddNode("Identity", {a}, {b});
+      test.builder.AddNode("Identity", {b}, {test.builder.MakeOutput()});
+      test.builder.SetGraphOutputs();
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      Statistics stats;
+      ASSERT_STATUS_OK(matcher.Run(test.graph, stats));
+      EXPECT_EQ(calls, repeat);
+      EXPECT_EQ(test.graph.NumberOfNodes(), 3u);
+      EXPECT_EQ(stats.matches, 1u);
+      ASSERT_STATUS_OK(rewriter.Run(test.graph, stats));
+      EXPECT_EQ(stats.rewrites, 1u);
+      EXPECT_EQ(test.graph.Nodes().begin()->GetAttributes().at("axis").i(), repeat);
+      ASSERT_STATUS_OK(test.graph.Resolve());
+    }
+  }
+
+  auto rule = IdentityPair();
+  rule.pattern = Pattern("(x)=>a=Identity(x);b=Identity(a);return Identity(b)");
+  Replacement plan("(x,perm)=>Transpose(x,perm=perm)");
+  auto replacement = [plan](const Graph&, const Match& m) {
+    ONNX_NAMESPACE::AttributeProto perm;
+    perm.set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_INTS);
+    perm.add_ints(0);
+    perm.add_ints(1);
+    m.update("perm", perm);
+    return plan;
+  };
+  rule.replacement = replacement;
+  TransformerTester(
+      [](ModelTestBuilder& b) {
+        auto* x = b.MakeInput<float>({2, 2}, -1.0f, 1.0f);
+        auto* a = b.MakeIntermediate();
+        auto* intermediate = b.MakeIntermediate();
+        b.AddNode("Identity", {x}, {a});
+        b.AddNode("Identity", {a}, {intermediate});
+        b.AddNode("Identity", {intermediate}, {b.MakeOutput()});
+      },
+      [](InferenceSessionWrapper& session) {
+        EXPECT_EQ(Count(session.GetGraph(), "Transpose"), 1u);
+        EXPECT_EQ(Count(session.GetGraph(), "Identity"), 0u);
+      },
+      TransformerLevel::Default, TransformerLevel::Level1, 17, 0, 0,
+      std::make_unique<PatternRewriter>(Rules{rule}));
+}
+
 TEST(PatternRewriterTests, ParsedHardSwishConstantsAndExecution) {
   constexpr auto text = R"(
     (x, low, high, divisor) =>
@@ -1854,6 +2011,10 @@ TEST(PatternRewriterBenchmark, DISABLED_Decoder) {
                 pattern.Op({"Mul", ""}, {input, value});
                 rule.pattern = std::move(pattern);
                 rule.guard = [](const Graph&, const Match&) { return false; };
+                auto replacement = [](const Graph&, const Match& m) {
+                  return Replacement{"Identity", kOnnxDomain, {m.valueOf("x")}, {}};
+                };
+                rule.replacement = replacement;
               }
               rules.push_back(std::move(rule));
             }

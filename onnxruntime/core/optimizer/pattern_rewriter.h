@@ -91,6 +91,7 @@ class Pattern {
 
  private:
   friend struct Match;
+  friend class PatternRewriter;
   size_t value_count_ = 0;
   InlinedVector<NodePattern, 1> nodes_;
   InlinedVector<Value> values_;
@@ -102,7 +103,13 @@ struct Match {
   InlinedVector<const Node*> nodes;
   InlinedVector<const NodeArg*> values;
   const NodeArg* valueOf(std::string_view name) const;
+  void update(std::string_view name, ONNX_NAMESPACE::AttributeProto value) const;
+  const ONNX_NAMESPACE::AttributeProto& attributeOf(std::string_view name) const;
+  void ClearUpdates() const { extra_attributes_.clear(); }
   const Pattern* pattern = nullptr;
+
+ private:
+  mutable NodeAttributes extra_attributes_;
 };
 
 struct Replacement {
@@ -120,6 +127,7 @@ struct Replacement {
     InlinedVector<Input> inputs;
     NodeAttributes attributes;
     size_t output_count = 1;
+    InlinedHashMap<std::string, std::string> attribute_bindings;
   };
   Replacement() = default;
   Replacement(std::string op_name, std::string op_domain, InlinedVector<Input> arguments, NodeAttributes attrs)
@@ -146,7 +154,8 @@ struct Rule {
   std::string name;
   Pattern pattern;
   InlinedVector<OpsetRequirement, 1> opsets;
-  // Guards and recipes must not mutate the graph or retain pointers into a Match.
+  // Guards must be pure. Recipes may set extra attribute bindings, but must not mutate the graph
+  // or retain pointers into a Match.
   std::function<bool(const Graph&, const Match&)> guard;
   std::function<Replacement(const Graph&, const Match&)> replacement;
 };

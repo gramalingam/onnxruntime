@@ -239,12 +239,14 @@ At runtime the callback returns a shared plan reference. There is no parsing,
 attribute-literal construction, or name lookup for these prebound inputs.
 The engine binds the external `NodeArg`s, allocates fresh intermediate values,
 creates nodes in definition order, and applies the stored attributes.
-Callbacks that need computed attributes can still return programmatic recipes;
-do not construct `Replacement(text)` inside a per-match callback.
+Callbacks that need computed attributes can use extra bindings with a captured
+parsed plan (below), or return programmatic recipes. Do not construct
+`Replacement(text)` inside a per-match callback.
 
 Replacement headers may select a subset of the matched pattern's inputs.
-They cannot refer to matched intermediates. All declared replacement inputs and
-nodes must reach the final operator. A multi-output assignment such as
+Tensor parameters cannot refer to matched intermediates. All declared replacement
+parameters must be used as tensor inputs or attribute bindings, and all nodes
+must reach the final operator. A multi-output assignment such as
 `a, b = Split(x, axis=0)` declares the exact internal arity.
 The final operator inherits **all matched root outputs in order**, including a
 multi-output root; its schema must accept that count. Intermediate outputs cannot
@@ -264,12 +266,69 @@ Replacement replacement(InlinedVector<Replacement::NodeRecipe, 1>{
 ```
 
 `NodeRecipe` contains op, domain, inputs, attributes and internal output count.
+It also has `attribute_bindings`, a map from target attribute names to extra
+binding names.
 Its inputs may be names, existing `Value` handles, matched `NodeArg*` bindings,
 earlier-output references or `Replacement::Scalar{...}` literals.
 The final node's output count is inherited from the root rather than this field.
 The original four-argument single-node constructor remains supported, including
 computed-attribute callbacks. Its public single-node fields cannot be combined
 with an immutable parsed/programmatic plan; mixed representations are rejected.
+
+#### Computed attributes through extra bindings
+
+Replacement keyword values may refer to names declared in its header.
+Tensor arguments come from the pattern match; extra attribute arguments come
+from `Match::update`, which accepts a concrete `AttributeProto`:
+
+```cpp
+Replacement plan("(x, y, alpha) => com.microsoft.FusedMatMul(x, y, alpha=alpha)");
+auto replacement = [plan](const Graph& graph, const Match& m) {
+  m.update("alpha", FloatAttribute("alpha",
+      1.0f / *Scalar(graph, *m.valueOf("divisor"))));
+  return plan;
+};
+Rule rule{"MatMulDiv", pattern, opsets, guard, replacement};
+```
+
+Here `FloatAttribute` and `Scalar` are the helpers used by the example rules;
+the guard establishes float32 and a finite, nonzero scalar divisor.
+The plan is parsed **once when defining the rule**, not once per successful
+match. Capturing/returning it shares the immutable plan. Computed attributes
+are looked up and copied into the new nodes at rewrite time. Captured callback
+plans still resolve tensor names at runtime; only directly supplied plans have
+their tensor names prebound by transformer construction.
+
+`com.microsoft.FusedMatMul` is accepted in replacement text, as is the existing
+`com.microsoft::FusedMatMul` spelling. Literal attributes and bound attributes
+can be mixed, e.g. `axis=-1, epsilon=fused_epsilon, stash_type=1`.
+Multiple nodes can share a binding, and target attribute names can differ from
+binding names. Attribute proto names are normalized to the target names.
+The proto carries the type, including list/tensor/string types not representable
+as text literals; imported operator schemas validate the resolved attributes.
+
+Extra bindings are invocation-local state, separate from immutable matched
+graph values. `update` is callable on the callback's `const Match&`, because it
+changes only this extra state, not the graph or matched values. Repeated updates
+to an extra name replace its value. Guards must remain pure; the engine clears
+extra state between candidates and before invoking the winning recipe. No binding
+is retained between rewrites, graph runs or rules; match-only mode never invokes
+recipes. `attributeOf(name)` retrieves a previously set extra attribute.
+
+Empty names, undefined attribute types, reference attributes, missing bindings
+and attempts to shadow any named pattern value are explicit errors.
+A header name cannot be used both as a tensor argument and an attribute binding;
+attribute references must name header parameters, not intermediate outputs.
+All required extras are checked before graph mutation. Schema validation failures
+use the same staged-node rollback as literal attributes. As with other recipes,
+callbacks must establish semantic/type compatibility; extra bindings are not
+an automatic semantic guard or a general graph transaction.
+
+The MatMulDiv and RMSNorm examples use captured plans with computed bindings.
+TransposeMatMul uses a literal parsed replacement. FusedMatMulDiv deliberately
+retains its programmatic recipe to preserve **all** original attributes, including
+transpose/batch settings; extra bindings describe individual attributes, not
+an attribute-map spread.
 
 Every replacement must contain at least one node and **strictly fewer nodes
 than the matched pattern**. Equal-size rewrites and expansions are rejected,

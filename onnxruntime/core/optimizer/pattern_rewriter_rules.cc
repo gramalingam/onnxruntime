@@ -19,14 +19,6 @@ ONNX_NAMESPACE::AttributeProto FloatAttribute(const char* name, float value) {
   return attr;
 }
 
-ONNX_NAMESPACE::AttributeProto IntAttribute(const char* name, int64_t value) {
-  ONNX_NAMESPACE::AttributeProto attr;
-  attr.set_name(name);
-  attr.set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_INT);
-  attr.set_i(value);
-  return attr;
-}
-
 bool Float32(const Match& match) {
   for (const NodeArg* value : match.values) {
     const auto* type = value->TypeAsProto();
@@ -89,10 +81,10 @@ Rules MakeExampleRules() {
       auto scalar = Scalar(graph, *m.valueOf("divisor"));
       return Float32(m) && scalar && *scalar != 0.0f && std::isfinite(1.0f / *scalar);
     };
-    auto replacement = [](const Graph& graph, const Match& m) {
-      NodeAttributes attributes;
-      attributes.emplace("alpha", FloatAttribute("alpha", 1.0f / *Scalar(graph, *m.valueOf("divisor"))));
-      return Replacement{"FusedMatMul", kMSDomain, {m.valueOf("x"), m.valueOf("y")}, std::move(attributes)};
+    Replacement plan("(x, y, alpha) => com.microsoft.FusedMatMul(x, y, alpha=alpha)");
+    auto replacement = [plan](const Graph& graph, const Match& m) {
+      m.update("alpha", FloatAttribute("alpha", 1.0f / *Scalar(graph, *m.valueOf("divisor"))));
+      return plan;
     };
     Rule rule{"MatMulDiv", p, {{kOnnxDomain, 9, 21}, {kMSDomain, 1, 1}}, guard, replacement};
     rules.push_back(std::move(rule));
@@ -116,9 +108,7 @@ Rules MakeExampleRules() {
       }
       return true;
     };
-    auto replacement = [](const Graph&, const Match& m) {
-      return Replacement{"FusedMatMul", kMSDomain, {m.valueOf("x"), m.valueOf("y")}, {{"transB", IntAttribute("transB", 1)}}};
-    };
+    Replacement replacement("(x,y) => com.microsoft.FusedMatMul(x,y,transB=1)");
     Rule rule{"TransposeMatMul", p, {{kOnnxDomain, 9, 21}, {kMSDomain, 1, 1}}, guard, replacement};
     rules.push_back(std::move(rule));
   }
@@ -169,12 +159,13 @@ Rules MakeExampleRules() {
              axes->second.type() == ONNX_NAMESPACE::AttributeProto_AttributeType_INTS &&
              axes->second.ints_size() == 1 && axes->second.ints(0) == -1;
     };
-    auto replacement = [](const Graph& graph, const Match& m) {
-      NodeAttributes attributes;
-      attributes.emplace("axis", IntAttribute("axis", -1));
-      attributes.emplace("epsilon", FloatAttribute("epsilon", *Scalar(graph, *m.valueOf("epsilon"))));
-      attributes.emplace("stash_type", IntAttribute("stash_type", ONNX_NAMESPACE::TensorProto_DataType_FLOAT));
-      return Replacement{"SimplifiedLayerNormalization", kOnnxDomain, {m.valueOf("x"), m.valueOf("scale")}, std::move(attributes)};
+    Replacement plan(R"(
+      (x, scale, fused_epsilon) =>
+        SimplifiedLayerNormalization(x, scale, axis=-1, epsilon=fused_epsilon, stash_type=1)
+    )");
+    auto replacement = [plan](const Graph& graph, const Match& m) {
+      m.update("fused_epsilon", FloatAttribute("epsilon", *Scalar(graph, *m.valueOf("epsilon"))));
+      return plan;
     };
     Rule rule{"RmsNormalization", p, {{kOnnxDomain, 7, 17}}, guard, replacement};
     rules.push_back(std::move(rule));
