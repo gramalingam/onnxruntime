@@ -89,6 +89,7 @@ class Pattern {
   const auto& Constants() const { return constants_; }
 
  private:
+  friend struct Match;
   size_t value_count_ = 0;
   InlinedVector<NodePattern, 1> nodes_;
   InlinedVector<Value> values_;
@@ -99,12 +100,14 @@ class Pattern {
 struct Match {
   InlinedVector<const Node*> nodes;
   InlinedVector<const NodeArg*> values;
+  const NodeArg* valueOf(std::string_view name) const;
+  const Pattern* pattern = nullptr;
 };
 
 struct Replacement {
   std::string op;
   std::string domain;
-  InlinedVector<Value> inputs;
+  InlinedVector<std::variant<Value, const NodeArg*>> inputs;
   NodeAttributes attributes;
 };
 

@@ -66,17 +66,17 @@ Rules MakeExampleRules() {
         mul = Mul(clip, x)
         return Div(mul, divisor)
     )");
-    auto x = p.NamedValue("x"), bias = p.NamedValue("bias"), low = p.NamedValue("low"),
-         high = p.NamedValue("high"), divisor = p.NamedValue("divisor");
     rules.push_back({"HardSwish",
                      p,
                      {{kOnnxDomain, 14, 21}},
-                     [=](const Graph& graph, const Match& m) {
-                       return Float32(m) && Scalar(graph, *m.values[bias]) == 3.0f &&
-                              Scalar(graph, *m.values[low]) == 0.0f && Scalar(graph, *m.values[high]) == 6.0f &&
-                              Scalar(graph, *m.values[divisor]) == 6.0f;
+                     [](const Graph& graph, const Match& m) {
+                       return Float32(m) && Scalar(graph, *m.valueOf("bias")) == 3.0f &&
+                              Scalar(graph, *m.valueOf("low")) == 0.0f && Scalar(graph, *m.valueOf("high")) == 6.0f &&
+                              Scalar(graph, *m.valueOf("divisor")) == 6.0f;
                      },
-                     [=](const Graph&, const Match&) { return Replacement{"HardSwish", kOnnxDomain, {x}, {}}; }});
+                     [](const Graph&, const Match& m) {
+                       return Replacement{"HardSwish", kOnnxDomain, {m.valueOf("x")}, {}};
+                     }});
   }
   {
     Pattern p(R"(
@@ -84,39 +84,38 @@ Rules MakeExampleRules() {
         sigmoid = HardSigmoid(x, alpha=0.16666667, beta=0.5)
         return Mul(sigmoid, x)
     )");
-    auto x = p.NamedValue("x");
     rules.push_back({"HardSigmoidMul",
                      p,
                      {{kOnnxDomain, 14, 21}},
                      [](const Graph&, const Match& m) { return Float32(m); },
-                     [=](const Graph&, const Match&) { return Replacement{"HardSwish", kOnnxDomain, {x}, {}}; }});
+                     [](const Graph&, const Match& m) {
+                       return Replacement{"HardSwish", kOnnxDomain, {m.valueOf("x")}, {}};
+                     }});
   }
 #ifndef DISABLE_CONTRIB_OPS
   {
     Pattern p("(x, y, divisor) => mm = MatMul(x, y); return Div(mm, divisor)");
-    auto x = p.NamedValue("x"), y = p.NamedValue("y"), divisor = p.NamedValue("divisor");
     rules.push_back({"MatMulDiv",
                      p,
                      {{kOnnxDomain, 9, 21}, {kMSDomain, 1, 1}},
-                     [=](const Graph& graph, const Match& m) {
-                       auto scalar = Scalar(graph, *m.values[divisor]);
+                     [](const Graph& graph, const Match& m) {
+                       auto scalar = Scalar(graph, *m.valueOf("divisor"));
                        return Float32(m) && scalar && *scalar != 0.0f && std::isfinite(1.0f / *scalar);
                      },
-                     [=](const Graph& graph, const Match& m) {
+                     [](const Graph& graph, const Match& m) {
                        NodeAttributes attributes;
-                       attributes.emplace("alpha", FloatAttribute("alpha", 1.0f / *Scalar(graph, *m.values[divisor])));
-                       return Replacement{"FusedMatMul", kMSDomain, {x, y}, std::move(attributes)};
+                       attributes.emplace("alpha", FloatAttribute("alpha", 1.0f / *Scalar(graph, *m.valueOf("divisor"))));
+                       return Replacement{"FusedMatMul", kMSDomain, {m.valueOf("x"), m.valueOf("y")}, std::move(attributes)};
                      }});
   }
   {
     Pattern p("(x, y) => transpose = Transpose(y); return MatMul(x, transpose)");
-    auto x = p.NamedValue("x"), y = p.NamedValue("y");
     rules.push_back({"TransposeMatMul",
                      p,
                      {{kOnnxDomain, 9, 21}, {kMSDomain, 1, 1}},
-                     [=](const Graph&, const Match& m) {
+                     [](const Graph&, const Match& m) {
                        if (!Float32(m)) return false;
-                       const auto* shape = m.values[y]->Shape();
+                       const auto* shape = m.valueOf("y")->Shape();
                        if (!shape || shape->dim_size() < 2) return false;
                        auto it = m.nodes[0]->GetAttributes().find("perm");
                        if (it == m.nodes[0]->GetAttributes().end()) return shape->dim_size() == 2;
@@ -131,28 +130,27 @@ Rules MakeExampleRules() {
                        }
                        return true;
                      },
-                     [=](const Graph&, const Match&) {
-                       return Replacement{"FusedMatMul", kMSDomain, {x, y}, {{"transB", IntAttribute("transB", 1)}}};
+                     [](const Graph&, const Match& m) {
+                       return Replacement{"FusedMatMul", kMSDomain, {m.valueOf("x"), m.valueOf("y")}, {{"transB", IntAttribute("transB", 1)}}};
                      }});
   }
   {
     Pattern p("(x, y, divisor) => mm = com.microsoft::FusedMatMul(x, y); return Div(mm, divisor)");
-    auto x = p.NamedValue("x"), y = p.NamedValue("y"), divisor = p.NamedValue("divisor");
     rules.push_back({"FusedMatMulDiv",
                      p,
                      {{kOnnxDomain, 9, 21}, {kMSDomain, 1, 1}},
-                     [=](const Graph& graph, const Match& m) {
-                       auto scalar = Scalar(graph, *m.values[divisor]);
+                     [](const Graph& graph, const Match& m) {
+                       auto scalar = Scalar(graph, *m.valueOf("divisor"));
                        auto it = m.nodes[0]->GetAttributes().find("alpha");
                        float alpha = it == m.nodes[0]->GetAttributes().end() ? 1.0f : it->second.f();
                        return Float32(m) && scalar && *scalar != 0.0f && std::isfinite(alpha / *scalar);
                      },
-                     [=](const Graph& graph, const Match& m) {
+                     [](const Graph& graph, const Match& m) {
                        auto attributes = m.nodes[0]->GetAttributes();
                        auto it = attributes.find("alpha");
                        float alpha = it == attributes.end() ? 1.0f : it->second.f();
-                       attributes["alpha"] = FloatAttribute("alpha", alpha / *Scalar(graph, *m.values[divisor]));
-                       return Replacement{"FusedMatMul", kMSDomain, {x, y}, std::move(attributes)};
+                       attributes["alpha"] = FloatAttribute("alpha", alpha / *Scalar(graph, *m.valueOf("divisor")));
+                       return Replacement{"FusedMatMul", kMSDomain, {m.valueOf("x"), m.valueOf("y")}, std::move(attributes)};
                      }});
   }
   {
@@ -166,17 +164,15 @@ Rules MakeExampleRules() {
         normalize = Mul(x, reciprocal)
         return Mul(normalize, scale)
     )");
-    auto x = p.NamedValue("x"), scale = p.NamedValue("scale"), exponent = p.NamedValue("exponent"),
-         epsilon = p.NamedValue("epsilon");
     rules.push_back(
         {"RmsNormalization",
          p,
          {{kOnnxDomain, 7, 17}},
-         [=](const Graph& graph, const Match& m) {
-           if (!Float32(m) || Scalar(graph, *m.values[exponent]) != 2.0f) return false;
-           auto eps = Scalar(graph, *m.values[epsilon]);
-           const auto* shape = m.values[x]->Shape();
-           const auto* scale_shape = m.values[scale]->Shape();
+         [](const Graph& graph, const Match& m) {
+           if (!Float32(m) || Scalar(graph, *m.valueOf("exponent")) != 2.0f) return false;
+           auto eps = Scalar(graph, *m.valueOf("epsilon"));
+           const auto* shape = m.valueOf("x")->Shape();
+           const auto* scale_shape = m.valueOf("scale")->Shape();
            if (!eps || *eps <= 0 || !shape || shape->dim_size() < 1 || !scale_shape || scale_shape->dim_size() != 1)
              return false;
            const auto& dim = shape->dim(shape->dim_size() - 1);
@@ -190,12 +186,12 @@ Rules MakeExampleRules() {
                   axes->second.type() == ONNX_NAMESPACE::AttributeProto_AttributeType_INTS &&
                   axes->second.ints_size() == 1 && axes->second.ints(0) == -1;
          },
-         [=](const Graph& graph, const Match& m) {
+         [](const Graph& graph, const Match& m) {
            NodeAttributes attributes;
            attributes.emplace("axis", IntAttribute("axis", -1));
-           attributes.emplace("epsilon", FloatAttribute("epsilon", *Scalar(graph, *m.values[epsilon])));
+           attributes.emplace("epsilon", FloatAttribute("epsilon", *Scalar(graph, *m.valueOf("epsilon"))));
            attributes.emplace("stash_type", IntAttribute("stash_type", ONNX_NAMESPACE::TensorProto_DataType_FLOAT));
-           return Replacement{"SimplifiedLayerNormalization", kOnnxDomain, {x, scale}, std::move(attributes)};
+           return Replacement{"SimplifiedLayerNormalization", kOnnxDomain, {m.valueOf("x"), m.valueOf("scale")}, std::move(attributes)};
          }});
   }
 #endif

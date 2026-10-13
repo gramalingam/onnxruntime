@@ -55,8 +55,8 @@ Rule rule{
     "HardSigmoidMul", p,
     {{kOnnxDomain, 14, 21}},  // inclusive imported opset range
     guard,  // checks float32; attributes are checked by the pattern
-    [x](const Graph&, const Match&) {
-      return Replacement{"HardSwish", kOnnxDomain, {x}, {}};
+    [](const Graph&, const Match& m) {
+      return Replacement{"HardSwish", kOnnxDomain, {m.valueOf("x")}, {}};
     }};
 auto transformer = std::make_unique<PatternRewriter>(Rules{rule});
 ORT_RETURN_IF_ERROR(session.RegisterGraphTransformer(std::move(transformer),
@@ -76,6 +76,21 @@ subsequent operators also use that canonical name. Previously returned `Value`
 copies are not renamed in place. `Value` converts to `int` for indexing
 `Match::values`; an unnamed value has an empty name, and a default value has
 invalid handle -1.
+
+In guards and replacement recipes, `m.valueOf("x")` directly returns the matched
+`const NodeArg*`; there is no need to capture `p.NamedValue("x")` and index
+`m.values` separately. Lookup also supports named intermediate outputs.
+Unknown/empty names or unbound values throw an explicit error rather than
+returning null. Names come from the current rule, even when its structural plan
+is shared with a differently named pattern. Lookup scans the bounded pattern
+value table and does not allocate a name map for each candidate.
+
+`Replacement::inputs` accepts either `Value` handles or matched `const NodeArg*`
+bindings, so recipes can use `{m.valueOf("x"), m.valueOf("y")}` directly.
+Pointer inputs are validated against the match's external input bindings:
+intermediates, root outputs, nulls and unrelated graph values are rejected before
+mutation. Matches reference immutable compiled patterns; do not retain them or
+their pointers beyond a callback.
 
 ### Attribute matchers and literal constants
 
@@ -122,7 +137,6 @@ Pattern p(R"(
     mul = Mul(clip, x)
     return Div(mul, divisor)
 )");
-auto x = p.NamedValue("x");
 ```
 
 The header declares named inputs. Assignment names label operator outputs.
@@ -151,7 +165,7 @@ tokens; semicolons may separate assignments. Values are ASCII identifiers.
 Definitions must precede use; every input and node must reach the final operator.
 There must be a final `return Op(...)`, with no subsequent statements.
 All six example rules use the string constructor and retrieve bindings with
-`NamedValue` for their guards and replacement recipes. Tests use it for parsed
+`Match::valueOf` for their guards and replacement recipes. Tests use the constructor for parsed
 patterns and test-only Identity, Split/Concat and LayerNorm-bias rules; builder
 tests and multi-output-root definitions retain the programmatic API.
 

@@ -134,7 +134,19 @@ Status Replace(Graph& graph, const Pattern& pattern, const Match& match, const R
   auto imported = graph.DomainToVersionMap().find(domain);
   ORT_RETURN_IF(imported == graph.DomainToVersionMap().end(), "Replacement domain is not imported: ", domain);
   InlinedVector<NodeArg*> inputs;
-  for (Value value : recipe.inputs) {
+  for (const auto& input : recipe.inputs) {
+    Value value;
+    if (const auto* handle = std::get_if<Value>(&input)) {
+      value = *handle;
+    } else {
+      const auto* argument = std::get<const NodeArg*>(input);
+      for (int id = 0; id < static_cast<int>(match.values.size()); ++id) {
+        if (argument && match.values[id] == argument && pattern.IsInput(id)) {
+          value = id;
+          break;
+        }
+      }
+    }
     ORT_RETURN_IF(
         value.handle < 0 || static_cast<size_t>(value.handle) >= match.values.size() || !pattern.IsInput(value),
         "Replacement inputs must be pattern input variables.");
@@ -551,6 +563,16 @@ class PatternParser {
 
 Pattern::Pattern(std::string_view text) { ORT_THROW_IF_ERROR(PatternParser(text).Parse(*this)); }
 
+const NodeArg* Match::valueOf(std::string_view name) const {
+  ORT_ENFORCE(pattern, "Named lookup requires a matched pattern.");
+  auto value = std::find_if(pattern->values_.begin(), pattern->values_.end(),
+                            [&](const Value& candidate) { return candidate.name == name; });
+  ORT_ENFORCE(!name.empty() && value != pattern->values_.end(), "Unknown pattern value: ", name);
+  ORT_ENFORCE(value->handle >= 0 && static_cast<size_t>(value->handle) < values.size() && values[value->handle],
+              "Pattern value is not bound: ", name);
+  return values[value->handle];
+}
+
 PatternRewriter::PatternRewriter(Rules rules, Options options)
     : GraphTransformer("PatternRewriter"), rules_(std::move(rules)), options_(options) {
   InlinedHashMap<std::string, size_t> signatures;
@@ -649,6 +671,7 @@ Status PatternRewriter::Run(Graph& graph, Statistics& statistics) const {
       if (!MatchPattern(pattern, graph, *root, producers, match) || !CanRewritePartition(match, options_)) return;
       for (size_t id : rule_ids) {
         if (!options_.match_only && id >= winner) break;
+        match.pattern = &rules_[id].pattern;
         ++statistics.guards;
         if (!rules_[id].guard(graph, match)) continue;
         if (options_.match_only) ++statistics.matches;

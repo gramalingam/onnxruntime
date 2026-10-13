@@ -76,12 +76,11 @@ size_t Count(const Graph& graph, const std::string& op) {
 
 Rule IdentityPair(const char* name = "identity", bool accept = true) {
   Pattern p("(x) => a = Identity(x); return Identity(a)");
-  auto x = p.NamedValue("x");
   return {name,
           p,
           {{kOnnxDomain, 1, 21}},
           [accept](const Graph&, const Match&) { return accept; },
-          [x](const Graph&, const Match&) { return Replacement{"Identity", kOnnxDomain, {x}, {}}; }};
+          [](const Graph&, const Match& m) { return Replacement{"Identity", kOnnxDomain, {m.valueOf("x")}, {}}; }};
 }
 
 Rule IdentitySplit() {
@@ -100,7 +99,6 @@ Rule IdentitySplit() {
 
 Rule SplitConcat() {
   Pattern p("(x) => a, b = Split(x); return Concat(a, b)");
-  auto x = p.NamedValue("x");
   return {"SplitConcat",
           p,
           {{kOnnxDomain, 13, 17}},
@@ -110,20 +108,19 @@ Rule SplitConcat() {
             return (axis == split_attributes.end() || axis->second.i() == 0) &&
                    match.nodes[1]->GetAttributes().at("axis").i() == 0;
           },
-          [x](const Graph&, const Match&) { return Replacement{"Identity", kOnnxDomain, {x}, {}}; }};
+          [](const Graph&, const Match& m) { return Replacement{"Identity", kOnnxDomain, {m.valueOf("x")}, {}}; }};
 }
 
 // Multi-output adaptation of ONNXScript's LayerNormBiasFusion; unused statistics may be removed.
 Rule LayerNormBias() {
   Pattern p("(x, scale, bias) => y, mean, inv_std = LayerNormalization(x, scale); return Add(y, bias)");
-  auto x = p.NamedValue("x"), scale = p.NamedValue("scale"), bias = p.NamedValue("bias");
   return {"LayerNormBias",
           p,
           {{kOnnxDomain, 17, 17}},
-          [=](const Graph&, const Match& match) {
-            const auto* shape = match.values[x]->Shape();
-            const auto* scale_shape = match.values[scale]->Shape();
-            const auto* bias_shape = match.values[bias]->Shape();
+          [](const Graph&, const Match& match) {
+            const auto* shape = match.valueOf("x")->Shape();
+            const auto* scale_shape = match.valueOf("scale")->Shape();
+            const auto* bias_shape = match.valueOf("bias")->Shape();
             if (!shape || shape->dim_size() < 1 || !scale_shape || !bias_shape || scale_shape->dim_size() != 1 ||
                 bias_shape->dim_size() != 1)
               return false;
@@ -136,8 +133,8 @@ Rule LayerNormBias() {
                    width.dim_value() == bias_width.dim_value() &&
                    (axis == match.nodes[0]->GetAttributes().end() || axis->second.i() == -1);
           },
-          [=](const Graph&, const Match& match) {
-            return Replacement{"LayerNormalization", "", {x, scale, bias}, match.nodes[0]->GetAttributes()};
+          [](const Graph&, const Match& match) {
+            return Replacement{"LayerNormalization", "", {match.valueOf("x"), match.valueOf("scale"), match.valueOf("bias")}, match.nodes[0]->GetAttributes()};
           }};
 }
 
@@ -341,6 +338,55 @@ TEST(PatternRewriterTests, NamedValuesAndAttributePredicates) {
   }
 }
 
+TEST(PatternRewriterTests, NamedMatchLookupAndReplacementSafety) {
+  Match empty;
+  EXPECT_THROW(empty.valueOf("x"), OnnxRuntimeException);
+  Pattern incomplete("(x) => return Identity(x)");
+  empty.pattern = &incomplete;
+  EXPECT_THROW(empty.valueOf("x"), OnnxRuntimeException);
+  for (bool indexed : {false, true}) {
+    for (int scenario = 0; scenario < 4; ++scenario) {
+      TestGraph test;
+      auto* x = test.builder.MakeInput<float>({2}, -1.0f, 1.0f);
+      auto* intermediate = test.builder.MakeIntermediate();
+      auto* output = test.builder.MakeOutput();
+      test.builder.AddNode("Identity", {x}, {intermediate});
+      test.builder.AddNode("Identity", {intermediate}, {output});
+      test.builder.SetGraphOutputs();
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      auto first = IdentityPair(), second = IdentityPair();
+      second.pattern = Pattern("(input) => middle = Identity(input); return Identity(middle)");
+      first.guard = [=](const Graph&, const Match& m) {
+        EXPECT_EQ(m.valueOf("x"), x);
+        EXPECT_EQ(m.valueOf("a"), intermediate);
+        EXPECT_THROW(m.valueOf("input"), OnnxRuntimeException);
+        EXPECT_THROW(m.valueOf(""), OnnxRuntimeException);
+        return false;
+      };
+      second.guard = [=](const Graph&, const Match& m) {
+        EXPECT_EQ(m.valueOf("input"), x);
+        EXPECT_EQ(m.valueOf("middle"), intermediate);
+        EXPECT_THROW(m.valueOf("x"), OnnxRuntimeException);
+        return true;
+      };
+      second.replacement = [scenario, output](const Graph&, const Match& m) {
+        const NodeArg* input = scenario == 0   ? m.valueOf("input")
+                               : scenario == 1 ? m.valueOf("middle")
+                               : scenario == 2 ? output
+                                               : nullptr;
+        return Replacement{"Identity", "", {input}, {}};
+      };
+      PatternRewriter rewriter({first, second}, {.indexed = indexed});
+      Statistics stats;
+      auto status = rewriter.Run(test.graph, stats);
+      EXPECT_EQ(status.IsOK(), scenario == 0);
+      EXPECT_EQ(stats.rewrites, scenario == 0 ? 1u : 0u);
+      EXPECT_EQ(test.graph.NumberOfNodes(), scenario == 0 ? 1u : 2u);
+      ASSERT_STATUS_OK(test.graph.Resolve());
+    }
+  }
+}
+
 TEST(PatternRewriterTests, ParsedHardSwishConstantsAndExecution) {
   constexpr auto text = R"(
     (x, low, high, divisor) =>
@@ -355,14 +401,7 @@ TEST(PatternRewriterTests, ParsedHardSwishConstantsAndExecution) {
   EXPECT_EQ(parsed.NamedValue("divisor").handle, 3);
   EXPECT_EQ(parsed.Nodes()[0].outputs[0].name, "add");
   EXPECT_EQ(parsed.Constants().size(), 1u);
-  auto semantic_guard = [guard = MakeExampleRules()[0].guard](const Graph& graph, const Match& match) {
-    auto remapped = match;
-    remapped.values[1] = match.values[4];  // Original rule orders leaves as x, bias, low, high, divisor.
-    remapped.values[2] = match.values[1];
-    remapped.values[3] = match.values[2];
-    remapped.values[4] = match.values[3];
-    return guard(graph, remapped);
-  };
+  parsed.Name(parsed.Nodes()[0].inputs[1], "bias");
   for (bool indexed : {false, true}) {
     for (int scenario = 0; scenario < 4; ++scenario) {
       TestGraph test;
@@ -399,9 +438,6 @@ TEST(PatternRewriterTests, ParsedHardSwishConstantsAndExecution) {
       }
       auto rule = MakeExampleRules()[0];
       rule.pattern = parsed;
-      rule.guard = semantic_guard;
-      auto x = parsed.NamedValue("x");
-      rule.replacement = [x](const Graph&, const Match&) { return Replacement{"HardSwish", "", {x}, {}}; };
       Statistics stats;
       ASSERT_STATUS_OK(PatternRewriter({rule}, {.indexed = indexed}).Run(test.graph, stats));
       EXPECT_EQ(stats.rewrites, scenario == 0 ? 1u : 0u);
@@ -410,9 +446,6 @@ TEST(PatternRewriterTests, ParsedHardSwishConstantsAndExecution) {
   }
   auto rule = MakeExampleRules()[0];
   rule.pattern = parsed;
-  rule.guard = semantic_guard;
-  auto x = parsed.NamedValue("x");
-  rule.replacement = [x](const Graph&, const Match&) { return Replacement{"HardSwish", "", {x}, {}}; };
   TransformerTester([](ModelTestBuilder& b) { BuildHardSwish(b); },
                     [](InferenceSessionWrapper& session) {
                       EXPECT_EQ(Count(session.GetGraph(), "HardSigmoid"), 1u);
@@ -427,9 +460,6 @@ TEST(PatternRewriterTests, ParsedAttributesMultiOutputsAndDomains) {
     Pattern split("(x) => a, b = Split(x, axis = 0); return Concat(a, b, axis = 0)");
     auto rule = SplitConcat();
     rule.pattern = split;
-    rule.replacement = [x = split.NamedValue("x")](const Graph&, const Match&) {
-      return Replacement{"Identity", "", {x}, {}};
-    };
     TestGraph test;
     auto* x = test.builder.MakeInput<float>({4}, -1.0f, 1.0f);
     auto* a = test.builder.MakeIntermediate();

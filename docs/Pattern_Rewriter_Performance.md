@@ -21,6 +21,9 @@ preparation includes building/compiling those rules, **not text parsing latency*
 The subsequent string-constructor migration converts all six example rules to
 text definitions. Those historical preparation timings therefore do not include
 the current parser cost; graph matching and mutation semantics are unchanged.
+The later `Match::valueOf` migration also introduces bounded name lookup in
+callbacks and binding validation for pointer-based replacement inputs. The
+recorded timings predate those changes and are not measurements of that API.
 The parser is exercised by correctness tests, including an executed HardSwish fusion.
 No decoder operator distribution or benchmark workload definition changed.
 
