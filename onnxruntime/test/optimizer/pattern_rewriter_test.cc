@@ -75,10 +75,8 @@ size_t Count(const Graph& graph, const std::string& op) {
 }
 
 Rule IdentityPair(const char* name = "identity", bool accept = true) {
-  Pattern p;
-  auto x = p.Input();
-  auto a = p.Op({"Identity", kOnnxDomain}, {x});
-  p.Op({"Identity", kOnnxDomain}, {a});
+  Pattern p("(x) => a = Identity(x); return Identity(a)");
+  auto x = p.NamedValue("x");
   return {name,
           p,
           {{kOnnxDomain, 1, 21}},
@@ -101,10 +99,8 @@ Rule IdentitySplit() {
 }
 
 Rule SplitConcat() {
-  Pattern p;
-  auto x = p.Input();
-  auto pieces = p.MultiOp("Split", {x}, 2);
-  p.Op("Concat", {pieces[0], pieces[1]});
+  Pattern p("(x) => a, b = Split(x); return Concat(a, b)");
+  auto x = p.NamedValue("x");
   return {"SplitConcat",
           p,
           {{kOnnxDomain, 13, 17}},
@@ -119,10 +115,8 @@ Rule SplitConcat() {
 
 // Multi-output adaptation of ONNXScript's LayerNormBiasFusion; unused statistics may be removed.
 Rule LayerNormBias() {
-  Pattern p;
-  auto x = p.Input(), scale = p.Input(), bias = p.Input();
-  auto outputs = p.MultiOp("LayerNormalization", {x, scale}, 3);
-  p.Op("Add", {outputs[0], bias});
+  Pattern p("(x, scale, bias) => y, mean, inv_std = LayerNormalization(x, scale); return Add(y, bias)");
+  auto x = p.NamedValue("x"), scale = p.NamedValue("scale"), bias = p.NamedValue("bias");
   return {"LayerNormBias",
           p,
           {{kOnnxDomain, 17, 17}},
@@ -355,8 +349,7 @@ TEST(PatternRewriterTests, ParsedHardSwishConstantsAndExecution) {
       mul = Mul(clip, x)
       return Div(mul, divisor)
   )";
-  Pattern parsed;
-  ASSERT_STATUS_OK(Pattern::Parse(text, parsed));
+  Pattern parsed(text);
   EXPECT_EQ(parsed.NamedValue("x").name, "x");
   EXPECT_EQ(parsed.NamedValue("low").handle, 1);
   EXPECT_EQ(parsed.NamedValue("divisor").handle, 3);
@@ -431,8 +424,7 @@ TEST(PatternRewriterTests, ParsedHardSwishConstantsAndExecution) {
 
 TEST(PatternRewriterTests, ParsedAttributesMultiOutputsAndDomains) {
   for (bool indexed : {false, true}) {
-    Pattern split;
-    ASSERT_STATUS_OK(Pattern::Parse("(x) => a, b = Split(x, axis = 0); return Concat(a, b, axis = 0)", split));
+    Pattern split("(x) => a, b = Split(x, axis = 0); return Concat(a, b, axis = 0)");
     auto rule = SplitConcat();
     rule.pattern = split;
     rule.replacement = [x = split.NamedValue("x")](const Graph&, const Match&) {
@@ -451,19 +443,15 @@ TEST(PatternRewriterTests, ParsedAttributesMultiOutputsAndDomains) {
     EXPECT_EQ(stats.rewrites, 1u);
     ASSERT_STATUS_OK(test.graph.Resolve());
   }
-  Pattern p;
-  ASSERT_STATUS_OK(
-      Pattern::Parse("(x, y) => a = com.microsoft::FusedMatMul(x, y, alpha=+1.0e-1); return Identity(a)", p));
+  Pattern p("(x, y) => a = com.microsoft::FusedMatMul(x, y, alpha=+1.0e-1); return Identity(a)");
   EXPECT_EQ(p.Nodes()[0].op.domain, kMSDomain);
   EXPECT_EQ(p.Nodes()[0].attributes.size(), 1u);
-  ASSERT_STATUS_OK(Pattern::Parse("(x) => a = Identity(x, mode='linear'); return Identity(a)", p));
+  p = Pattern("(x) => a = Identity(x, mode='linear'); return Identity(a)");
   ONNX_NAMESPACE::AttributeProto attr;
   attr.set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_STRING);
   attr.set_s("linear");
   EXPECT_TRUE(p.Nodes()[0].attributes[0].Matches(attr));
-  Pattern original;
-  auto x = original.Input("x");
-  original.Op("Identity", {x});
+  Pattern original("(x) => return Identity(x)");
   for (auto text :
        {"(x,x)=>return Identity(x)", "(x)=>return Identity(y)", "(x)=>a=Identity(x)",
         "(x)=>a=Identity(x);return Identity(a);extra", "(x)=>a=Identity(x);return Add(a, 1e999)",
@@ -473,20 +461,23 @@ TEST(PatternRewriterTests, ParsedAttributesMultiOutputsAndDomains) {
         "(x)=>a=Identity(x);return Identity(a, axis=[1])", "(x,y)=>return Identity(x)",
         "(x)=>a=Identity(x);return Identity(x)", "(x)=>x=Identity(x);return Identity(x)",
         "(x)=>a=Identity(x);return Identity(a) ''", "(x)=>'return' Identity(x)", "(x)=>return Identity(x ')'"}) {
-    auto status = Pattern::Parse(text, original);
-    EXPECT_FALSE(status.IsOK()) << text;
-    EXPECT_NE(status.ErrorMessage().find("byte"), std::string::npos);
+    try {
+      original = Pattern(text);
+      FAIL() << "Expected malformed pattern to throw: " << text;
+    } catch (const OnnxRuntimeException& error) {
+      EXPECT_NE(std::string(error.what()).find("byte"), std::string::npos);
+    }
     EXPECT_EQ(original.Nodes().size(), 1u);
     EXPECT_EQ(original.NamedValue("x").handle, 0);
   }
-  ASSERT_STATUS_OK(Pattern::Parse("(x)=>a=Identity(x, mode='');return Identity(a)", p));
+  p = Pattern("(x)=>a=Identity(x, mode='');return Identity(a)");
   attr.set_s("");
   EXPECT_TRUE(p.Nodes()[0].attributes[0].Matches(attr));
   std::string excessive = "(x)=>";
   for (int i = 0; i < 65; ++i)
     excessive += "v" + std::to_string(i) + "=Identity(" + (i == 0 ? "x" : "v" + std::to_string(i - 1)) + ");";
   excessive += "return Identity(v64)";
-  EXPECT_FALSE(Pattern::Parse(excessive, original).IsOK());
+  EXPECT_THROW(original = Pattern(excessive), OnnxRuntimeException);
 }
 
 TEST(PatternRewriterTests, LiteralTypeAndRankMatching) {
@@ -502,11 +493,11 @@ TEST(PatternRewriterTests, LiteralTypeAndRankMatching) {
       test.builder.SetGraphOutputs();
       ASSERT_STATUS_OK(test.graph.Resolve());
       auto rule = IdentityPair();
-      ASSERT_STATUS_OK(Pattern::Parse("(x)=>a=Add(x,3);return Identity(a)", rule.pattern));
+      rule.pattern = Pattern("(x)=>a=Add(x,3);return Identity(a)");
       Statistics stats;
       ASSERT_STATUS_OK(PatternRewriter({rule}, {.match_only = true, .indexed = indexed}).Run(test.graph, stats));
       EXPECT_EQ(stats.matches, scenario == 0 ? 1u : 0u);
-      ASSERT_STATUS_OK(Pattern::Parse("(x)=>a=Add(x,3.0);return Identity(a)", rule.pattern));
+      rule.pattern = Pattern("(x)=>a=Add(x,3.0);return Identity(a)");
       ASSERT_STATUS_OK(PatternRewriter({rule}, {.match_only = true, .indexed = indexed}).Run(test.graph, stats));
       EXPECT_EQ(stats.matches, 0u);
     }
@@ -528,15 +519,14 @@ TEST(PatternRewriterTests, AttributeAndConstantPlansCannotAlias) {
     test.builder.SetGraphOutputs();
     ASSERT_STATUS_OK(test.graph.Resolve());
     auto rejected = IdentityPair(), accepted = IdentityPair();
-    ASSERT_STATUS_OK(Pattern::Parse("(x)=>a=HardSigmoid(x, alpha=0.2);return Mul(a,x)", rejected.pattern));
-    ASSERT_STATUS_OK(Pattern::Parse("(x)=>a=HardSigmoid(x, alpha=0.25);return Mul(a,x)", accepted.pattern));
+    rejected.pattern = Pattern("(x)=>a=HardSigmoid(x, alpha=0.2);return Mul(a,x)");
+    accepted.pattern = Pattern("(x)=>a=HardSigmoid(x, alpha=0.25);return Mul(a,x)");
     Statistics stats;
     ASSERT_STATUS_OK(
         PatternRewriter({rejected, accepted}, {.match_only = true, .indexed = indexed}).Run(test.graph, stats));
     EXPECT_EQ(stats.matches, 1u);
-    Pattern first, second;
-    ASSERT_STATUS_OK(Pattern::Parse("(x)=>a=Add(x,3.0);return Identity(a)", first));
-    ASSERT_STATUS_OK(Pattern::Parse("(x)=>a=Add(x,4.0);return Identity(a)", second));
+    Pattern first("(x)=>a=Add(x,3.0);return Identity(a)");
+    Pattern second("(x)=>a=Add(x,4.0);return Identity(a)");
     TestGraph constants;
     auto* input = constants.builder.MakeInput<float>({2}, -1.0f, 1.0f);
     auto* intermediate = constants.builder.MakeIntermediate();

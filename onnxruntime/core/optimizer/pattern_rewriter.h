@@ -53,6 +53,8 @@ struct OpsetRequirement {
 // Reusing a Value requires exactly the same NodeArg, including for input variables.
 class Pattern {
  public:
+  Pattern() = default;
+  explicit Pattern(std::string_view text);
   Value Input(std::string_view name = "");
   Value Constant(float value);
   Value Constant(int64_t value);
@@ -62,7 +64,6 @@ class Pattern {
   void Name(Value value, std::string_view name);
   void Attributes(std::initializer_list<AttributeMatcher> matchers);
   void Attributes(InlinedVector<AttributeMatcher, 1> matchers);
-  static Status Parse(std::string_view text, Pattern& destination);
   Value Op(Operator op, std::initializer_list<Value> inputs);
   template <typename Name, std::enable_if_t<std::is_convertible_v<Name, std::string_view>, int> = 0>
   Value Op(Name&& name, std::initializer_list<Value> inputs, std::string_view domain = "") {

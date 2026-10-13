@@ -549,7 +549,7 @@ class PatternParser {
 };
 }  // namespace
 
-Status Pattern::Parse(std::string_view text, Pattern& destination) { return PatternParser(text).Parse(destination); }
+Pattern::Pattern(std::string_view text) { ORT_THROW_IF_ERROR(PatternParser(text).Parse(*this)); }
 
 PatternRewriter::PatternRewriter(Rules rules, Options options)
     : GraphTransformer("PatternRewriter"), rules_(std::move(rules)), options_(options) {

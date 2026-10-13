@@ -16,8 +16,11 @@ The same CPU Release build configuration, decoder generator, full 1080-row
 matrix, two warmups and nine repeats were rerun after adding named handles,
 scalar literal constraints, attribute predicates and the text parser.
 HardSigmoid/Mul now uses node attribute matchers instead of equivalent guard
-checks. The benchmark still constructs its patterns through the C++ builder;
+checks. At the measured revision, the benchmark constructs its patterns through the C++ builder;
 preparation includes building/compiling those rules, **not text parsing latency**.
+The subsequent string-constructor migration converts all six example rules to
+text definitions. Those historical preparation timings therefore do not include
+the current parser cost; graph matching and mutation semantics are unchanged.
 The parser is exercised by correctness tests, including an executed HardSwish fusion.
 No decoder operator distribution or benchmark workload definition changed.
 

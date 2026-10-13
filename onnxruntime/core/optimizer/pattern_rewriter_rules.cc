@@ -59,12 +59,15 @@ bool Integer(const Node& node, const char* name, int64_t value) {
 Rules MakeExampleRules() {
   Rules rules;
   {
-    Pattern p;
-    auto x = p.Input(), bias = p.Input(), low = p.Input(), high = p.Input(), divisor = p.Input();
-    auto add = p.Op("Add", {x, bias});
-    auto clip = p.Op("Clip", {add, low, high});
-    auto mul = p.Op("Mul", {clip, x});
-    p.Op("Div", {mul, divisor});
+    Pattern p(R"(
+      (x, bias, low, high, divisor) =>
+        add = Add(x, bias)
+        clip = Clip(add, low, high)
+        mul = Mul(clip, x)
+        return Div(mul, divisor)
+    )");
+    auto x = p.NamedValue("x"), bias = p.NamedValue("bias"), low = p.NamedValue("low"),
+         high = p.NamedValue("high"), divisor = p.NamedValue("divisor");
     rules.push_back({"HardSwish",
                      p,
                      {{kOnnxDomain, 14, 21}},
@@ -76,11 +79,12 @@ Rules MakeExampleRules() {
                      [=](const Graph&, const Match&) { return Replacement{"HardSwish", kOnnxDomain, {x}, {}}; }});
   }
   {
-    Pattern p;
-    auto x = p.Input();
-    auto sigmoid = p.Op("HardSigmoid", {x});
-    p.Attributes({AttributeMatcher::Equal("alpha", 1.0f / 6.0f), AttributeMatcher::Equal("beta", 0.5f)});
-    p.Op("Mul", {sigmoid, x});
+    Pattern p(R"(
+      (x) =>
+        sigmoid = HardSigmoid(x, alpha=0.16666667, beta=0.5)
+        return Mul(sigmoid, x)
+    )");
+    auto x = p.NamedValue("x");
     rules.push_back({"HardSigmoidMul",
                      p,
                      {{kOnnxDomain, 14, 21}},
@@ -89,10 +93,8 @@ Rules MakeExampleRules() {
   }
 #ifndef DISABLE_CONTRIB_OPS
   {
-    Pattern p;
-    auto x = p.Input(), y = p.Input(), divisor = p.Input();
-    auto mm = p.Op("MatMul", {x, y});
-    p.Op("Div", {mm, divisor});
+    Pattern p("(x, y, divisor) => mm = MatMul(x, y); return Div(mm, divisor)");
+    auto x = p.NamedValue("x"), y = p.NamedValue("y"), divisor = p.NamedValue("divisor");
     rules.push_back({"MatMulDiv",
                      p,
                      {{kOnnxDomain, 9, 21}, {kMSDomain, 1, 1}},
@@ -107,10 +109,8 @@ Rules MakeExampleRules() {
                      }});
   }
   {
-    Pattern p;
-    auto x = p.Input(), y = p.Input();
-    auto transpose = p.Op("Transpose", {y});
-    p.Op("MatMul", {x, transpose});
+    Pattern p("(x, y) => transpose = Transpose(y); return MatMul(x, transpose)");
+    auto x = p.NamedValue("x"), y = p.NamedValue("y");
     rules.push_back({"TransposeMatMul",
                      p,
                      {{kOnnxDomain, 9, 21}, {kMSDomain, 1, 1}},
@@ -136,10 +136,8 @@ Rules MakeExampleRules() {
                      }});
   }
   {
-    Pattern p;
-    auto x = p.Input(), y = p.Input(), divisor = p.Input();
-    auto mm = p.Op("FusedMatMul", {x, y}, kMSDomain);
-    p.Op("Div", {mm, divisor});
+    Pattern p("(x, y, divisor) => mm = com.microsoft::FusedMatMul(x, y); return Div(mm, divisor)");
+    auto x = p.NamedValue("x"), y = p.NamedValue("y"), divisor = p.NamedValue("divisor");
     rules.push_back({"FusedMatMulDiv",
                      p,
                      {{kOnnxDomain, 9, 21}, {kMSDomain, 1, 1}},
@@ -158,15 +156,18 @@ Rules MakeExampleRules() {
                      }});
   }
   {
-    Pattern p;
-    auto x = p.Input(), scale = p.Input(), exponent = p.Input(), epsilon = p.Input();
-    auto square = p.Op("Pow", {x, exponent});
-    auto mean = p.Op("ReduceMean", {square});
-    auto add = p.Op("Add", {mean, epsilon});
-    auto sqrt = p.Op("Sqrt", {add});
-    auto reciprocal = p.Op("Reciprocal", {sqrt});
-    auto normalize = p.Op("Mul", {x, reciprocal});
-    p.Op("Mul", {normalize, scale});
+    Pattern p(R"(
+      (x, scale, exponent, epsilon) =>
+        square = Pow(x, exponent)
+        mean = ReduceMean(square)
+        add = Add(mean, epsilon)
+        sqrt = Sqrt(add)
+        reciprocal = Reciprocal(sqrt)
+        normalize = Mul(x, reciprocal)
+        return Mul(normalize, scale)
+    )");
+    auto x = p.NamedValue("x"), scale = p.NamedValue("scale"), exponent = p.NamedValue("exponent"),
+         epsilon = p.NamedValue("epsilon");
     rules.push_back(
         {"RmsNormalization",
          p,

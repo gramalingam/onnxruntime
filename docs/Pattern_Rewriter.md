@@ -108,18 +108,20 @@ but matching never creates tensors.
 
 ### Textual patterns
 
-`Pattern::Parse(text, destination)` returns a `Status` and replaces `destination`
-only on success. The requested branched pattern can be written directly:
+The explicit `Pattern(std::string_view text)` constructor parses a textual pattern.
+The default constructor remains available for the programmatic builder.
+Malformed text throws `OnnxRuntimeException` with a byte-offset diagnostic
+(or aborts in exception-disabled builds, following ORT's throwing macros).
+The requested branched pattern can be written directly:
 
 ```cpp
-Pattern p;
-ORT_RETURN_IF_ERROR(Pattern::Parse(R"(
+Pattern p(R"(
   (x, low, high, divisor) =>
     add = Add(x, 3.0)
     clip = Clip(add, low, high)
     mul = Mul(clip, x)
     return Div(mul, divisor)
-)", p));
+)");
 auto x = p.NamedValue("x");
 ```
 
@@ -148,9 +150,15 @@ Unqualified operators use the standard ONNX domain. Whitespace/newlines separate
 tokens; semicolons may separate assignments. Values are ASCII identifiers.
 Definitions must precede use; every input and node must reach the final operator.
 There must be a final `return Op(...)`, with no subsequent statements.
+All six example rules use the string constructor and retrieve bindings with
+`NamedValue` for their guards and replacement recipes. Tests use it for parsed
+patterns and test-only Identity, Split/Concat and LayerNorm-bias rules; builder
+tests and multi-output-root definitions retain the programmatic API.
+
 The parser checks duplicate names/attributes, undefined references, numeric range,
 disconnected definitions and the same 64-node/256-value/64-input-output limits as
-the C++ builder. Errors include a byte offset and leave the destination unchanged.
+the C++ builder. Errors include a byte offset; `p = Pattern(text)` leaves `p`
+unchanged if construction fails.
 A one-node parsed pattern is valid, but cannot form a node-count-decreasing rule.
 
 The language intentionally excludes nested calls, lists/tensor literals, optional
