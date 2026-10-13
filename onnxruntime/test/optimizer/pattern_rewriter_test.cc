@@ -134,7 +134,10 @@ Rule LayerNormBias() {
                    (axis == match.nodes[0]->GetAttributes().end() || axis->second.i() == -1);
           },
           [](const Graph&, const Match& match) {
-            return Replacement{"LayerNormalization", "", {match.valueOf("x"), match.valueOf("scale"), match.valueOf("bias")}, match.nodes[0]->GetAttributes()};
+            return Replacement{"LayerNormalization",
+                               "",
+                               {match.valueOf("x"), match.valueOf("scale"), match.valueOf("bias")},
+                               match.nodes[0]->GetAttributes()};
           }};
 }
 
@@ -384,6 +387,308 @@ TEST(PatternRewriterTests, NamedMatchLookupAndReplacementSafety) {
       EXPECT_EQ(test.graph.NumberOfNodes(), scenario == 0 ? 1u : 2u);
       ASSERT_STATUS_OK(test.graph.Resolve());
     }
+  }
+}
+
+TEST(PatternRewriterTests, ParsedReplacementSequenceAndNumerics) {
+  Replacement replacement(R"(
+    (x) =>
+      h = HardSigmoid(x, alpha=0.16666667, beta=0.5)
+      return Mul(h, x)
+  )");
+  const auto* plan = replacement.Plan().get();
+  auto copy = replacement;
+  EXPECT_EQ(copy.Plan().get(), plan);
+  EXPECT_EQ(replacement.Plan()->size(), 2u);
+  EXPECT_FLOAT_EQ(replacement.Plan()->front().attributes.at("alpha").f(), 1.0f / 6.0f);
+  for (bool indexed : {false, true}) {
+    TestGraph test;
+    EXPECT_EQ(replacement(test.graph, {}).Plan().get(), plan);
+    BuildHardSwish(test.builder);
+    test.builder.SetGraphOutputs();
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    auto outputs = test.graph.GetOutputs();
+    auto rule = MakeExampleRules()[0];
+    rule.replacement = replacement;
+    PatternRewriter rewriter({rule}, {.indexed = indexed});
+    Statistics stats;
+    ASSERT_STATUS_OK(rewriter.Run(test.graph, stats));
+    EXPECT_EQ(stats.rewrites, 1u);
+    EXPECT_EQ(test.graph.NumberOfNodes(), 2u);
+    EXPECT_EQ(test.graph.GetOutputs(), outputs);
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    EXPECT_EQ(Count(test.graph, "HardSigmoid"), 1u);
+    EXPECT_EQ(Count(test.graph, "Mul"), 1u);
+    ASSERT_STATUS_OK(rewriter.Run(test.graph, stats));
+    EXPECT_EQ(stats.rewrites, 0u);
+  }
+  auto rule = MakeExampleRules()[0];
+  rule.replacement = replacement;
+  TransformerTester([](ModelTestBuilder& b) { BuildHardSwish(b); },
+                    [](InferenceSessionWrapper& session) {
+                      EXPECT_EQ(Count(session.GetGraph(), "HardSigmoid"), 1u);
+                      EXPECT_EQ(Count(session.GetGraph(), "Mul"), 1u);
+                      EXPECT_EQ(Count(session.GetGraph(), "Clip"), 0u);
+                    },
+                    TransformerLevel::Default, TransformerLevel::Level1, 17, 1e-6, 1e-5,
+                    std::make_unique<PatternRewriter>(Rules{rule}));
+}
+
+TEST(PatternRewriterTests, ReplacementBranchesAndMultiOutputRoot) {
+  auto branched = IdentityPair();
+  branched.pattern = Pattern(R"(
+    (x) => a = Identity(x); b = Identity(a); c = Identity(b); return Identity(c)
+  )");
+  branched.replacement = Replacement("(x) => a, b = Split(x, axis=0); return Concat(a, b, axis=0)");
+  auto build_branch = [](ModelTestBuilder& b) {
+    auto* x = b.MakeInput<float>({4}, -1.0f, 1.0f);
+    auto* upstream = b.MakeIntermediate();
+    b.AddNode("Add", {x, x}, {upstream});
+    auto* current = upstream;
+    for (int i = 0; i < 4; ++i) {
+      auto* next = i == 3 ? b.MakeOutput() : b.MakeIntermediate();
+      b.AddNode("Identity", {current}, {next});
+      current = next;
+    }
+    b.AddNode("Add", {current, current}, {b.MakeOutput()});
+  };
+  for (bool indexed : {false, true}) {
+    TestGraph test;
+    build_branch(test.builder);
+    test.builder.SetGraphOutputs();
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    for (auto& node : test.graph.Nodes()) node.SetExecutionProviderType(kCpuExecutionProvider);
+    Statistics stats;
+    ASSERT_STATUS_OK(PatternRewriter({branched}, {.indexed = indexed}).Run(test.graph, stats));
+    EXPECT_EQ(stats.rewrites, 1u);
+    EXPECT_EQ(test.graph.NumberOfNodes(), 4u);
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    for (const auto& node : test.graph.Nodes()) {
+      EXPECT_EQ(node.GetExecutionProviderType(), kCpuExecutionProvider);
+      if (node.OpType() == "Concat") EXPECT_EQ(node.GetOutputEdgesCount(), 2u);
+      if (node.OpType() == "Split") {
+        EXPECT_EQ(node.OutputDefs().size(), 2u);
+        EXPECT_EQ(node.GetOutputEdgesCount(), 2u);
+      }
+    }
+  }
+  TransformerTester(
+      build_branch,
+      [](InferenceSessionWrapper& session) {
+        EXPECT_EQ(Count(session.GetGraph(), "Split"), 1u);
+        EXPECT_EQ(Count(session.GetGraph(), "Concat"), 1u);
+        EXPECT_EQ(Count(session.GetGraph(), "Identity"), 0u);
+      },
+      TransformerLevel::Default, TransformerLevel::Level1, 17, 0, 0,
+      std::make_unique<PatternRewriter>(Rules{branched}));
+
+  auto split = IdentitySplit();
+  Pattern p;
+  auto x = p.Input("x");
+  auto a = p.Op("Identity", {x});
+  auto b = p.Op("Identity", {a});
+  p.MultiOp("Split", {b}, 2);
+  split.pattern = p;
+  split.replacement = Replacement("(x) => a=Identity(x); return Split(a, axis=0)");
+  auto build_split = [](ModelTestBuilder& b) {
+    auto* x = b.MakeInput<float>({4}, -1.0f, 1.0f);
+    auto* a = b.MakeIntermediate();
+    auto* intermediate = b.MakeIntermediate();
+    b.AddNode("Identity", {x}, {a});
+    b.AddNode("Identity", {a}, {intermediate});
+    b.AddNode("Split", {intermediate}, {b.MakeOutput(), b.MakeOutput()}).AddAttribute("axis", int64_t{0});
+  };
+  TransformerTester(
+      build_split,
+      [](InferenceSessionWrapper& session) {
+        EXPECT_EQ(Count(session.GetGraph(), "Identity"), 1u);
+        EXPECT_EQ(Count(session.GetGraph(), "Split"), 1u);
+      },
+      TransformerLevel::Default, TransformerLevel::Level1, 17, 0, 0, std::make_unique<PatternRewriter>(Rules{split}));
+}
+
+TEST(PatternRewriterTests, ReplacementParsingCompilationAndRollback) {
+  for (auto text : {"(x)=>Unknown(y)", "(x)=>a=Identity(x); Identity(x)", "(x)=>Add(x,1e999)",
+                    "(x)=>a=Identity(x);return Identity(a,axis=[0])", "(x)=>Identity(x);more",
+                    "(x)=>Identity(x,axis=0,axis=1)", "(x)=>Identity(x,mode='bad)"})
+    EXPECT_THROW(Replacement{text}, OnnxRuntimeException) << text;
+  auto invalid = IdentityPair();
+  invalid.replacement = Replacement("(missing)=>Identity(missing)");
+  EXPECT_THROW(PatternRewriter({invalid}), OnnxRuntimeException);
+  invalid.replacement = Replacement("(a)=>Identity(a)");
+  EXPECT_THROW(PatternRewriter({invalid}), OnnxRuntimeException);
+  invalid.replacement = Replacement("(x)=>a=Identity(x);return Identity(a)");
+  EXPECT_THROW(PatternRewriter({invalid}), OnnxRuntimeException);
+  invalid.replacement = Replacement("(x)=>com.microsoft::FusedMatMul(x,x)");
+  EXPECT_THROW(PatternRewriter({invalid}), OnnxRuntimeException);
+  EXPECT_NO_THROW(Replacement("(Identity)=>Identity(Identity)"));
+  for (bool indexed : {false, true}) {
+    for (int scenario = 0; scenario < 9; ++scenario) {
+      TestGraph test;
+      BuildHardSwish(test.builder);
+      test.builder.SetGraphOutputs();
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      auto initializer_count = test.graph.GetAllInitializedTensors().size();
+      auto rule = MakeExampleRules()[0];
+      InlinedVector<Replacement::NodeRecipe, 1> nodes{{"Identity", "", {std::string("x")}, {}, 1},
+                                                      {"HardSwish", "", {Replacement::Output{0}}, {}, 1}};
+      if (scenario == 0) nodes[1].op = "NoSuchReplacementOperator";
+      if (scenario == 1) nodes[1].inputs = {Replacement::Output{1}};
+      if (scenario == 2) nodes[1].inputs = {Replacement::Output{0, 1}};
+      if (scenario == 3) nodes[1].inputs = {std::string("x")};
+      if (scenario == 4) {
+        ONNX_NAMESPACE::AttributeProto attr;
+        attr.set_name("axis");
+        attr.set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_STRING);
+        attr.set_s("wrong");
+        nodes[1].op = "Softmax";
+        nodes[1].attributes.emplace("axis", attr);
+      }
+      if (scenario == 5) nodes[1].domain = kMSDomain;
+      if (scenario == 6) nodes[0].output_count = 0;
+      if (scenario == 7) {
+        nodes[0].op = "Add";
+        nodes[0].inputs.push_back(Replacement::Scalar{0.0f});
+        nodes[1].op = "NoSuchReplacementOperator";
+      }
+      rule.replacement = [recipe = Replacement(std::move(nodes))](const Graph&, const Match&) { return recipe; };
+      if (scenario == 8) {
+        rule.replacement = [](const Graph&, const Match&) {
+          Replacement recipe("(x)=>HardSwish(x)");
+          recipe.op = "Identity";
+          return recipe;
+        };
+      }
+      Statistics stats;
+      ASSERT_FALSE(PatternRewriter({rule}, {.indexed = indexed}).Run(test.graph, stats).IsOK());
+      EXPECT_EQ(stats.rewrites, 0u);
+      EXPECT_EQ(test.graph.NumberOfNodes(), 4u);
+      EXPECT_EQ(test.graph.GetAllInitializedTensors().size(), initializer_count);
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      rule.replacement = Replacement("(x)=>a=Identity(x);return HardSwish(a)");
+      ASSERT_STATUS_OK(PatternRewriter({rule}, {.indexed = indexed}).Run(test.graph, stats));
+      EXPECT_EQ(stats.rewrites, 1u);
+      ASSERT_STATUS_OK(test.graph.Resolve());
+    }
+  }
+}
+
+TEST(PatternRewriterTests, ReplacementScalarConstantsAndProgrammaticSequence) {
+  auto rule = IdentityPair();
+  rule.pattern = Pattern("(x)=>a=Identity(x);b=Identity(a);return Identity(b)");
+  for (bool integer : {false, true}) {
+    rule.replacement = Replacement(integer ? "(x)=>Add(x,0)" : "(x)=>Add(x,0.0)");
+    auto* compiled = rule.replacement.target<Replacement>();
+    ASSERT_NE(compiled, nullptr);
+    ASSERT_EQ(compiled->Plan()->size(), 1u);
+    const auto& scalar = std::get<Replacement::Scalar>(compiled->Plan()->front().inputs[1]);
+    EXPECT_EQ(std::holds_alternative<int64_t>(scalar.value), integer);
+    auto build = [integer](ModelTestBuilder& b) {
+      auto* x = integer ? b.MakeInput<int64_t>({4}, -5, 5) : b.MakeInput<float>({4}, -1.0f, 1.0f);
+      auto* current = x;
+      for (int i = 0; i < 3; ++i) {
+        auto* next = i == 2 ? b.MakeOutput() : b.MakeIntermediate();
+        b.AddNode("Identity", {current}, {next});
+        current = next;
+      }
+    };
+    TransformerTester(
+        build,
+        [](InferenceSessionWrapper& session) {
+          EXPECT_EQ(Count(session.GetGraph(), "Add"), 1u);
+          EXPECT_EQ(Count(session.GetGraph(), "Identity"), 0u);
+        },
+        TransformerLevel::Default, TransformerLevel::Level1, 17, 0, 0, std::make_unique<PatternRewriter>(Rules{rule}));
+  }
+  rule.replacement = Replacement(InlinedVector<Replacement::NodeRecipe, 1>{
+      {"Identity", "", {std::string("x")}, {}, 1}, {"Identity", "", {Replacement::Output{0}}, {}, 1}});
+  TestGraph test;
+  auto* x = test.builder.MakeInput<float>({2}, -1.0f, 1.0f);
+  auto* current = x;
+  for (int i = 0; i < 3; ++i) {
+    auto* next = i == 2 ? test.builder.MakeOutput() : test.builder.MakeIntermediate();
+    test.builder.AddNode("Identity", {current}, {next});
+    current = next;
+  }
+  test.builder.SetGraphOutputs();
+  ASSERT_STATUS_OK(test.graph.Resolve());
+  Statistics stats;
+  ASSERT_STATUS_OK(PatternRewriter({rule}).Run(test.graph, stats));
+  EXPECT_EQ(stats.rewrites, 1u);
+  EXPECT_EQ(test.graph.NumberOfNodes(), 2u);
+  ASSERT_STATUS_OK(test.graph.Resolve());
+}
+
+TEST(PatternRewriterTests, ReplacementPlanBindingAndSequenceInvalidation) {
+  Replacement shared("(x,y)=>Sub(x,y)");
+  for (auto text : {"(x,y)=>a=Identity(x);b=Identity(y);return Sub(a,b)",
+                    "(y,x)=>a=Identity(x);b=Identity(y);return Sub(a,b)"}) {
+    auto rule = IdentityPair();
+    rule.pattern = Pattern(text);
+    rule.replacement = shared;
+    TransformerTester(
+        [](ModelTestBuilder& b) {
+          auto* x = b.MakeInput<float>({2}, 1.0f, 2.0f);
+          auto* y = b.MakeInput<float>({2}, -2.0f, -1.0f);
+          auto* a = b.MakeIntermediate();
+          auto* intermediate = b.MakeIntermediate();
+          b.AddNode("Identity", {x}, {a});
+          b.AddNode("Identity", {y}, {intermediate});
+          b.AddNode("Sub", {a, intermediate}, {b.MakeOutput()});
+        },
+        [](InferenceSessionWrapper& session) {
+          EXPECT_EQ(Count(session.GetGraph(), "Identity"), 0u);
+          EXPECT_EQ(Count(session.GetGraph(), "Sub"), 1u);
+        },
+        TransformerLevel::Default, TransformerLevel::Level1, 17, 0, 0,
+        std::make_unique<PatternRewriter>(Rules{rule}));
+  }
+  for (bool indexed : {false, true}) {
+    auto first = IdentityPair("first", false);
+    first.pattern = Pattern("(first)=>a=Identity(first);b=Identity(a);c=Identity(b);return Identity(c)");
+    first.replacement = Replacement("(first)=>Identity(first)");
+    auto second = first;
+    second.pattern = Pattern("(second)=>a=Identity(second);b=Identity(a);c=Identity(b);return Identity(c)");
+    second.guard = [](const Graph&, const Match&) { return true; };
+    second.replacement = Replacement("(second)=>a=Identity(second);return Identity(a)");
+    auto followup = IdentityPair();
+    followup.guard = [](const Graph&, const Match& m) { return m.nodes.back()->Name().find("rewrite") == 0; };
+    PatternRewriter rewriter({first, second, followup}, {.indexed = indexed});
+    for (int repeat = 0; repeat < 2; ++repeat) {
+      TestGraph test;
+      auto* x = test.builder.MakeInput<float>({2}, -1.0f, 1.0f);
+      auto* current = x;
+      for (int i = 0; i < 4; ++i) {
+        auto* next = i == 3 ? test.builder.MakeOutput() : test.builder.MakeIntermediate();
+        test.builder.AddNode("Identity", {current}, {next});
+        current = next;
+      }
+      test.builder.SetGraphOutputs();
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      Statistics stats;
+      ASSERT_STATUS_OK(rewriter.Run(test.graph, stats));
+      EXPECT_EQ(stats.rewrites, 2u);
+      EXPECT_EQ(test.graph.NumberOfNodes(), 1u);
+      ASSERT_STATUS_OK(test.graph.Resolve());
+    }
+    auto invalid = second;
+    invalid.replacement = [](const Graph&, const Match&) {
+      return Replacement("(second)=>a=Identity(second);b=Identity(a);c=Identity(b);return Identity(c)");
+    };
+    TestGraph test;
+    auto* x = test.builder.MakeInput<float>({2}, -1.0f, 1.0f);
+    auto* current = x;
+    for (int i = 0; i < 4; ++i) {
+      auto* next = i == 3 ? test.builder.MakeOutput() : test.builder.MakeIntermediate();
+      test.builder.AddNode("Identity", {current}, {next});
+      current = next;
+    }
+    test.builder.SetGraphOutputs();
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    Statistics stats;
+    EXPECT_FALSE(PatternRewriter({invalid}, {.indexed = indexed}).Run(test.graph, stats).IsOK());
+    EXPECT_EQ(test.graph.NumberOfNodes(), 4u);
+    ASSERT_STATUS_OK(test.graph.Resolve());
   }
 }
 
@@ -1466,7 +1771,7 @@ TEST(PatternRewriterBenchmark, DISABLED_Decoder) {
               if (workload == 3) {
                 // Distinct, synthetic same-Mul-root structural nonmatches, with common suffixes.
                 Pattern pattern;
-                auto input = pattern.Input();
+                auto input = pattern.Input("x");
                 auto value = input;
                 for (size_t bit = 0; bit < 9; ++bit) {
                   value = pattern.Op({(i & (size_t{1} << bit)) ? "Tanh" : "Sigmoid", ""}, {value});
@@ -1500,6 +1805,64 @@ TEST(PatternRewriterBenchmark, DISABLED_Decoder) {
   csv.flush();
   ASSERT_TRUE(csv.good()) << "Failed to write benchmark results.";
 #endif
+}
+
+TEST(PatternRewriterBenchmark, DISABLED_ReplacementPlans) {
+  using Clock = std::chrono::steady_clock;
+  auto ms = [](auto begin, auto end) { return std::chrono::duration<double, std::milli>(end - begin).count(); };
+  auto logger = DefaultLoggingManager().CreateLogger("replacement_benchmark", logging::Severity::kERROR, false);
+  const auto destination = Env::Default().GetEnvironmentVar("ORT_REWRITER_REPLACEMENT_CSV");
+  std::ofstream csv;
+  if (!destination.empty()) {
+    csv.open(destination);
+    ASSERT_TRUE(csv.is_open()) << "Failed to open replacement benchmark CSV.";
+    csv << "replacement_mode,repeat,prepare_ms,engine_ms,resolve_ms,rewrites,output_nodes\n";
+  }
+  TestGraph source;
+  for (int i = 0; i < 1000; ++i) BuildHardSwish(source.builder);
+  source.builder.SetGraphOutputs();
+  ASSERT_STATUS_OK(source.graph.Resolve());
+  const auto proto = source.model.ToProto();
+  std::cout << "replacement_mode,repeat,prepare_ms,engine_ms,resolve_ms,rewrites,output_nodes\n";
+  for (int mode = 0; mode < 3; ++mode) {
+    for (int repeat = -2; repeat < 9; ++repeat) {
+      Model model(proto, nullptr, *logger);
+      auto& graph = model.MainGraph();
+      ASSERT_STATUS_OK(graph.Resolve());
+      auto begin_prepare = Clock::now();
+      auto rule = MakeExampleRules()[0];
+      if (mode == 0) {
+        rule.replacement = [](const Graph&, const Match& m) {
+          return Replacement{"HardSwish", "", {m.valueOf("x")}, {}};
+        };
+      } else if (mode == 1) {
+        rule.replacement = Replacement("(x)=>HardSwish(x)");
+      } else {
+        rule.replacement = Replacement("(x)=>h=HardSigmoid(x,alpha=0.16666667,beta=0.5);return Mul(h,x)");
+      }
+      PatternRewriter rewriter({rule});
+      auto end_prepare = Clock::now();
+      Statistics stats;
+      auto begin_engine = Clock::now();
+      ASSERT_STATUS_OK(rewriter.Run(graph, stats));
+      auto end_engine = Clock::now();
+      ASSERT_EQ(stats.rewrites, 1000u);
+      ASSERT_EQ(graph.NumberOfNodes(), mode == 2 ? 2000u : 1000u);
+      auto begin_resolve = Clock::now();
+      ASSERT_STATUS_OK(graph.Resolve());
+      auto end_resolve = Clock::now();
+      if (repeat < 0) continue;
+      std::ostringstream row;
+      row << mode << ',' << repeat << ',' << ms(begin_prepare, end_prepare) << ',' << ms(begin_engine, end_engine)
+          << ',' << ms(begin_resolve, end_resolve) << ',' << stats.rewrites << ',' << graph.NumberOfNodes() << '\n';
+      std::cout << "replacement_row," << row.str();
+      if (csv.is_open()) csv << row.str();
+    }
+  }
+  if (csv.is_open()) {
+    csv.flush();
+    ASSERT_TRUE(csv.good()) << "Failed to write replacement benchmark results.";
+  }
 }
 
 }  // namespace test

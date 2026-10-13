@@ -4,6 +4,7 @@
 
 #include <functional>
 #include <initializer_list>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -105,10 +106,40 @@ struct Match {
 };
 
 struct Replacement {
+  struct Output {
+    size_t node;
+    size_t slot = 0;
+  };
+  struct Scalar {
+    std::variant<float, int64_t> value;
+  };
+  using Input = std::variant<Value, const NodeArg*, Output, std::string, Scalar>;
+  struct NodeRecipe {
+    std::string op;
+    std::string domain;
+    InlinedVector<Input> inputs;
+    NodeAttributes attributes;
+    size_t output_count = 1;
+  };
+  Replacement() = default;
+  Replacement(std::string op_name, std::string op_domain, InlinedVector<Input> arguments, NodeAttributes attrs)
+      : op(std::move(op_name)),
+        domain(std::move(op_domain)),
+        inputs(std::move(arguments)),
+        attributes(std::move(attrs)) {}
+  explicit Replacement(std::string_view text);
+  explicit Replacement(InlinedVector<NodeRecipe, 1> nodes);
+  // A parsed replacement is a reusable recipe callback; copying it shares the immutable plan.
+  Replacement operator()(const Graph&, const Match&) const { return *this; }
+  const auto& Plan() const { return plan_; }
   std::string op;
   std::string domain;
-  InlinedVector<std::variant<Value, const NodeArg*>> inputs;
+  InlinedVector<Input> inputs;
   NodeAttributes attributes;
+
+ private:
+  friend class PatternRewriter;
+  std::shared_ptr<const InlinedVector<NodeRecipe, 1>> plan_;
 };
 
 struct Rule {

@@ -165,7 +165,8 @@ tokens; semicolons may separate assignments. Values are ASCII identifiers.
 Definitions must precede use; every input and node must reach the final operator.
 There must be a final `return Op(...)`, with no subsequent statements.
 All six example rules use the string constructor and retrieve bindings with
-`Match::valueOf` for their guards and replacement recipes. Tests use the constructor for parsed
+`Match::valueOf` for their guards and dynamic replacement recipes; static
+replacement plans bind inputs once during compilation. Tests use the constructor for parsed
 patterns and test-only Identity, Split/Concat and LayerNorm-bias rules; builder
 tests and multi-output-root definitions retain the programmatic API.
 
@@ -178,7 +179,91 @@ A one-node parsed pattern is valid, but cannot form a node-count-decreasing rule
 The language intentionally excludes nested calls, lists/tensor literals, optional
 placeholders, booleans, comments, `return` of an existing value and multi-output
 `return` calls (use the C++ API for multi-output roots). It describes only matching:
-opset requirements, semantic guards and replacement recipes remain explicit C++.
+opset requirements and semantic guards remain explicit C++.
+
+### Reusable replacement plans
+
+`Replacement(std::string_view)` parses a reusable replacement definition, once:
+
+```cpp
+Rule rule{
+    "HardSwish", pattern, {{kOnnxDomain, 14, 21}}, guard,
+    Replacement("(x) => HardSwish(x)")};
+```
+
+The final operator call may omit `return`. Multi-node definitions use the same
+assignment, domain and keyword-attribute syntax as patterns:
+
+```cpp
+Replacement replacement(R"(
+  (x) =>
+    h = HardSigmoid(x, alpha=0.16666667, beta=0.5)
+    return Mul(h, x)
+)");
+```
+
+This defines a two-node replacement, not a callback that parses a string on every
+match. The constructor builds an immutable plan containing operator/domain names,
+literal attributes, external input names and indexed earlier-output references.
+Copies share that plan. When the plan is supplied directly as `Rule::replacement`,
+transformer construction binds its external names to the rule's input handles,
+and checks declared domains and node-count reduction. Binding is per rule, so
+reusing a plan across differently ordered input headers is safe.
+
+At runtime the callback returns a shared plan reference. There is no parsing,
+attribute-literal construction, or name lookup for these prebound inputs.
+The engine binds the external `NodeArg`s, allocates fresh intermediate values,
+creates nodes in definition order, and applies the stored attributes.
+Callbacks that need computed attributes can still return programmatic recipes;
+do not construct `Replacement(text)` inside a per-match callback.
+
+Replacement headers may select a subset of the matched pattern's inputs.
+They cannot refer to matched intermediates. All declared replacement inputs and
+nodes must reach the final operator. A multi-output assignment such as
+`a, b = Split(x, axis=0)` declares the exact internal arity.
+The final operator inherits **all matched root outputs in order**, including a
+multi-output root; its schema must accept that count. Intermediate outputs cannot
+be mapped independently to observable root slots yet.
+
+Numeric positional literals are synthesized as immutable rank-zero float32 or
+int64 initializers, using the same literal typing as patterns:
+`Replacement("(x) => Add(x, 0.0)")`. No Constant kernel or subsequent
+constant-folding pass is required. There is no general tensor/list synthesis.
+
+Programmatic sequences use `NodeRecipe` and `Output{node_index, output_slot}`:
+
+```cpp
+Replacement replacement(InlinedVector<Replacement::NodeRecipe, 1>{
+    {"HardSigmoid", kOnnxDomain, {std::string("x")}, sigmoid_attributes, 1},
+    {"Mul", kOnnxDomain, {Replacement::Output{0, 0}, std::string("x")}, {}, 1}});
+```
+
+`NodeRecipe` contains op, domain, inputs, attributes and internal output count.
+Its inputs may be names, existing `Value` handles, matched `NodeArg*` bindings,
+earlier-output references or `Replacement::Scalar{...}` literals.
+The final node's output count is inherited from the root rather than this field.
+The original four-argument single-node constructor remains supported, including
+computed-attribute callbacks. Its public single-node fields cannot be combined
+with an immutable parsed/programmatic plan; mixed representations are rejected.
+
+Every replacement must contain at least one node and **strictly fewer nodes
+than the matched pattern**. Equal-size rewrites and expansions are rejected,
+including dynamic recipes, retaining the node-count termination policy.
+All internal references must point backward to valid output slots; disconnected
+nodes and undeclared domains are errors. Limits remain 64 nodes and 64 inputs/
+outputs per node. Pattern parsing additionally bounds named values to 256.
+
+All replacement nodes are staged and their imported schemas/attributes checked
+before deleting matched nodes or rewiring edges. A schema failure removes every
+staged node and synthesized initializer, leaving the original live graph intact;
+unused staging `NodeArg`s and consumed unique-name IDs may remain. Final Resolve
+is still responsible for type/shape inference and validation; arbitrary computed
+recipes must establish semantic/type compatibility, and post-commit Resolve
+failure is not a general graph transaction rollback.
+All added nodes inherit root provider/layer metadata. Producer/consumer maps,
+internal edges and external root edges are updated; every added node seeds the
+invalidation worklist. Replacement notification attributes the removed pattern
+to the final node.
 
 ### Multiple outputs
 
@@ -201,7 +286,7 @@ consumers if the node is deleted. The tests include Split/Concat and a genuine
 ONNXScript LayerNorm-bias adaptation with unused mean/inverse-standard-deviation
 outputs; exposing either statistic prevents its deletion.
 
-A multi-output root is also supported. The single replacement node inherits
+A multi-output root is also supported. The final replacement node inherits
 **all root outputs in the original order**, including their names, types, shapes,
 graph-output status, and consumers. The recipe does not need an output list.
 Its schema must permit that output count. Identity/Split to Split tests execute
@@ -306,21 +391,22 @@ produced inside the deletion set prevent replacement.
 
 Registration order defines priority even across different structural groups.
 Match-only mode reports all passing rule guards; rewrite mode selects only the
-first passing rule. Replacements may consume **only input variables**, retain the
+first passing rule. Replacements may consume **only matched input variables,
+new scalar literals or earlier replacement outputs**, retain the
 root's output `NodeArg`s (name/type/shape and external users), and inherit its
 execution provider and layer annotation. The replacement domain must be declared
-in the rule requirements and already imported. Replacement schema/attribute checks
+in the rule requirements and already imported for every added node. Replacement schema/attribute checks
 precede deletion. ORT edges and producer/consumer indexes are updated; removed
 nodes are reported via `NotifyNodeReplacement`. Final Resolve validates types and
 inferred shapes, rather than silently ignoring graph-validation errors.
 
-After mutation, the replacement and surviving input producers seed a bounded
+After mutation, all replacement nodes and surviving input producers seed a bounded
 forward invalidation walk. Descendant roots up to the maximum pattern size are
 requeued, since producer changes or reduced use counts can unlock deeper patterns.
 Queue deduplication avoids redundant pending entries; removed IDs are skipped.
 Traversal and rule priority are deterministic.
 
-Every rule replaces at least two nodes with exactly one node. Thus every
+Every rule replaces at least two nodes with a smaller nonempty node sequence. Thus every
 successful rewrite strictly decreases live node count, and a graph with N nodes
 admits at most N-1 rewrites. This is a termination policy, **not a runtime bound**:
 guards, fanout, structural checks, and worklist invalidation still cost time.
@@ -339,10 +425,10 @@ mathematical worst-case guarantees for arbitrary rules or models.
 
 ## Intentional limitations and precision
 
-Matched nodes may have multiple outputs, but replacements remain single-node
-and must preserve the root's complete ordered output list. Optional/missing
+Matched and replacement nodes may have multiple outputs, but the final replacement
+node must preserve the root's complete ordered output list. Optional/missing
 inputs or outputs, variadic patterns,
-model-local function rewriting, tensor synthesis, domain-import edits, alternative
+model-local function rewriting, general tensor synthesis, domain-import edits, alternative
 patterns and implicit commutation are unsupported. Control-flow nodes are not
 matched, but `Apply` rewrites inside their subgraphs. External tensor data and
 overridable initializers do not satisfy example constant guards; scalar constants

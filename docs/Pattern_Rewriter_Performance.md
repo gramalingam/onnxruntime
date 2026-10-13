@@ -69,6 +69,77 @@ Pop-Location
 
 All four commands passed for the recorded follow-up measurements.
 
+## Multi-node replacement and parse-once follow-up
+
+The current replacement-plan implementation was measured using the same build,
+machine and decoder matrix. Raw current decoder results are in
+[Pattern_Rewriter_Replacement_Benchmark.csv](Pattern_Rewriter_Replacement_Benchmark.csv).
+These measurements include parsing the six example patterns and two textual
+replacement plans in preparation, plus per-rule compilation of replacement input
+names to handles. Runtime does not reparse these replacements. The prior sections
+remain historical, not measurements of this version.
+
+At 32 layers / 2241 nodes / 500 rules, all times are milliseconds:
+
+| Workload | Reference engine median | Indexed engine median | Indexed engine max | Indexed preparation median | Indexed Resolve median | Indexed total median |
+|---|---:|---:|---:|---:|---:|---:|
+| Active match-only | 57.9851 | 19.4515 | 20.8962 | 4.0799 | 0.0238 | 23.5048 |
+| Adversarial semantic misses | 59.9347 | 20.4246 | 21.5715 | 4.0817 | 0.0246 | 24.4483 |
+| Successful rewriting | 66.7473 | 23.5457 | 24.5314 | 3.9599 | 18.8356 | 46.3994 |
+| Synthetic distinct structural misses | 68.8041 | 53.8021 | 80.3349 | 11.2572 | 0.0281 | 65.1687 |
+
+Both implementations still agree on visits, matches, rewrites and output node
+counts across all 1080 rows. The successful 500-rule decoder run performs 128
+rewrites, leaving 1793 nodes.
+
+A separate **synthetic replacement microbenchmark**, not a model-derived decoder,
+uses 1000 independent four-node HardSwish decompositions (4000 initial nodes).
+It compares callback-built single-node recipes with parsed single-node and
+parsed two-node replacements. Each mode uses two warmups and nine measured
+repetitions on fresh loaded/resolved graphs; generation/loading/initial Resolve
+are excluded. Preparation constructs the example rules and compiles the selected
+single active rule. Engine includes matching,
+guards, schema checking, mutation and invalidation, not just node construction.
+Final Resolve is separate. Every run performs exactly 1000 rewrites.
+Raw results are in [Pattern_Rewriter_Replacement_Plans.csv](Pattern_Rewriter_Replacement_Plans.csv).
+
+| Mode | Preparation median ms | Engine median ms | Engine max ms | Resolve median ms | Output nodes |
+|---|---:|---:|---:|---:|---:|
+| 0: callback-built HardSwish | 0.1263 | 47.9877 | 49.8680 | 36.4286 | 1000 |
+| 1: parsed HardSwish | 0.1315 | 45.2831 | 62.1462 | 35.4819 | 1000 |
+| 2: parsed HardSigmoid/Mul sequence | 0.1414 | 77.2673 | 91.1039 | 50.3654 | 2000 |
+
+The similar single-node timings are not evidence of a universal speedup:
+shared-machine variation is visible in the maxima. The two-node plan necessarily
+does more creation, edge and Resolve work. This demonstrates that parsing can be
+paid once while the same plan drives 1000 successful rewrites; the benchmark does
+not measure or endorse parsing inside a per-match callback.
+
+Validation: CPU Release build passed, **52 correctness/regression tests passed**
+(41 rewriter, 11 existing optimizer), and both disabled benchmarks passed.
+New executed tests cover HardSwish-to-HardSigmoid/Mul, branched Split/Concat,
+multi-output roots, and synthesized float32/int64 scalar initializers.
+Negative tests verify staged-node/initializer cleanup on schema failure,
+invalid output references, undeclared domains and nondecreasing replacements.
+Plan reuse and invalidation are checked in indexed and reference modes.
+Decoder numerical errors remain unchanged from the earlier section.
+
+Use the same build command and correctness filter above. Benchmark reproduction:
+
+```powershell
+$env:ORT_REWRITER_BENCHMARK_CSV = Join-Path (Get-Location) 'docs\Pattern_Rewriter_Replacement_Benchmark.csv'
+$env:ORT_REWRITER_REPLACEMENT_CSV = Join-Path (Get-Location) 'docs\Pattern_Rewriter_Replacement_Plans.csv'
+Push-Location build\rewriter\Release\Release
+.\onnxruntime_test_all.exe --gtest_also_run_disabled_tests --gtest_filter="PatternRewriterBenchmark.DISABLED_Decoder:PatternRewriterBenchmark.DISABLED_ReplacementPlans"
+Pop-Location
+.\.venv\Scripts\python.exe tools\ci_build\summarize_rewriter_benchmark.py docs\Pattern_Rewriter_Replacement_Benchmark.csv
+```
+
+Both commands passed. The replacement microbenchmark also prints its 27 measured
+rows to stdout, prefixed `replacement_row,`. Decoder matrix completeness, deterministic counters and
+reference/indexed agreement were checked by the summarizer.
+All timings and extrapolations are empirical, never worst-case guarantees.
+
 ## Configuration and scope
 
 Measured October 13, 2026, after adding multi-output patterns, concise constructors

@@ -74,9 +74,7 @@ Rules MakeExampleRules() {
                               Scalar(graph, *m.valueOf("low")) == 0.0f && Scalar(graph, *m.valueOf("high")) == 6.0f &&
                               Scalar(graph, *m.valueOf("divisor")) == 6.0f;
                      },
-                     [](const Graph&, const Match& m) {
-                       return Replacement{"HardSwish", kOnnxDomain, {m.valueOf("x")}, {}};
-                     }});
+                     Replacement("(x) => HardSwish(x)")});
   }
   {
     Pattern p(R"(
@@ -88,9 +86,7 @@ Rules MakeExampleRules() {
                      p,
                      {{kOnnxDomain, 14, 21}},
                      [](const Graph&, const Match& m) { return Float32(m); },
-                     [](const Graph&, const Match& m) {
-                       return Replacement{"HardSwish", kOnnxDomain, {m.valueOf("x")}, {}};
-                     }});
+                     Replacement("(x) => HardSwish(x)")});
   }
 #ifndef DISABLE_CONTRIB_OPS
   {

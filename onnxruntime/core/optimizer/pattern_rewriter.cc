@@ -129,50 +129,122 @@ bool CanRewritePartition(const Match& match, const Options& options) {
 }
 
 Status Replace(Graph& graph, const Pattern& pattern, const Match& match, const Replacement& recipe,
-               Producers& producers, NodeIndex& added) {
-  const auto& domain = recipe.domain == kOnnxDomainAlias ? kOnnxDomain : recipe.domain;
-  auto imported = graph.DomainToVersionMap().find(domain);
-  ORT_RETURN_IF(imported == graph.DomainToVersionMap().end(), "Replacement domain is not imported: ", domain);
-  InlinedVector<NodeArg*> inputs;
-  for (const auto& input : recipe.inputs) {
-    Value value;
-    if (const auto* handle = std::get_if<Value>(&input)) {
-      value = *handle;
-    } else {
-      const auto* argument = std::get<const NodeArg*>(input);
-      for (int id = 0; id < static_cast<int>(match.values.size()); ++id) {
-        if (argument && match.values[id] == argument && pattern.IsInput(id)) {
-          value = id;
-          break;
+               Producers& producers, InlinedVector<NodeIndex>& added) {
+  ORT_RETURN_IF(recipe.Plan() && (!recipe.op.empty() || !recipe.domain.empty() || !recipe.inputs.empty() ||
+                                  !recipe.attributes.empty()),
+                "A replacement plan cannot be combined with single-node recipe fields.");
+  InlinedVector<Replacement::NodeRecipe, 1> single;
+  if (!recipe.Plan()) single.push_back({recipe.op, recipe.domain, recipe.inputs, recipe.attributes, 1});
+  const auto& nodes = recipe.Plan() ? *recipe.Plan() : single;
+  ORT_RETURN_IF(nodes.empty() || nodes.size() >= match.nodes.size(),
+                "Replacements must contain fewer nodes than the matched pattern.");
+  const Node& root = *match.nodes.back();
+  InlinedVector<InlinedVector<NodeArg*>> external_inputs;
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    const auto& node = nodes[i];
+    const auto& domain = node.domain == kOnnxDomainAlias ? kOnnxDomain : node.domain;
+    ORT_RETURN_IF(node.op.empty() || node.inputs.size() > 64 || node.output_count == 0 || node.output_count > 64,
+                  "Invalid replacement operator or arity.");
+    ORT_RETURN_IF(graph.DomainToVersionMap().find(domain) == graph.DomainToVersionMap().end(),
+                  "Replacement domain is not imported: ", domain);
+    InlinedVector<NodeArg*> inputs;
+    for (const auto& input : node.inputs) {
+      if (const auto* scalar = std::get_if<Replacement::Scalar>(&input)) {
+        ORT_RETURN_IF(std::holds_alternative<float>(scalar->value) && !std::isfinite(std::get<float>(scalar->value)),
+                      "Replacement float constants must be finite.");
+        inputs.push_back(nullptr);
+        continue;
+      }
+      if (const auto* output = std::get_if<Replacement::Output>(&input)) {
+        ORT_RETURN_IF(output->node >= i || output->slot >= nodes[output->node].output_count,
+                      "Replacement inputs must reference an earlier output slot.");
+        inputs.push_back(nullptr);
+        continue;
+      }
+      Value value;
+      if (const auto* handle = std::get_if<Value>(&input)) {
+        value = *handle;
+      } else {
+        const auto* argument = std::holds_alternative<std::string>(input) ? match.valueOf(std::get<std::string>(input))
+                                                                          : std::get<const NodeArg*>(input);
+        for (int id = 0; id < static_cast<int>(match.values.size()); ++id) {
+          if (argument && match.values[id] == argument && pattern.IsInput(id)) {
+            value = id;
+            break;
+          }
         }
       }
+      ORT_RETURN_IF(
+          value.handle < 0 || static_cast<size_t>(value.handle) >= match.values.size() || !pattern.IsInput(value),
+          "Replacement inputs must be pattern input variables.");
+      inputs.push_back(graph.GetNodeArg(match.values[value]->Name()));
     }
-    ORT_RETURN_IF(
-        value.handle < 0 || static_cast<size_t>(value.handle) >= match.values.size() || !pattern.IsInput(value),
-        "Replacement inputs must be pattern input variables.");
-    inputs.push_back(graph.GetNodeArg(match.values[value]->Name()));
+    external_inputs.push_back(std::move(inputs));
   }
-  const Node& root = *match.nodes.back();
-  InlinedVector<NodeArg*> outputs;
-  for (const NodeArg* output : root.OutputDefs()) outputs.push_back(graph.GetNodeArg(output->Name()));
-  Node& replacement = graph.AddNode(graph.GenerateNodeName("rewrite"), recipe.op, "PatternRewriter", inputs, outputs,
-                                    root, &recipe.attributes, domain);
-  // Validate the imported schema before deleting anything.
-  if (!graph.SetOpSchemaFromRegistryForNode(replacement)) {
-    graph.RemoveNode(replacement.Index());
-    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Replacement schema is unavailable: ", recipe.op);
+  // Require a connected sequence ending at the node that inherits the root outputs.
+  InlinedHashSet<size_t> reachable{nodes.size() - 1};
+  for (size_t i = nodes.size(); i-- > 0;) {
+    ORT_RETURN_IF(!reachable.count(i), "Disconnected replacement node.");
+    for (const auto& input : nodes[i].inputs)
+      if (const auto* output = std::get_if<Replacement::Output>(&input)) reachable.insert(output->node);
   }
-  ORT_TRY {
-    ONNX_NAMESPACE::NodeProto proto;
-    replacement.ToProto(proto);
-    replacement.Op()->Verify(proto);
+  InlinedVector<std::string> initializers;
+  auto rollback = [&]() {
+    for (auto it = added.rbegin(); it != added.rend(); ++it) graph.RemoveNode(*it);
+    for (const auto& name : initializers) graph.RemoveInitializedTensor(name);
+    added.clear();
+  };
+  // Stage and validate every schema before deleting any matched nodes or changing edges.
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    auto& inputs = external_inputs[i];
+    for (size_t j = 0; j < inputs.size(); ++j) {
+      if (const auto* output = std::get_if<Replacement::Output>(&nodes[i].inputs[j]))
+        inputs[j] = graph.GetNode(added[output->node])->MutableOutputDefs()[output->slot];
+      if (const auto* scalar = std::get_if<Replacement::Scalar>(&nodes[i].inputs[j])) {
+        ONNX_NAMESPACE::TensorProto tensor;
+        tensor.set_name(graph.GenerateNodeArgName("rewrite_literal"));
+        if (const auto* floating = std::get_if<float>(&scalar->value)) {
+          tensor.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+          tensor.add_float_data(*floating);
+        } else {
+          tensor.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_INT64);
+          tensor.add_int64_data(std::get<int64_t>(scalar->value));
+        }
+        ONNX_NAMESPACE::TypeProto type;
+        type.mutable_tensor_type()->set_elem_type(tensor.data_type());
+        type.mutable_tensor_type()->mutable_shape();
+        inputs[j] = &graph.GetOrCreateNodeArg(tensor.name(), &type);
+        initializers.push_back(tensor.name());
+        graph.AddInitializedTensor(tensor);
+      }
+    }
+    InlinedVector<NodeArg*> outputs;
+    if (i + 1 == nodes.size()) {
+      for (const NodeArg* output : root.OutputDefs()) outputs.push_back(graph.GetNodeArg(output->Name()));
+    } else {
+      for (size_t j = 0; j < nodes[i].output_count; ++j)
+        outputs.push_back(&graph.GetOrCreateNodeArg(graph.GenerateNodeArgName("rewrite_value"), nullptr));
+    }
+    const auto& node = nodes[i];
+    const auto& domain = node.domain == kOnnxDomainAlias ? kOnnxDomain : node.domain;
+    Node& replacement = graph.AddNode(graph.GenerateNodeName("rewrite"), node.op, "PatternRewriter", inputs, outputs,
+                                      root, &node.attributes, domain);
+    added.push_back(replacement.Index());
+    if (!graph.SetOpSchemaFromRegistryForNode(replacement)) {
+      rollback();
+      return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Replacement schema is unavailable: ", node.op);
+    }
+    ORT_TRY {
+      ONNX_NAMESPACE::NodeProto proto;
+      replacement.ToProto(proto);
+      replacement.Op()->Verify(proto);
+    }
+    ORT_CATCH(const ONNX_NAMESPACE::checker::ValidationError& error) {
+      rollback();
+      return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Invalid replacement: ", error.what());
+    }
+    replacement.SetExecutionProviderType(root.GetExecutionProviderType());
   }
-  ORT_CATCH(const ONNX_NAMESPACE::checker::ValidationError& error) {
-    graph.RemoveNode(replacement.Index());
-    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Invalid replacement: ", error.what());
-  }
-  replacement.SetExecutionProviderType(root.GetExecutionProviderType());
-  added = replacement.Index();
   struct Edge {
     NodeIndex destination;
     int source_arg;
@@ -195,21 +267,26 @@ Status Replace(Graph& graph, const Pattern& pattern, const Match& match, const R
   for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
     ORT_ENFORCE(graph.RemoveNode(*it), "Failed to remove matched node.");
   }
-  for (size_t i = 0; i < inputs.size(); ++i) {
-    graph.AddConsumerNode(inputs[i]->Name(), &replacement);
-    auto it = producers.find(inputs[i]);
-    if (it == producers.end()) continue;
-    const Node& producer = *graph.GetNode(it->second);
-    auto output_it = std::find(producer.OutputDefs().begin(), producer.OutputDefs().end(), inputs[i]);
-    graph.AddEdge(producer.Index(), added, static_cast<int>(std::distance(producer.OutputDefs().begin(), output_it)),
-                  static_cast<int>(i));
+  for (NodeIndex index : added) {
+    Node& replacement = *graph.GetNode(index);
+    for (size_t i = 0; i < replacement.InputDefs().size(); ++i) {
+      const NodeArg* input = replacement.InputDefs()[i];
+      graph.AddConsumerNode(input->Name(), &replacement);
+      auto it = producers.find(input);
+      if (it == producers.end()) continue;
+      const Node& producer = *graph.GetNode(it->second);
+      auto output_it = std::find(producer.OutputDefs().begin(), producer.OutputDefs().end(), input);
+      graph.AddEdge(producer.Index(), index, static_cast<int>(std::distance(producer.OutputDefs().begin(), output_it)),
+                    static_cast<int>(i));
+    }
+    for (const NodeArg* output : replacement.OutputDefs()) {
+      producers[output] = index;
+      graph.UpdateProducerNode(output->Name(), index);
+    }
   }
-  for (const auto& edge : outgoing) graph.AddEdge(added, edge.destination, edge.source_arg, edge.destination_arg);
-  for (NodeArg* output : outputs) {
-    producers[output] = added;
-    graph.UpdateProducerNode(output->Name(), added);
-  }
-  graph.NotifyNodeReplacement(removed, added);
+  for (const auto& edge : outgoing)
+    graph.AddEdge(added.back(), edge.destination, edge.source_arg, edge.destination_arg);
+  graph.NotifyNodeReplacement(removed, added.back());
   return Status::OK();
 }
 }  // namespace
@@ -330,7 +407,8 @@ bool Pattern::IsInput(Value value) const {
 namespace {
 class PatternParser {
  public:
-  explicit PatternParser(std::string_view text) : text_(text) {}
+  explicit PatternParser(std::string_view text, InlinedVector<NodeAttributes, 1>* attributes = nullptr)
+      : text_(text), replacement_attributes_(attributes) {}
 
   Status Parse(Pattern& destination) {
     ORT_RETURN_IF_ERROR(Next());
@@ -359,16 +437,27 @@ class PatternParser {
         returned = true;
         ORT_RETURN_IF_ERROR(Next());
       } else {
+        const size_t start = token_start_;
         do {
           std::string name;
-          ORT_RETURN_IF_ERROR(Identifier(name));
-          ORT_RETURN_IF(symbols_.count(name) || std::find(names.begin(), names.end(), name) != names.end(),
-                        Error("duplicate assignment name"));
+          ORT_RETURN_IF_ERROR(Identifier(name, replacement_attributes_ && names.empty()));
+          ORT_RETURN_IF(std::find(names.begin(), names.end(), name) != names.end(), Error("duplicate assignment name"));
           names.push_back(std::move(name));
           if (token_ != ",") break;
           ORT_RETURN_IF_ERROR(Next());
         } while (true);
-        ORT_RETURN_IF_ERROR(Expect("="));
+        if (replacement_attributes_ && names.size() == 1 && (token_ == "(" || token_ == "::")) {
+          position_ = start;
+          ORT_RETURN_IF_ERROR(Next());
+          names.clear();
+          returned = true;
+        } else {
+          for (const auto& name : names) ORT_RETURN_IF(symbols_.count(name), Error("duplicate assignment name"));
+          ORT_RETURN_IF(std::any_of(names.begin(), names.end(),
+                                    [](const auto& name) { return name.find('.') != std::string::npos; }),
+                        Error("expected value identifier"));
+          ORT_RETURN_IF_ERROR(Expect("="));
+        }
       }
       ORT_RETURN_IF_ERROR(Call(names));
       if (returned) {
@@ -452,9 +541,10 @@ class PatternParser {
     ORT_RETURN_IF(kind_ != Kind::Symbol || token_ != token, Error("unexpected token"));
     return Next();
   }
-  Status Identifier(std::string& name) {
-    ORT_RETURN_IF(kind_ != Kind::Identifier || token_ == "return" || token_.find('.') != std::string::npos,
-                  Error("expected value identifier"));
+  Status Identifier(std::string& name, bool allow_domain = false) {
+    ORT_RETURN_IF(
+        kind_ != Kind::Identifier || token_ == "return" || (!allow_domain && token_.find('.') != std::string::npos),
+        Error("expected value identifier"));
     name = token_;
     return Next();
   }
@@ -493,6 +583,7 @@ class PatternParser {
     ORT_RETURN_IF_ERROR(Expect("("));
     InlinedVector<Value> inputs;
     InlinedVector<AttributeMatcher, 1> attributes;
+    NodeAttributes literal_attributes;
     InlinedHashSet<std::string> attribute_names;
     bool keyword = false;
     if (token_ != ")") {
@@ -506,12 +597,25 @@ class PatternParser {
             ORT_RETURN_IF_ERROR(Next());
             if (kind_ == Kind::String) {
               attributes.push_back(AttributeMatcher::Equal(name, token_));
+              auto& attr = literal_attributes[name];
+              attr.set_name(name);
+              attr.set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_STRING);
+              attr.set_s(token_);
               ORT_RETURN_IF_ERROR(Next());
             } else {
               std::variant<float, int64_t> number;
               ORT_RETURN_IF_ERROR(Number(number));
               attributes.push_back(
                   std::visit([&](auto value) { return AttributeMatcher::Equal(name, value); }, number));
+              auto& attr = literal_attributes[name];
+              attr.set_name(name);
+              if (const auto* floating = std::get_if<float>(&number)) {
+                attr.set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT);
+                attr.set_f(*floating);
+              } else {
+                attr.set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_INT);
+                attr.set_i(std::get<int64_t>(number));
+              }
             }
           } else {
             ORT_RETURN_IF(keyword, Error("positional input after attribute"));
@@ -537,6 +641,7 @@ class PatternParser {
                   Error("pattern limits exceeded"));
     auto values = pattern_.MultiOp(std::move(op), gsl::span<const Value>(inputs), outputs);
     pattern_.Attributes(std::move(attributes));
+    if (replacement_attributes_) replacement_attributes_->push_back(std::move(literal_attributes));
     for (size_t i = 0; i < names.size(); ++i) {
       pattern_.Name(values[i], names[i]);
       symbols_.emplace(names[i], pattern_.NamedValue(names[i]));
@@ -558,10 +663,44 @@ class PatternParser {
   std::string token_;
   Pattern pattern_;
   InlinedHashMap<std::string, Value> symbols_;
+  InlinedVector<NodeAttributes, 1>* replacement_attributes_ = nullptr;
 };
 }  // namespace
 
 Pattern::Pattern(std::string_view text) { ORT_THROW_IF_ERROR(PatternParser(text).Parse(*this)); }
+
+Replacement::Replacement(InlinedVector<NodeRecipe, 1> nodes) {
+  ORT_ENFORCE(!nodes.empty() && nodes.size() <= 64, "Replacements need between 1 and 64 nodes.");
+  plan_ = std::make_shared<const InlinedVector<NodeRecipe, 1>>(std::move(nodes));
+}
+
+Replacement::Replacement(std::string_view text) {
+  Pattern parsed;
+  InlinedVector<NodeAttributes, 1> parsed_attributes;
+  ORT_THROW_IF_ERROR(PatternParser(text, &parsed_attributes).Parse(parsed));
+  InlinedHashMap<int, Output> outputs;
+  InlinedVector<NodeRecipe, 1> nodes;
+  for (size_t i = 0; i < parsed.Nodes().size(); ++i) {
+    const auto& node = parsed.Nodes()[i];
+    NodeRecipe recipe{node.op.name, node.op.domain, {}, std::move(parsed_attributes[i]), node.outputs.size()};
+    for (const Value& input : node.inputs) {
+      auto literal = parsed.Constants().find(input.handle);
+      if (literal != parsed.Constants().end()) {
+        recipe.inputs.push_back(Scalar{literal->second});
+        continue;
+      }
+      auto found = outputs.find(input.handle);
+      if (found == outputs.end())
+        recipe.inputs.push_back(input.name);
+      else
+        recipe.inputs.push_back(found->second);
+    }
+    for (size_t slot = 0; slot < node.outputs.size(); ++slot)
+      outputs.emplace(node.outputs[slot].handle, Output{nodes.size(), slot});
+    nodes.push_back(std::move(recipe));
+  }
+  plan_ = std::make_shared<const InlinedVector<NodeRecipe, 1>>(std::move(nodes));
+}
 
 const NodeArg* Match::valueOf(std::string_view name) const {
   ORT_ENFORCE(pattern, "Named lookup requires a matched pattern.");
@@ -589,6 +728,23 @@ PatternRewriter::PatternRewriter(Rules rules, Options options)
     }
     for (const auto& node : rule.pattern.Nodes()) {
       ORT_ENFORCE(domains.count(node.op.domain), "Missing rule opset requirement for domain: ", node.op.domain);
+    }
+    if (auto* recipe = rule.replacement.target<Replacement>(); recipe && recipe->plan_) {
+      auto nodes = *recipe->plan_;
+      ORT_ENFORCE(nodes.size() < rule.pattern.Nodes().size(),
+                  "Replacements must contain fewer nodes than the matched pattern.");
+      for (auto& node : nodes) {
+        if (node.domain == kOnnxDomainAlias) node.domain = kOnnxDomain;
+        ORT_ENFORCE(domains.count(node.domain), "Missing rule opset requirement for replacement domain: ", node.domain);
+        for (auto& input : node.inputs) {
+          if (const auto* name = std::get_if<std::string>(&input)) {
+            auto value = rule.pattern.NamedValue(*name);
+            ORT_ENFORCE(rule.pattern.IsInput(value), "Replacement inputs must be pattern input variables: ", *name);
+            input = std::move(value);
+          }
+        }
+      }
+      recipe->plan_ = std::make_shared<const InlinedVector<Replacement::NodeRecipe, 1>>(std::move(nodes));
     }
     // Every node must reach the last node. Disconnected definitions are not patterns.
     const auto& root_outputs = rule.pattern.Nodes().back().outputs;
@@ -707,15 +863,22 @@ Status PatternRewriter::Run(Graph& graph, Statistics& statistics) const {
       auto it = producers.find(winning_match.values[value]);
       if (it != producers.end()) affected.push_back(it->second);
     }
-    NodeIndex added;
+    InlinedVector<NodeIndex> added;
     auto recipe = rules_[winner].replacement(graph, winning_match);
-    const auto& domain = recipe.domain == kOnnxDomainAlias ? kOnnxDomain : recipe.domain;
-    ORT_RETURN_IF(std::none_of(rules_[winner].opsets.begin(), rules_[winner].opsets.end(),
-                               [&](const auto& requirement) { return requirement.domain == domain; }),
-                  "Replacement domain has no rule opset requirement: ", domain);
+    auto declared = [&](const std::string& node_domain) {
+      const auto& domain = node_domain == kOnnxDomainAlias ? kOnnxDomain : node_domain;
+      return std::any_of(rules_[winner].opsets.begin(), rules_[winner].opsets.end(),
+                         [&](const auto& requirement) { return requirement.domain == domain; });
+    };
+    if (recipe.Plan()) {
+      for (const auto& node : *recipe.Plan())
+        ORT_RETURN_IF(!declared(node.domain), "Replacement domain has no rule opset requirement: ", node.domain);
+    } else {
+      ORT_RETURN_IF(!declared(recipe.domain), "Replacement domain has no rule opset requirement: ", recipe.domain);
+    }
     ORT_RETURN_IF_ERROR(Replace(graph, *winning_pattern, winning_match, recipe, producers, added));
     ++statistics.rewrites;
-    affected.push_back(added);
+    affected.insert(affected.end(), added.begin(), added.end());
     // A changed producer or use count can affect a deeper pattern root, not just a direct consumer.
     InlinedHashSet<NodeIndex> seen;
     for (size_t depth = 0; depth <= invalidation_depth_ && !affected.empty(); ++depth) {
