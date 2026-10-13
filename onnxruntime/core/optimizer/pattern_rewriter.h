@@ -16,7 +16,12 @@ using Value = size_t;
 struct Operator {
   std::string name;
   std::string domain;
-  InlinedVector<int> versions;
+};
+
+struct OpsetRequirement {
+  std::string domain;
+  int min_version;
+  int max_version;  // Inclusive model/function import range, not schema since-versions.
 };
 
 // A straight-line definition describes a DAG, not necessarily a chain.
@@ -48,7 +53,6 @@ struct Match {
 struct Replacement {
   std::string op;
   std::string domain;
-  int version;
   InlinedVector<Value> inputs;
   NodeAttributes attributes;
 };
@@ -56,6 +60,7 @@ struct Replacement {
 struct Rule {
   std::string name;
   Pattern pattern;
+  InlinedVector<OpsetRequirement, 1> opsets;
   // Guards and recipes must not mutate the graph or retain pointers into a Match.
   std::function<bool(const Graph&, const Match&)> guard;
   std::function<Replacement(const Graph&, const Match&)> replacement;

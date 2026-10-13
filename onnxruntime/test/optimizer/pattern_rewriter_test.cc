@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <sstream>
+#include <unordered_map>
 
 #include "core/optimizer/pattern_rewriter.h"
 #include "core/platform/env.h"
@@ -20,14 +21,16 @@ namespace {
 using namespace rewrite;
 
 struct TestGraph {
-  Model model{"rewrite",
+  explicit TestGraph(const std::unordered_map<std::string, int>& imports = {{kOnnxDomain, 17}, {kMSDomain, 1}})
+      : model{"rewrite",
               false,
               ModelMetaData(),
               PathString(),
               IOnnxRuntimeOpSchemaRegistryList(),
-              {{kOnnxDomain, 17}, {kMSDomain, 1}},
+              imports,
               {},
-              DefaultLoggingManager().DefaultLogger()};
+              DefaultLoggingManager().DefaultLogger()} {}
+  Model model;
   Graph& graph = model.MainGraph();
   ModelTestBuilder builder{graph};
 };
@@ -74,10 +77,13 @@ size_t Count(const Graph& graph, const std::string& op) {
 Rule IdentityPair(const char* name = "identity", bool accept = true) {
   Pattern p;
   auto x = p.Input();
-  auto a = p.Op({"Identity", kOnnxDomain, {16}}, {x});
-  p.Op({"Identity", kOnnxDomain, {16}}, {a});
-  return {name, p, [accept](const Graph&, const Match&) { return accept; },
-          [x](const Graph&, const Match&) { return Replacement{"Identity", kOnnxDomain, 16, {x}, {}}; }};
+  auto a = p.Op({"Identity", kOnnxDomain}, {x});
+  p.Op({"Identity", kOnnxDomain}, {a});
+  return {name,
+          p,
+          {{kOnnxDomain, 1, 21}},
+          [accept](const Graph&, const Match&) { return accept; },
+          [x](const Graph&, const Match&) { return Replacement{"Identity", kOnnxDomain, {x}, {}}; }};
 }
 
 // Small-weight eager decoder: B=1, Hq=4, Hkv=2, D=4. Cache length is 3.
@@ -273,8 +279,8 @@ TEST(PatternRewriterTests, PriorityOverlapTerminationAndMatchOnly) {
 TEST(PatternRewriterTests, InvalidRuleAndRecipe) {
   Pattern disconnected;
   auto x = disconnected.Input();
-  disconnected.Op({"Identity", "", {16}}, {x});
-  disconnected.Op({"Identity", "", {16}}, {x});
+  disconnected.Op({"Identity", ""}, {x});
+  disconnected.Op({"Identity", ""}, {x});
   auto rule = IdentityPair();
   rule.pattern = disconnected;
   EXPECT_THROW(PatternRewriter({rule}), OnnxRuntimeException);
@@ -286,10 +292,10 @@ TEST(PatternRewriterTests, InvalidRuleAndRecipe) {
   test.builder.SetGraphOutputs();
   ASSERT_STATUS_OK(test.graph.Resolve());
   rule = IdentityPair();
-  for (int scenario = 0; scenario < 4; ++scenario) {
+  for (int scenario = 0; scenario < 5; ++scenario) {
     rule.replacement = [scenario](const Graph&, const Match&) {
-      Replacement recipe{"Identity", "", 16, {0}, {}};
-      if (scenario == 0) recipe.version = 999;
+      Replacement recipe{"Identity", "", {0}, {}};
+      if (scenario == 0) recipe.op = "NoSuchReplacementOperator";
       if (scenario == 1) recipe.domain = "not.imported";
       if (scenario == 2) recipe.inputs = {1};  // Deleted intermediate, not an external input.
       if (scenario == 3) {
@@ -299,12 +305,152 @@ TEST(PatternRewriterTests, InvalidRuleAndRecipe) {
         attr.set_i(1);
         recipe.attributes.emplace("invalid", attr);
       }
+      if (scenario == 4) recipe.domain = kMSDomain;  // Imported, but not declared by this rule.
       return recipe;
     };
     Statistics stats;
     EXPECT_FALSE(PatternRewriter({rule}).Run(test.graph, stats).IsOK());
     EXPECT_EQ(test.graph.NumberOfNodes(), 2);
     ASSERT_STATUS_OK(test.graph.Resolve());
+  }
+}
+
+TEST(PatternRewriterTests, InvalidOpsetRequirements) {
+  for (bool indexed : {false, true}) {
+    for (int scenario = 0; scenario < 5; ++scenario) {
+      auto rule = IdentityPair();
+      if (scenario == 0) rule.opsets.clear();
+      if (scenario == 1) rule.opsets = {{kOnnxDomain, 0, 17}};
+      if (scenario == 2) rule.opsets = {{kOnnxDomain, 18, 17}};
+      if (scenario == 3) rule.opsets = {{kOnnxDomain, 1, 17}, {kOnnxDomainAlias, 1, 17}};
+      if (scenario == 4) rule.opsets = {{kMSDomain, 1, 1}};
+      EXPECT_THROW((PatternRewriter({rule}, {.indexed = indexed})), OnnxRuntimeException);
+    }
+  }
+}
+
+TEST(PatternRewriterTests, RuleImportRangesAndAliases) {
+  for (bool indexed : {false, true}) {
+    auto rule = IdentityPair();
+    rule.opsets = {{kOnnxDomainAlias, 14, 17}};
+    Pattern pattern;
+    auto input = pattern.Input();
+    auto first = pattern.Op({"Identity", kOnnxDomainAlias}, {input});
+    pattern.Op({"Identity", kOnnxDomainAlias}, {first});
+    rule.pattern = std::move(pattern);
+    int guards = 0;
+    rule.guard = [&guards](const Graph&, const Match&) {
+      ++guards;
+      return true;
+    };
+    rule.replacement = [](const Graph&, const Match&) { return Replacement{"Identity", kOnnxDomainAlias, {0}, {}}; };
+    // Reusing one compiled rule across models must not retain the first model's imports.
+    PatternRewriter rewriter({rule}, {.indexed = indexed});
+    for (int opset : {13, 14, 15, 16, 17, 18}) {
+      TestGraph test({{kOnnxDomain, opset}});
+      auto* x = test.builder.MakeInput<float>({2}, -1.0f, 1.0f);
+      auto* middle = test.builder.MakeIntermediate();
+      test.builder.AddNode("Identity", {x}, {middle});
+      test.builder.AddNode("Identity", {middle}, {test.builder.MakeOutput()});
+      test.builder.SetGraphOutputs();
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      const bool supported = opset >= 14 && opset <= 17;
+      guards = 0;
+      Statistics stats;
+      ASSERT_STATUS_OK(rewriter.Run(test.graph, stats));
+      EXPECT_EQ(guards, supported ? 1 : 0);
+      EXPECT_EQ(stats.rewrites, supported ? 1u : 0u);
+      if (!supported) {
+        EXPECT_EQ(stats.visited, 0u);
+        EXPECT_EQ(stats.candidates, 0u);
+        EXPECT_EQ(stats.structural_checks, 0u);
+      }
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      EXPECT_EQ(test.graph.NumberOfNodes(), supported ? 1 : 2);
+    }
+  }
+}
+
+TEST(PatternRewriterTests, ImportFilteringWithinSharedStructuralGroups) {
+  for (bool indexed : {false, true}) {
+    for (bool match_only : {false, true}) {
+      TestGraph test;
+      auto* x = test.builder.MakeInput<float>({2}, -1.0f, 1.0f);
+      auto* middle = test.builder.MakeIntermediate();
+      test.builder.AddNode("Identity", {x}, {middle});
+      test.builder.AddNode("Identity", {middle}, {test.builder.MakeOutput()});
+      test.builder.SetGraphOutputs();
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      auto inactive = IdentityPair("inactive"), active = IdentityPair("active"), later = IdentityPair("later");
+      inactive.opsets = {{kOnnxDomain, 18, 21}};
+      int inactive_guards = 0, active_guards = 0, later_guards = 0;
+      inactive.guard = [&inactive_guards](const Graph&, const Match&) {
+        ++inactive_guards;
+        return true;
+      };
+      active.guard = [&active_guards](const Graph&, const Match&) {
+        ++active_guards;
+        return true;
+      };
+      later.guard = [&later_guards](const Graph&, const Match&) {
+        ++later_guards;
+        return true;
+      };
+      Statistics stats;
+      ASSERT_STATUS_OK(PatternRewriter({inactive, active, later}, {.match_only = match_only, .indexed = indexed})
+                           .Run(test.graph, stats));
+      EXPECT_EQ(inactive_guards, 0);
+      EXPECT_EQ(active_guards, 1);
+      EXPECT_EQ(later_guards, match_only ? 1 : 0);
+      EXPECT_EQ(stats.matches, match_only ? 2u : 1u);
+      EXPECT_EQ(stats.rewrites, match_only ? 0u : 1u);
+      ASSERT_STATUS_OK(test.graph.Resolve());
+    }
+  }
+}
+
+TEST(PatternRewriterTests, MultipleDomainImportRequirements) {
+  for (bool indexed : {false, true}) {
+    for (int scenario = 0; scenario < 3; ++scenario) {
+      TestGraph test(scenario == 0 ? std::unordered_map<std::string, int>{{kOnnxDomain, 17}}
+                                   : std::unordered_map<std::string, int>{{kOnnxDomain, 17}, {kMSDomain, 1}});
+      auto* x = test.builder.MakeInput<float>({2}, -1.0f, 1.0f);
+      auto* middle = test.builder.MakeIntermediate();
+      test.builder.AddNode("Identity", {x}, {middle});
+      test.builder.AddNode("Identity", {middle}, {test.builder.MakeOutput()});
+      test.builder.SetGraphOutputs();
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      auto rule = IdentityPair();
+      rule.opsets.push_back({kMSDomain, scenario == 1 ? 2 : 1, 2});
+      int guards = 0;
+      rule.guard = [&guards](const Graph&, const Match&) {
+        ++guards;
+        return true;
+      };
+      Statistics stats;
+      ASSERT_STATUS_OK(PatternRewriter({rule}, {.indexed = indexed}).Run(test.graph, stats));
+      EXPECT_EQ(guards, scenario == 2 ? 1 : 0);
+      EXPECT_EQ(stats.rewrites, scenario == 2 ? 1u : 0u);
+      ASSERT_STATUS_OK(test.graph.Resolve());
+    }
+  }
+}
+
+TEST(PatternRewriterTests, ExampleRuleImportBoundaries) {
+  for (bool indexed : {false, true}) {
+    PatternRewriter rewriter(MakeExampleRules(), {.indexed = indexed});
+    for (int opset : {13, 14, 17, 21, 22}) {
+      TestGraph test({{kOnnxDomain, opset}});
+      BuildHardSwish(test.builder);
+      test.builder.SetGraphOutputs();
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      Statistics stats;
+      ASSERT_STATUS_OK(rewriter.Run(test.graph, stats));
+      const bool supported = opset >= 14 && opset <= 21;
+      EXPECT_EQ(stats.rewrites, supported ? 1u : 0u);
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      EXPECT_EQ(Count(test.graph, "HardSwish"), supported ? 1u : 0u);
+    }
   }
 }
 
@@ -327,11 +473,14 @@ TEST(PatternRewriterTests, PriorityAcrossInterleavedStructuralGroups) {
     };
     Pattern p;
     auto input = p.Input();
-    auto first = p.Op({"Identity", "", {16}}, {input});
-    auto second = p.Op({"Identity", "", {16}}, {first});
-    p.Op({"Identity", "", {16}}, {second});
-    Rule higher_priority{"higher_priority", p, [](const Graph&, const Match&) { return true; },
-                         [input](const Graph&, const Match&) { return Replacement{"Identity", "", 16, {input}, {}}; }};
+    auto first = p.Op({"Identity", ""}, {input});
+    auto second = p.Op({"Identity", ""}, {first});
+    p.Op({"Identity", ""}, {second});
+    Rule higher_priority{"higher_priority",
+                         p,
+                         {{kOnnxDomain, 1, 21}},
+                         [](const Graph&, const Match&) { return true; },
+                         [input](const Graph&, const Match&) { return Replacement{"Identity", "", {input}, {}}; }};
     Statistics stats;
     ASSERT_STATUS_OK(
         PatternRewriter({rejected, higher_priority, lower_priority}, {.indexed = indexed}).Run(test.graph, stats));
@@ -368,7 +517,7 @@ TEST(PatternRewriterTests, LayerAnnotationsAndRootConsumers) {
   }
 }
 
-TEST(PatternRewriterTests, MultiOutputAndVersionRejection) {
+TEST(PatternRewriterTests, MultiOutputRejection) {
   TestGraph test;
   auto& b = test.builder;
   auto* x = b.MakeInput<float>({2}, -1.0f, 1.0f);
@@ -379,33 +528,13 @@ TEST(PatternRewriterTests, MultiOutputAndVersionRejection) {
   ASSERT_STATUS_OK(test.graph.Resolve());
   Pattern p;
   auto input = p.Input();
-  auto identity = p.Op({"Identity", "", {16}}, {input});
-  p.Op({"Dropout", "", {13}}, {identity});
+  auto identity = p.Op({"Identity", ""}, {input});
+  p.Op({"Dropout", ""}, {identity});
   auto rule = IdentityPair();
   rule.pattern = p;
   Statistics stats;
   ASSERT_STATUS_OK(PatternRewriter({rule}).Run(test.graph, stats));
   EXPECT_EQ(stats.rewrites, 0u);
-  for (bool indexed : {false, true}) {
-    for (int scenario = 0; scenario < 3; ++scenario) {
-      TestGraph versions;
-      auto* input_value = versions.builder.MakeInput<float>({2}, -1.0f, 1.0f);
-      auto* middle = versions.builder.MakeIntermediate();
-      versions.builder.AddNode("Identity", {input_value}, {middle});
-      versions.builder.AddNode("Identity", {middle}, {versions.builder.MakeOutput()});
-      versions.builder.SetGraphOutputs();
-      ASSERT_STATUS_OK(versions.graph.Resolve());
-      Pattern pattern;
-      auto value = pattern.Input();
-      auto first = pattern.Op({"Identity", "", {scenario == 0 ? 1 : 16}}, {value});
-      pattern.Op({"Identity", "", {scenario == 1 ? 1 : 16}}, {first});
-      rule = IdentityPair();
-      rule.pattern = pattern;
-      ASSERT_STATUS_OK(PatternRewriter({rule}, {.indexed = indexed}).Run(versions.graph, stats));
-      EXPECT_EQ(stats.rewrites, scenario == 2 ? 1u : 0u);
-      ASSERT_STATUS_OK(versions.graph.Resolve());
-    }
-  }
 }
 
 TEST(PatternRewriterTests, NumericalMultiOutputLeafPreservation) {
@@ -458,11 +587,14 @@ TEST(PatternRewriterTests, BranchedSharedNodeBindings) {
     ASSERT_STATUS_OK(test.graph.Resolve());
     Pattern p;
     auto px = p.Input(), py = p.Input();
-    auto psum = p.Op({"Add", "", {14}}, {px, py});
-    auto pproduct = p.Op({"Mul", "", {14}}, {psum, px});
-    p.Op({"Add", "", {14}}, {psum, pproduct});
-    Rule rule{"diamond", p, [](const Graph&, const Match&) { return true; },
-              [](const Graph&, const Match&) { return Replacement{"Identity", "", 16, {0}, {}}; }};
+    auto psum = p.Op({"Add", ""}, {px, py});
+    auto pproduct = p.Op({"Mul", ""}, {psum, px});
+    p.Op({"Add", ""}, {psum, pproduct});
+    Rule rule{"diamond",
+              p,
+              {{kOnnxDomain, 7, 21}},
+              [](const Graph&, const Match&) { return true; },
+              [](const Graph&, const Match&) { return Replacement{"Identity", "", {0}, {}}; }};
     Statistics stats;
     // Structural-only test: this deliberately has no semantically equivalent replacement.
     ASSERT_STATUS_OK(PatternRewriter({rule}, {.match_only = true}).Run(test.graph, stats));
@@ -700,9 +832,9 @@ TEST(PatternRewriterBenchmark, DISABLED_Decoder) {
                 auto input = pattern.Input();
                 auto value = input;
                 for (size_t bit = 0; bit < 9; ++bit) {
-                  value = pattern.Op({(i & (size_t{1} << bit)) ? "Tanh" : "Sigmoid", "", {6, 13}}, {value});
+                  value = pattern.Op({(i & (size_t{1} << bit)) ? "Tanh" : "Sigmoid", ""}, {value});
                 }
-                pattern.Op({"Mul", "", {7, 13, 14}}, {input, value});
+                pattern.Op({"Mul", ""}, {input, value});
                 rule.pattern = std::move(pattern);
                 rule.guard = [](const Graph&, const Match&) { return false; };
               }

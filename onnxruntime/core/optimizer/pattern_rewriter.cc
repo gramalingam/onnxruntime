@@ -13,16 +13,13 @@ namespace onnxruntime {
 namespace rewrite {
 namespace {
 
-std::string Key(const std::string& op, const std::string& domain, int version) {
-  return domain + '\0' + op + '\0' + std::to_string(version);
-}
+std::string Key(const std::string& op, const std::string& domain) { return domain + '\0' + op; }
 
 std::string Signature(const Pattern& pattern) {
   std::ostringstream stream;
   stream << pattern.ValueCount() << ':';
   for (const auto& node : pattern.Nodes()) {
     stream << node.op.domain.size() << ':' << node.op.domain << node.op.name.size() << ':' << node.op.name;
-    for (int version : node.op.versions) stream << ':' << version;
     stream << '/' << node.output;
     for (Value input : node.inputs) stream << ',' << input;
     stream << ';';
@@ -36,8 +33,7 @@ bool MatchPattern(const Pattern& pattern, const Graph& graph, const Node& root, 
                   Match& match) {
   const auto& root_op = pattern.Nodes().back().op;
   // Cheap root rejection precedes binding allocation in the reference implementation too.
-  if (root.OpType() != root_op.name || root.Domain() != root_op.domain ||
-      std::find(root_op.versions.begin(), root_op.versions.end(), root.SinceVersion()) == root_op.versions.end()) {
+  if (root.OpType() != root_op.name || root.Domain() != root_op.domain) {
     return false;
   }
   match.values.assign(pattern.ValueCount(), nullptr);
@@ -52,12 +48,9 @@ bool MatchPattern(const Pattern& pattern, const Graph& graph, const Node& root, 
       if (it != producers.end()) node = graph.GetNode(it->second);
     }
     if (!node || !distinct.insert(node->Index()).second || node->OpType() != expected.op.name ||
-        node->Domain() != expected.op.domain ||
-        std::find(expected.op.versions.begin(), expected.op.versions.end(), node->SinceVersion()) ==
-            expected.op.versions.end() ||
-        node->InputDefs().size() != expected.inputs.size() || node->OutputDefs().size() != 1 ||
-        !node->GetAttributeNameToSubgraphMap().empty() || !node->ImplicitInputDefs().empty() ||
-        node->GetLayeringAnnotation() != root.GetLayeringAnnotation() ||
+        node->Domain() != expected.op.domain || node->InputDefs().size() != expected.inputs.size() ||
+        node->OutputDefs().size() != 1 || !node->GetAttributeNameToSubgraphMap().empty() ||
+        !node->ImplicitInputDefs().empty() || node->GetLayeringAnnotation() != root.GetLayeringAnnotation() ||
         node->GetExecutionProviderType() != root.GetExecutionProviderType()) {
       return false;
     }
@@ -90,8 +83,9 @@ bool MatchPattern(const Pattern& pattern, const Graph& graph, const Node& root, 
 
 Status Replace(Graph& graph, const Pattern& pattern, const Match& match, const Replacement& recipe,
                Producers& producers, NodeIndex& added) {
-  auto imported = graph.DomainToVersionMap().find(recipe.domain);
-  ORT_RETURN_IF(imported == graph.DomainToVersionMap().end(), "Replacement domain is not imported: ", recipe.domain);
+  const auto& domain = recipe.domain == kOnnxDomainAlias ? kOnnxDomain : recipe.domain;
+  auto imported = graph.DomainToVersionMap().find(domain);
+  ORT_RETURN_IF(imported == graph.DomainToVersionMap().end(), "Replacement domain is not imported: ", domain);
   InlinedVector<NodeArg*> inputs;
   for (Value value : recipe.inputs) {
     ORT_RETURN_IF(value >= match.values.size() || !pattern.IsInput(value),
@@ -101,11 +95,11 @@ Status Replace(Graph& graph, const Pattern& pattern, const Match& match, const R
   const Node& root = *match.nodes.back();
   NodeArg* output = graph.GetNodeArg(root.OutputDefs()[0]->Name());
   Node& replacement = graph.AddNode(graph.GenerateNodeName("rewrite"), recipe.op, "PatternRewriter", inputs, {output},
-                                    root, &recipe.attributes, recipe.domain);
+                                    root, &recipe.attributes, domain);
   // Validate the imported schema before deleting anything.
-  if (!graph.SetOpSchemaFromRegistryForNode(replacement) || replacement.SinceVersion() != recipe.version) {
+  if (!graph.SetOpSchemaFromRegistryForNode(replacement)) {
     graph.RemoveNode(replacement.Index());
-    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Replacement schema/version is unavailable: ", recipe.op);
+    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Replacement schema is unavailable: ", recipe.op);
   }
   ORT_TRY {
     ONNX_NAMESPACE::NodeProto proto;
@@ -163,14 +157,11 @@ Value Pattern::Input() {
 }
 
 Value Pattern::Op(Operator op, std::initializer_list<Value> inputs) {
-  ORT_ENFORCE(!op.name.empty() && !op.versions.empty(), "Pattern operators need a name and explicit schema versions.");
+  ORT_ENFORCE(!op.name.empty(), "Pattern operators need a name.");
   ORT_ENFORCE(nodes_.size() < 64, "Patterns are limited to 64 nodes.");
   ORT_ENFORCE(value_count_ < 256 && inputs.size() <= 64,
               "Patterns are limited to 256 values and 64 inputs per operator.");
   if (op.domain == kOnnxDomainAlias) op.domain = kOnnxDomain;
-  for (int version : op.versions) ORT_ENFORCE(version > 0, "Schema versions must be positive.");
-  std::sort(op.versions.begin(), op.versions.end());
-  op.versions.erase(std::unique(op.versions.begin(), op.versions.end()), op.versions.end());
   for (Value input : inputs) ORT_ENFORCE(input < value_count_, "Pattern inputs must already be defined.");
   Value output = value_count_++;
   nodes_.push_back({std::move(op), InlinedVector<Value>(inputs), output});
@@ -185,9 +176,19 @@ PatternRewriter::PatternRewriter(Rules rules, Options options)
     : GraphTransformer("PatternRewriter"), rules_(std::move(rules)), options_(options) {
   InlinedHashMap<std::string, size_t> signatures;
   for (size_t i = 0; i < rules_.size(); ++i) {
-    const Rule& rule = rules_[i];
+    Rule& rule = rules_[i];
     ORT_ENFORCE(!rule.name.empty() && rule.pattern.Nodes().size() >= 2 && rule.guard && rule.replacement,
                 "Rules need a name, at least two nodes, a guard and a recipe.");
+    InlinedHashSet<std::string> domains;
+    for (auto& requirement : rule.opsets) {
+      if (requirement.domain == kOnnxDomainAlias) requirement.domain = kOnnxDomain;
+      ORT_ENFORCE(requirement.min_version > 0 && requirement.max_version >= requirement.min_version,
+                  "Rule opset requirements need a positive, nonempty inclusive range.");
+      ORT_ENFORCE(domains.insert(requirement.domain).second, "Duplicate rule opset domain: ", requirement.domain);
+    }
+    for (const auto& node : rule.pattern.Nodes()) {
+      ORT_ENFORCE(domains.count(node.op.domain), "Missing rule opset requirement for domain: ", node.op.domain);
+    }
     // Every node must reach the last node. Disconnected definitions are not patterns.
     InlinedHashSet<Value> reachable{rule.pattern.Nodes().back().output};
     for (auto it = rule.pattern.Nodes().rbegin(); it != rule.pattern.Nodes().rend(); ++it) {
@@ -201,9 +202,7 @@ PatternRewriter::PatternRewriter(Rules rules, Options options)
     auto [it, inserted] = signatures.emplace(signature, groups_.size());
     if (inserted) {
       const auto& root = rule.pattern.Nodes().back().op;
-      for (int version : root.versions) {
-        roots_[Key(root.name, root.domain, version)].push_back(groups_.size());
-      }
+      roots_[Key(root.name, root.domain)].push_back(groups_.size());
       groups_.push_back({rule.pattern, {}});
     }
     groups_[it->second].rules.push_back(i);
@@ -213,6 +212,27 @@ PatternRewriter::PatternRewriter(Rules rules, Options options)
 Status PatternRewriter::Run(Graph& graph, Statistics& statistics) const {
   statistics = {};
   ORT_RETURN_IF(graph.GraphResolveNeeded(), "PatternRewriter requires an already resolved graph.");
+  // Import applicability is evaluated once per rule and graph, never per matched node.
+  InlinedVector<char> applicable;
+  InlinedVector<size_t> applicable_rules;
+  for (size_t id = 0; id < rules_.size(); ++id) {
+    bool supported = std::all_of(rules_[id].opsets.begin(), rules_[id].opsets.end(), [&](const auto& requirement) {
+      auto imported = graph.DomainToVersionMap().find(requirement.domain);
+      return imported != graph.DomainToVersionMap().end() && imported->second >= requirement.min_version &&
+             imported->second <= requirement.max_version;
+    });
+    applicable.push_back(supported);
+    if (supported) applicable_rules.push_back(id);
+  }
+  if (applicable_rules.empty()) return Status::OK();
+  InlinedVector<InlinedVector<size_t>, 1> applicable_groups;
+  for (const auto& group : groups_) {
+    InlinedVector<size_t> ids;
+    for (size_t id : group.rules) {
+      if (applicable[id]) ids.push_back(id);
+    }
+    applicable_groups.push_back(std::move(ids));
+  }
   Producers producers;
   InlinedVector<NodeIndex> worklist;
   InlinedHashSet<NodeIndex> queued;
@@ -253,16 +273,17 @@ Status PatternRewriter::Run(Graph& graph, Statistics& statistics) const {
       }
     };
     if (options_.indexed) {
-      auto it = roots_.find(Key(root->OpType(), root->Domain(), root->SinceVersion()));
+      auto it = roots_.find(Key(root->OpType(), root->Domain()));
       if (it != roots_.end()) {
         for (size_t id : it->second) {
           const auto& group = groups_[id];
-          if (!options_.match_only && group.rules.front() >= winner) continue;
-          consider(group.pattern, group.rules);
+          const auto& ids = applicable_groups[id];
+          if (ids.empty() || (!options_.match_only && ids.front() >= winner)) continue;
+          consider(group.pattern, ids);
         }
       }
     } else {
-      for (size_t id = 0; id < rules_.size(); ++id) {
+      for (size_t id : applicable_rules) {
         consider(rules_[id].pattern, gsl::span<const size_t>(&id, 1));
         if (!options_.match_only && winner != std::numeric_limits<size_t>::max()) break;
       }
@@ -276,8 +297,12 @@ Status PatternRewriter::Run(Graph& graph, Statistics& statistics) const {
       if (it != producers.end()) affected.push_back(it->second);
     }
     NodeIndex added;
-    ORT_RETURN_IF_ERROR(Replace(graph, *winning_pattern, winning_match,
-                                rules_[winner].replacement(graph, winning_match), producers, added));
+    auto recipe = rules_[winner].replacement(graph, winning_match);
+    const auto& domain = recipe.domain == kOnnxDomainAlias ? kOnnxDomain : recipe.domain;
+    ORT_RETURN_IF(std::none_of(rules_[winner].opsets.begin(), rules_[winner].opsets.end(),
+                               [&](const auto& requirement) { return requirement.domain == domain; }),
+                  "Replacement domain has no rule opset requirement: ", domain);
+    ORT_RETURN_IF_ERROR(Replace(graph, *winning_pattern, winning_match, recipe, producers, added));
     ++statistics.rewrites;
     affected.push_back(added);
     // A changed producer or use count can affect a deeper pattern root, not just a direct consumer.

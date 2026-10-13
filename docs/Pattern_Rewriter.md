@@ -33,20 +33,22 @@ are the additional capabilities over hand-written selectors.
 
 The small DSL uses integer value handles. An input introduces a variable; an
 operator introduces a single output. Reusing a handle requires the identical
-`NodeArg`, not merely the same shape or equivalent contents. Operators specify
-**schema since-versions**, not model-imported opset numbers.
+`NodeArg`, not merely the same shape or equivalent contents. Pattern operators
+specify only name and domain. **Model-imported opset ranges belong to the rule**,
+not to individual nodes or their schema since-versions.
 
 ```cpp
 using namespace onnxruntime::rewrite;
 Pattern p;
 auto x = p.Input();
-auto h = p.Op({"HardSigmoid", kOnnxDomain, {6}}, {x});
-p.Op({"Mul", kOnnxDomain, {7, 13, 14}}, {h, x});
+auto h = p.Op({"HardSigmoid", kOnnxDomain}, {x});
+p.Op({"Mul", kOnnxDomain}, {h, x});
 Rule rule{
     "HardSigmoidMul", p,
-    guard,  // checks float32, CPU/unassigned, alpha=1/6, beta=1/2, supported opset
+    {{kOnnxDomain, 14, 21}},  // inclusive imported opset range
+    guard,  // checks float32, CPU/unassigned, alpha=1/6, beta=1/2
     [x](const Graph&, const Match&) {
-      return Replacement{"HardSwish", kOnnxDomain, 14, {x}, {}};
+      return Replacement{"HardSwish", kOnnxDomain, {x}, {}};
     }};
 auto transformer = std::make_unique<PatternRewriter>(Rules{rule});
 ORT_RETURN_IF_ERROR(session.RegisterGraphTransformer(std::move(transformer),
@@ -61,6 +63,21 @@ pointers, and must establish semantic equivalence and replacement type/kernel
 compatibility. The engine provides structural and deletion safety; it cannot prove
 an arbitrary callback's mathematical correctness. Guard false means an ordinary
 nonmatch; invalid patterns or recipes report explicit errors.
+
+Each `OpsetRequirement` is `{domain, min_version, max_version}`, with inclusive,
+positive bounds. A rule must declare every domain used by its pattern or
+replacement; additional domain requirements are allowed. All requirements must
+be satisfied by the graph's import map. Missing imports or out-of-range versions
+make the whole rule inapplicable, before matching or guards. Duplicate domains
+(including `""`/`"ai.onnx"` aliases), reversed ranges and undeclared pattern
+domains are rejected when compiling rules.
+
+For example, MatMul/Div to FusedMatMul declares
+`{{kOnnxDomain, 9, 21}, {kMSDomain, 1, 1}}`. The standard-domain nodes use the
+model's ONNX import; the replacement uses the existing Microsoft-domain import.
+Rule authors are responsible for equivalence throughout the declared ranges.
+The engine neither derives nor compares node schema since-versions. Replacement
+schemas are resolved normally from imports and validated before deletion.
 
 `Apply` recurses into subgraphs and resolves the graph through the normal ORT
 transformer wrapper. For diagnostics and separate engine/Resolve timing:
@@ -77,19 +94,28 @@ immutable and per-call state/statistics are local.
 
 ## Compilation, matching, mutation, and termination
 
-Construction validates connected acyclic definitions, used inputs, explicit
-versions, and limits of 64 nodes, 256 values and 64 inputs per operator.
-It buckets groups by root op/domain/schema-version and
-interns identical structural signatures, including versions and binding identities.
+Construction validates connected acyclic definitions, used inputs, rule-level
+domain/opset requirements, and limits of 64 nodes, 256 values and 64 inputs per operator.
+It buckets groups by root op/domain and interns identical structural signatures,
+including binding identities but not rule-level import ranges.
 Rules with identical topology but different attribute/constant conditions share
-one structural match. There is **no arbitrary-prefix trie**: different structural
+one structural match, even when their applicability ranges differ.
+There is **no arbitrary-prefix trie**: different structural
 plans still match independently. This is intentionally a simpler, measurable
 starting point than a decision DAG compiler.
 
-Each call builds a producer index and topological worklist once. Matching walks
+Each call filters rules once against `Graph::DomainToVersionMap()`, retaining
+registration order within each structural group. No applicability state is cached
+across graphs; recursive subgraph calls use their own graph import context.
+Filtering costs the sum of rule requirement counts, outside the node traversal.
+If no rules apply, the call returns without traversing nodes. Model-local function
+rewriting remains unsupported; future function rewriting must use that function's
+imports, not the enclosing model's.
+
+The call then builds a producer index and topological worklist once. Matching walks
 the compiled node definitions backward without recursive search, alternation,
 commutative backtracking, or unbounded neighborhood exploration. Each node checks
-op/domain/version, exact input count, one output, repeated bindings, provider and
+op/domain, exact input count, one output, repeated bindings, provider and
 layer annotation agreement. All non-root outputs must be internal: graph outputs,
 external consumers (including implicit subgraph captures), and pattern inputs
 produced inside the deletion set prevent replacement.
@@ -98,8 +124,8 @@ Registration order defines priority even across different structural groups.
 Match-only mode reports all passing rule guards; rewrite mode selects only the
 first passing rule. Replacements may consume **only input variables**, retain the
 root's output `NodeArg` (name/type/shape and external users), and inherit its
-execution provider and layer annotation. The domain must already be imported and
-the imported schema's since-version must match the recipe. Schema/attribute checks
+execution provider and layer annotation. The replacement domain must be declared
+in the rule requirements and already imported. Replacement schema/attribute checks
 precede deletion. ORT edges and producer/consumer indexes are updated; removed
 nodes are reported via `NotifyNodeReplacement`. Final Resolve validates types and
 inferred shapes, rather than silently ignoring graph-validation errors.
@@ -121,7 +147,7 @@ root bucket and P the maximum pattern size. Structure work is bounded by the
 sum over visited roots of U times pattern/boundary checking cost, plus passing
 plan guard costs. Boundary checks include matched-node fanout; they are not
 constant-time. The reference mode performs the same checks per rule instead,
-with cheap root op/domain/version rejection before allocating binding buffers.
+with cheap root op/domain rejection before allocating binding buffers.
 Rewrite workloads additionally pay edge updates and bounded descendant walks;
 large fanout can make these expensive. Arbitrary trusted guards have no imposed
 time bound. Consequently timings below are empirical observations, never
@@ -143,8 +169,11 @@ The examples support a conservative subset, not every ONNXScript variant:
 RMSNorm requires the last axis, keepdims, positive finite epsilon, float32,
 known positive-width matching one-dimensional scale, and pre-opset-18 attribute
 axes. Transpose requires known rank >=2 and exactly the last-two-axis swap.
-MatMul Div requires a finite nonzero scalar and finite reciprocal. FusedMatMul
-examples require an existing `com.microsoft` opset-1 import; they do not add one.
+RMSNorm declares ONNX opsets 7 through 17. MatMul Div requires a finite nonzero
+scalar and finite reciprocal. The FusedMatMul examples declare ONNX opsets 9
+through 21 and require an existing `com.microsoft` opset-1 import; they do not add
+one. The upper bounds are conservative supported ranges, not inferred schema
+version boundaries; extending them requires reviewing and testing semantics.
 HardSwish requires exact float32 constants/attributes and model opset 14 through
 21. The tested CPU build executes HardSwish by expanding its ONNX function body
 to HardSigmoid/Mul; RMSNorm and FusedMatMul execute native CPU kernels.
@@ -225,8 +254,8 @@ For one rule, RMSNorm is selected; active examples rotate consistently thereafte
 
 Rule creation/compilation, engine execution, and final Resolve are separately
 timed with `steady_clock`. Generation, model copying/loading, initial Resolve,
-and random feeds are excluded. Engine time includes producer-index/worklist
-creation, structural matching, guards, boundary checks, edge mutation and
+and random feeds are excluded. Engine time includes per-graph rule import filtering,
+producer-index/worklist creation, structural matching, guards, boundary checks, edge mutation and
 invalidation; it excludes final Resolve. The timed graphs use an error-severity
 logger to exclude unused-initializer warning I/O, without suppressing failed
 statuses. Read-only Resolve is usually a no-op.
