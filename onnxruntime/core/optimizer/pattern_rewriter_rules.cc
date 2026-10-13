@@ -120,12 +120,23 @@ Rules MakeExampleRules() {
       float alpha = it == m.nodes[0]->GetAttributes().end() ? 1.0f : it->second.f();
       return Float32(m) && scalar && *scalar != 0.0f && std::isfinite(alpha / *scalar);
     };
-    auto replacement = [](const Graph& graph, const Match& m) {
-      auto attributes = m.nodes[0]->GetAttributes();
+    Replacement plan(R"(
+      (x, y, alpha, transA, transB, transBatchA, transBatchB) =>
+        com.microsoft.FusedMatMul(x, y, alpha=alpha, transA=transA, transB=transB,
+                                 transBatchA=transBatchA, transBatchB=transBatchB)
+    )");
+    auto replacement = [plan](const Graph& graph, const Match& m) {
+      const auto& node = *m.nodes[0];
+      const auto& attributes = node.GetAttributes();
       auto it = attributes.find("alpha");
       float alpha = it == attributes.end() ? 1.0f : it->second.f();
-      attributes["alpha"] = FloatAttribute("alpha", alpha / *Scalar(graph, *m.valueOf("divisor")));
-      return Replacement{"FusedMatMul", kMSDomain, {m.valueOf("x"), m.valueOf("y")}, std::move(attributes)};
+      m.update("alpha", FloatAttribute("alpha", alpha / *Scalar(graph, *m.valueOf("divisor"))));
+      for (const char* name : {"transA", "transB", "transBatchA", "transBatchB"}) {
+        auto attribute = attributes.find(name);
+        m.update(name, attribute == attributes.end() ? node.Op()->attributes().at(name).default_value
+                                                     : attribute->second);
+      }
+      return plan;
     };
     Rule rule{"FusedMatMulDiv", p, {{kOnnxDomain, 9, 21}, {kMSDomain, 1, 1}}, guard, replacement};
     rules.push_back(std::move(rule));

@@ -325,10 +325,14 @@ callbacks must establish semantic/type compatibility; extra bindings are not
 an automatic semantic guard or a general graph transaction.
 
 The MatMulDiv and RMSNorm examples use captured plans with computed bindings.
-TransposeMatMul uses a literal parsed replacement. FusedMatMulDiv deliberately
-retains its programmatic recipe to preserve **all** original attributes, including
-transpose/batch settings; extra bindings describe individual attributes, not
-an attribute-map spread.
+TransposeMatMul uses a literal parsed replacement. FusedMatMulDiv also captures
+a parsed plan, computing `alpha` and binding `transA`, `transB`, `transBatchA`
+and `transBatchB` from the original node. Missing transpose attributes use the
+imported schema's defaults; the replacement emits all five version-1 attributes
+explicitly, preserving their effective values. All six examples therefore use
+parsed replacements. Extra bindings describe individual attributes, not an
+attribute-map spread; a rule for a schema with other attributes must explicitly
+preserve those too.
 
 Every replacement must contain at least one node and **strictly fewer nodes
 than the matched pattern**. Equal-size rewrites and expansions are rejected,

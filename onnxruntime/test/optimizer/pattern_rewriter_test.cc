@@ -1875,6 +1875,50 @@ TEST(PatternRewriterTests, NumericalMatMulDivAndTranspose) {
   }
 }
 
+TEST(PatternRewriterTests, NumericalFusedMatMulDivPreservesAttributes) {
+  for (bool indexed : {false, true}) {
+    for (int scenario = -1; scenario < 16; ++scenario) {
+      SCOPED_TRACE(scenario);
+      const int flags = std::max(scenario, 0);
+      auto build = [scenario, flags](ModelTestBuilder& b) {
+        auto input_shape = [flags](std::vector<int64_t> shape, int transpose, int transpose_batch) {
+          if (flags & transpose) std::swap(shape[1], shape[2]);
+          if (flags & transpose_batch) std::swap(shape[0], shape[1]);
+          return shape;
+        };
+        auto* x = b.MakeInput<float>(input_shape({2, 3, 4}, 1, 4), -1.0f, 1.0f);
+        auto* y = b.MakeInput<float>(input_shape({2, 4, 5}, 2, 8), -1.0f, 1.0f);
+        auto* mm = b.MakeIntermediate();
+        auto& node = b.AddNode("FusedMatMul", {x, y}, {mm}, kMSDomain);
+        if (scenario >= 0) {
+          node.AddAttribute("alpha", -1.5f);
+          node.AddAttribute("transA", int64_t{(flags & 1) != 0});
+          node.AddAttribute("transB", int64_t{(flags & 2) != 0});
+          node.AddAttribute("transBatchA", int64_t{(flags & 4) != 0});
+          node.AddAttribute("transBatchB", int64_t{(flags & 8) != 0});
+        }
+        b.AddNode("Div", {mm, b.MakeScalarInitializer<float>(2.0f)}, {b.MakeOutput()});
+      };
+      auto check = [scenario, flags](InferenceSessionWrapper& session) {
+        EXPECT_EQ(Count(session.GetGraph(), "FusedMatMul"), 1u);
+        EXPECT_EQ(Count(session.GetGraph(), "Div"), 0u);
+        for (const auto& node : session.GetGraph().Nodes()) {
+          if (node.OpType() != "FusedMatMul") continue;
+          const auto& attributes = node.GetAttributes();
+          EXPECT_FLOAT_EQ(attributes.at("alpha").f(), scenario < 0 ? 0.5f : -0.75f);
+          EXPECT_EQ(attributes.at("transA").i(), (flags & 1) != 0);
+          EXPECT_EQ(attributes.at("transB").i(), (flags & 2) != 0);
+          EXPECT_EQ(attributes.at("transBatchA").i(), (flags & 4) != 0);
+          EXPECT_EQ(attributes.at("transBatchB").i(), (flags & 8) != 0);
+        }
+      };
+      Rule rule = MakeExampleRules()[4];
+      TransformerTester(build, check, TransformerLevel::Default, TransformerLevel::Level1, 17, 1e-6, 1e-5,
+                        std::make_unique<PatternRewriter>(Rules{std::move(rule)}, Options{.indexed = indexed}));
+    }
+  }
+}
+
 TEST(PatternRewriterTests, RmsConstantAndAttributeGuards) {
   for (int scenario = 0; scenario < 4; ++scenario) {
     TestGraph test;

@@ -149,7 +149,8 @@ All timings and extrapolations are empirical, never worst-case guarantees.
 
 ## Runtime attribute-binding follow-up
 
-The extra-binding implementation was measured with the same machine/build,
+The extra-binding implementation at revision `f8477c578b9c12c2fbde8894d37673bf855feaea`
+was measured with the same machine/build,
 decoder topology and 120-group matrix, two warmups and nine repeats.
 Raw results are in
 [Pattern_Rewriter_Extra_Bindings_Benchmark.csv](Pattern_Rewriter_Extra_Bindings_Benchmark.csv)
@@ -215,6 +216,14 @@ Push-Location build\rewriter\Release\Release
 Pop-Location
 .\.venv\Scripts\python.exe tools\ci_build\summarize_rewriter_benchmark.py docs\Pattern_Rewriter_Extra_Bindings_Benchmark.csv
 ```
+
+The subsequent FusedMatMulDiv migration also uses a captured parsed plan, binding
+all five version-1 attributes and using schema defaults for omitted transpose
+settings. The same incremental build and correctness command passed **56 tests**
+(45 rewriter, 11 existing optimizer). The new numerical test verifies all 16
+transpose/batch-transpose combinations, nondefault alpha, and omitted attributes,
+in both indexed and reference modes. The raw timing tables above predate this
+additional migration; no new performance comparison is claimed for it.
 
 ## Configuration and scope
 
