@@ -54,12 +54,6 @@ bool Integer(const Node& node, const char* name, int64_t value) {
   return it != node.GetAttributes().end() && it->second.type() == ONNX_NAMESPACE::AttributeProto_AttributeType_INT &&
          it->second.i() == value;
 }
-
-bool Float(const Node& node, const char* name, float value) {
-  auto it = node.GetAttributes().find(name);
-  return it != node.GetAttributes().end() && it->second.type() == ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT &&
-         it->second.f() == value;
-}
 }  // namespace
 
 Rules MakeExampleRules() {
@@ -85,14 +79,12 @@ Rules MakeExampleRules() {
     Pattern p;
     auto x = p.Input();
     auto sigmoid = p.Op("HardSigmoid", {x});
+    p.Attributes({AttributeMatcher::Equal("alpha", 1.0f / 6.0f), AttributeMatcher::Equal("beta", 0.5f)});
     p.Op("Mul", {sigmoid, x});
     rules.push_back({"HardSigmoidMul",
                      p,
                      {{kOnnxDomain, 14, 21}},
-                     [](const Graph&, const Match& m) {
-                       return Float32(m) && Float(*m.nodes[0], "alpha", 1.0f / 6.0f) &&
-                              Float(*m.nodes[0], "beta", 0.5f);
-                     },
+                     [](const Graph&, const Match& m) { return Float32(m); },
                      [=](const Graph&, const Match&) { return Replacement{"HardSwish", kOnnxDomain, {x}, {}}; }});
   }
 #ifndef DISABLE_CONTRIB_OPS

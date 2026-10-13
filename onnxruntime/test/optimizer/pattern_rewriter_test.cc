@@ -297,6 +297,261 @@ TEST(PatternRewriterTests, HardSigmoidAttributeGuard) {
   }
 }
 
+TEST(PatternRewriterTests, NamedValuesAndAttributePredicates) {
+  Pattern p;
+  auto x = p.Input("x");
+  auto first = p.Op("HardSigmoid", {x});
+  p.Name(first, "sigmoid");
+  p.Attributes({AttributeMatcher::Equal("alpha", 0.25f),
+                {"beta", [](const auto& attr) {
+                   return attr.type() == ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT && attr.f() > 0.4f;
+                 }}});
+  p.Op("Mul", {first, x});
+  EXPECT_EQ(x.name, "x");
+  EXPECT_EQ(x.handle, 0);
+  EXPECT_EQ(p.NamedValue("sigmoid").handle, first.handle);
+  EXPECT_EQ(p.Nodes()[0].outputs[0].name, "sigmoid");
+  EXPECT_EQ(p.Nodes()[1].inputs[0].name, "sigmoid");
+  EXPECT_THROW(p.Input("x"), OnnxRuntimeException);
+  EXPECT_THROW(p.NamedValue("missing"), OnnxRuntimeException);
+  EXPECT_THROW(p.Name(x, "sigmoid"), OnnxRuntimeException);
+  EXPECT_THROW(p.Op("Identity", {Value{-1}}), OnnxRuntimeException);
+  auto integer = AttributeMatcher::Equal("axis", int64_t{1});
+  auto string = AttributeMatcher::Equal("mode", std::string("linear"));
+  ONNX_NAMESPACE::AttributeProto attr;
+  attr.set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_INT);
+  attr.set_i(1);
+  EXPECT_TRUE(integer.Matches(attr));
+  EXPECT_FALSE(string.Matches(attr));
+  attr.set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_STRING);
+  attr.set_s("linear");
+  EXPECT_TRUE(string.Matches(attr));
+  EXPECT_FALSE(integer.Matches(attr));
+  for (bool indexed : {false, true}) {
+    for (int scenario = 0; scenario < 4; ++scenario) {
+      TestGraph test;
+      auto* input = test.builder.MakeInput<float>({2}, -1.0f, 1.0f);
+      auto* output = test.builder.MakeIntermediate();
+      auto& sigmoid = test.builder.AddNode("HardSigmoid", {input}, {output});
+      if (scenario != 3) sigmoid.AddAttribute("alpha", scenario == 1 ? 0.2f : 0.25f);
+      sigmoid.AddAttribute("beta", scenario == 2 ? 0.3f : 0.5f);
+      test.builder.AddNode("Mul", {output, input}, {test.builder.MakeOutput()});
+      test.builder.SetGraphOutputs();
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      auto rule = IdentityPair();
+      rule.pattern = p;
+      Statistics stats;
+      ASSERT_STATUS_OK(PatternRewriter({rule}, {.match_only = true, .indexed = indexed}).Run(test.graph, stats));
+      EXPECT_EQ(stats.matches, scenario == 0 ? 1u : 0u);
+    }
+  }
+}
+
+TEST(PatternRewriterTests, ParsedHardSwishConstantsAndExecution) {
+  constexpr auto text = R"(
+    (x, low, high, divisor) =>
+      add = Add(x, 3.0)
+      clip = Clip(add, low, high)
+      mul = Mul(clip, x)
+      return Div(mul, divisor)
+  )";
+  Pattern parsed;
+  ASSERT_STATUS_OK(Pattern::Parse(text, parsed));
+  EXPECT_EQ(parsed.NamedValue("x").name, "x");
+  EXPECT_EQ(parsed.NamedValue("low").handle, 1);
+  EXPECT_EQ(parsed.NamedValue("divisor").handle, 3);
+  EXPECT_EQ(parsed.Nodes()[0].outputs[0].name, "add");
+  EXPECT_EQ(parsed.Constants().size(), 1u);
+  auto semantic_guard = [guard = MakeExampleRules()[0].guard](const Graph& graph, const Match& match) {
+    auto remapped = match;
+    remapped.values[1] = match.values[4];  // Original rule orders leaves as x, bias, low, high, divisor.
+    remapped.values[2] = match.values[1];
+    remapped.values[3] = match.values[2];
+    remapped.values[4] = match.values[3];
+    return guard(graph, remapped);
+  };
+  for (bool indexed : {false, true}) {
+    for (int scenario = 0; scenario < 4; ++scenario) {
+      TestGraph test;
+      BuildHardSwish(test.builder);
+      test.builder.SetGraphOutputs();
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      NodeArg* bias = nullptr;
+      for (auto& node : test.graph.Nodes()) {
+        if (node.OpType() == "Add") bias = node.MutableInputDefs()[1];
+      }
+      ASSERT_NE(bias, nullptr);
+      if (scenario == 1) {
+        const auto* tensor = test.graph.GetInitializer(bias->Name(), false);
+        ASSERT_NE(tensor, nullptr);
+        auto updated = *tensor;
+        updated.clear_raw_data();
+        updated.clear_float_data();
+        updated.add_float_data(4.0f);
+        test.graph.RemoveInitializedTensor(bias->Name());
+        test.graph.AddInitializedTensor(updated);
+        ASSERT_STATUS_OK(test.graph.Resolve());
+      }
+      if (scenario == 2) {
+        auto inputs = test.graph.GetInputsIncludingInitializers();
+        inputs.push_back(bias);
+        test.graph.SetInputs(inputs);
+        ASSERT_STATUS_OK(test.graph.Resolve());
+      }
+      if (scenario == 3) {
+        for (auto& node : test.graph.Nodes()) {
+          if (node.OpType() == "Mul") node.MutableInputDefs()[1] = node.MutableInputDefs()[0];
+        }
+        ASSERT_STATUS_OK(test.graph.Resolve());
+      }
+      auto rule = MakeExampleRules()[0];
+      rule.pattern = parsed;
+      rule.guard = semantic_guard;
+      auto x = parsed.NamedValue("x");
+      rule.replacement = [x](const Graph&, const Match&) { return Replacement{"HardSwish", "", {x}, {}}; };
+      Statistics stats;
+      ASSERT_STATUS_OK(PatternRewriter({rule}, {.indexed = indexed}).Run(test.graph, stats));
+      EXPECT_EQ(stats.rewrites, scenario == 0 ? 1u : 0u);
+      ASSERT_STATUS_OK(test.graph.Resolve());
+    }
+  }
+  auto rule = MakeExampleRules()[0];
+  rule.pattern = parsed;
+  rule.guard = semantic_guard;
+  auto x = parsed.NamedValue("x");
+  rule.replacement = [x](const Graph&, const Match&) { return Replacement{"HardSwish", "", {x}, {}}; };
+  TransformerTester([](ModelTestBuilder& b) { BuildHardSwish(b); },
+                    [](InferenceSessionWrapper& session) {
+                      EXPECT_EQ(Count(session.GetGraph(), "HardSigmoid"), 1u);
+                      EXPECT_EQ(Count(session.GetGraph(), "Clip"), 0u);
+                    },
+                    TransformerLevel::Default, TransformerLevel::Level1, 17, 1e-6, 1e-5,
+                    std::make_unique<PatternRewriter>(Rules{rule}));
+}
+
+TEST(PatternRewriterTests, ParsedAttributesMultiOutputsAndDomains) {
+  for (bool indexed : {false, true}) {
+    Pattern split;
+    ASSERT_STATUS_OK(Pattern::Parse("(x) => a, b = Split(x, axis = 0); return Concat(a, b, axis = 0)", split));
+    auto rule = SplitConcat();
+    rule.pattern = split;
+    rule.replacement = [x = split.NamedValue("x")](const Graph&, const Match&) {
+      return Replacement{"Identity", "", {x}, {}};
+    };
+    TestGraph test;
+    auto* x = test.builder.MakeInput<float>({4}, -1.0f, 1.0f);
+    auto* a = test.builder.MakeIntermediate();
+    auto* b = test.builder.MakeIntermediate();
+    test.builder.AddNode("Split", {x}, {a, b}).AddAttribute("axis", int64_t{0});
+    test.builder.AddNode("Concat", {a, b}, {test.builder.MakeOutput()}).AddAttribute("axis", int64_t{0});
+    test.builder.SetGraphOutputs();
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    Statistics stats;
+    ASSERT_STATUS_OK(PatternRewriter({rule}, {.indexed = indexed}).Run(test.graph, stats));
+    EXPECT_EQ(stats.rewrites, 1u);
+    ASSERT_STATUS_OK(test.graph.Resolve());
+  }
+  Pattern p;
+  ASSERT_STATUS_OK(
+      Pattern::Parse("(x, y) => a = com.microsoft::FusedMatMul(x, y, alpha=+1.0e-1); return Identity(a)", p));
+  EXPECT_EQ(p.Nodes()[0].op.domain, kMSDomain);
+  EXPECT_EQ(p.Nodes()[0].attributes.size(), 1u);
+  ASSERT_STATUS_OK(Pattern::Parse("(x) => a = Identity(x, mode='linear'); return Identity(a)", p));
+  ONNX_NAMESPACE::AttributeProto attr;
+  attr.set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_STRING);
+  attr.set_s("linear");
+  EXPECT_TRUE(p.Nodes()[0].attributes[0].Matches(attr));
+  Pattern original;
+  auto x = original.Input("x");
+  original.Op("Identity", {x});
+  for (auto text :
+       {"(x,x)=>return Identity(x)", "(x)=>return Identity(y)", "(x)=>a=Identity(x)",
+        "(x)=>a=Identity(x);return Identity(a);extra", "(x)=>a=Identity(x);return Add(a, 1e999)",
+        "(x)=>a=Identity(x);return Add(a, 9223372036854775808)", "(x)=>a=Identity(x);return Add(a, 1.2.3)",
+        "(x)=>a=Identity(x);return Identity(a, mode='bad)", "(x)=>a=Identity(x);return Identity(a, axis=1, axis=2)",
+        "(x)=>a=Identity(x);return Add(axis=1, a)", "(x)=>a=Identity(x);return Identity(a,) ",
+        "(x)=>a=Identity(x);return Identity(a, axis=[1])", "(x,y)=>return Identity(x)",
+        "(x)=>a=Identity(x);return Identity(x)", "(x)=>x=Identity(x);return Identity(x)",
+        "(x)=>a=Identity(x);return Identity(a) ''", "(x)=>'return' Identity(x)", "(x)=>return Identity(x ')'"}) {
+    auto status = Pattern::Parse(text, original);
+    EXPECT_FALSE(status.IsOK()) << text;
+    EXPECT_NE(status.ErrorMessage().find("byte"), std::string::npos);
+    EXPECT_EQ(original.Nodes().size(), 1u);
+    EXPECT_EQ(original.NamedValue("x").handle, 0);
+  }
+  ASSERT_STATUS_OK(Pattern::Parse("(x)=>a=Identity(x, mode='');return Identity(a)", p));
+  attr.set_s("");
+  EXPECT_TRUE(p.Nodes()[0].attributes[0].Matches(attr));
+  std::string excessive = "(x)=>";
+  for (int i = 0; i < 65; ++i)
+    excessive += "v" + std::to_string(i) + "=Identity(" + (i == 0 ? "x" : "v" + std::to_string(i - 1)) + ");";
+  excessive += "return Identity(v64)";
+  EXPECT_FALSE(Pattern::Parse(excessive, original).IsOK());
+}
+
+TEST(PatternRewriterTests, LiteralTypeAndRankMatching) {
+  for (bool indexed : {false, true}) {
+    for (int scenario = 0; scenario < 3; ++scenario) {
+      TestGraph test;
+      auto* x = test.builder.MakeInput<int64_t>({2}, 0, 5);
+      auto* intermediate = test.builder.MakeIntermediate();
+      auto* literal = scenario == 1 ? test.builder.MakeInitializer<int64_t>({1}, {3})
+                                    : test.builder.MakeScalarInitializer<int64_t>(scenario == 2 ? 4 : 3);
+      test.builder.AddNode("Add", {x, literal}, {intermediate});
+      test.builder.AddNode("Identity", {intermediate}, {test.builder.MakeOutput()});
+      test.builder.SetGraphOutputs();
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      auto rule = IdentityPair();
+      ASSERT_STATUS_OK(Pattern::Parse("(x)=>a=Add(x,3);return Identity(a)", rule.pattern));
+      Statistics stats;
+      ASSERT_STATUS_OK(PatternRewriter({rule}, {.match_only = true, .indexed = indexed}).Run(test.graph, stats));
+      EXPECT_EQ(stats.matches, scenario == 0 ? 1u : 0u);
+      ASSERT_STATUS_OK(Pattern::Parse("(x)=>a=Add(x,3.0);return Identity(a)", rule.pattern));
+      ASSERT_STATUS_OK(PatternRewriter({rule}, {.match_only = true, .indexed = indexed}).Run(test.graph, stats));
+      EXPECT_EQ(stats.matches, 0u);
+    }
+  }
+  Pattern p;
+  auto integer = p.Constant(3);
+  auto floating = p.Constant(3.0);
+  EXPECT_TRUE(std::holds_alternative<int64_t>(p.Constants().at(integer)));
+  EXPECT_TRUE(std::holds_alternative<float>(p.Constants().at(floating)));
+}
+
+TEST(PatternRewriterTests, AttributeAndConstantPlansCannotAlias) {
+  for (bool indexed : {false, true}) {
+    TestGraph test;
+    auto* x = test.builder.MakeInput<float>({2}, -1.0f, 1.0f);
+    auto* a = test.builder.MakeIntermediate();
+    test.builder.AddNode("HardSigmoid", {x}, {a}).AddAttribute("alpha", 0.25f);
+    test.builder.AddNode("Mul", {a, x}, {test.builder.MakeOutput()});
+    test.builder.SetGraphOutputs();
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    auto rejected = IdentityPair(), accepted = IdentityPair();
+    ASSERT_STATUS_OK(Pattern::Parse("(x)=>a=HardSigmoid(x, alpha=0.2);return Mul(a,x)", rejected.pattern));
+    ASSERT_STATUS_OK(Pattern::Parse("(x)=>a=HardSigmoid(x, alpha=0.25);return Mul(a,x)", accepted.pattern));
+    Statistics stats;
+    ASSERT_STATUS_OK(
+        PatternRewriter({rejected, accepted}, {.match_only = true, .indexed = indexed}).Run(test.graph, stats));
+    EXPECT_EQ(stats.matches, 1u);
+    Pattern first, second;
+    ASSERT_STATUS_OK(Pattern::Parse("(x)=>a=Add(x,3.0);return Identity(a)", first));
+    ASSERT_STATUS_OK(Pattern::Parse("(x)=>a=Add(x,4.0);return Identity(a)", second));
+    TestGraph constants;
+    auto* input = constants.builder.MakeInput<float>({2}, -1.0f, 1.0f);
+    auto* intermediate = constants.builder.MakeIntermediate();
+    constants.builder.AddNode("Add", {input, constants.builder.MakeScalarInitializer<float>(4.0f)}, {intermediate});
+    constants.builder.AddNode("Identity", {intermediate}, {constants.builder.MakeOutput()});
+    constants.builder.SetGraphOutputs();
+    ASSERT_STATUS_OK(constants.graph.Resolve());
+    rejected.pattern = first;
+    accepted.pattern = second;
+    ASSERT_STATUS_OK(
+        PatternRewriter({rejected, accepted}, {.match_only = true, .indexed = indexed}).Run(constants.graph, stats));
+    EXPECT_EQ(stats.matches, 1u);
+  }
+}
+
 TEST(PatternRewriterTests, GenericExecutionProviderPolicy) {
   for (bool indexed : {false, true}) {
     for (bool match_only : {false, true}) {

@@ -3,10 +3,15 @@
 #include "core/optimizer/pattern_rewriter.h"
 
 #include <algorithm>
+#include <cctype>
+#include <charconv>
+#include <cmath>
+#include <iterator>
 #include <limits>
 #include <sstream>
 
 #include "core/graph/graph_utils.h"
+#include "core/optimizer/initializer.h"
 #include "onnx/checker.h"
 
 namespace onnxruntime {
@@ -18,6 +23,14 @@ std::string Key(const std::string& op, const std::string& domain) { return domai
 std::string Signature(const Pattern& pattern) {
   std::ostringstream stream;
   stream << pattern.ValueCount() << ':';
+  stream.precision(std::numeric_limits<float>::max_digits10);
+  for (int id = 0; id < static_cast<int>(pattern.ValueCount()); ++id) {
+    auto it = pattern.Constants().find(id);
+    if (it == pattern.Constants().end()) continue;
+    stream << 'c' << id << ':' << it->second.index() << ':';
+    std::visit([&](auto value) { stream << value; }, it->second);
+    stream << ';';
+  }
   for (const auto& node : pattern.Nodes()) {
     stream << node.op.domain.size() << ':' << node.op.domain << node.op.name.size() << ':' << node.op.name;
     stream << '/';
@@ -60,6 +73,10 @@ bool MatchPattern(const Pattern& pattern, const Graph& graph, const Node& root, 
       return false;
     }
     match.nodes[i] = node;
+    for (const auto& attribute : expected.attributes) {
+      auto found = node->GetAttributes().find(attribute.name);
+      if (found == node->GetAttributes().end() || !attribute.Matches(found->second)) return false;
+    }
     for (size_t j = 0; j < expected.outputs.size(); ++j) {
       const NodeArg* output = node->OutputDefs()[j];
       const NodeArg*& binding = match.values[expected.outputs[j]];
@@ -74,10 +91,25 @@ bool MatchPattern(const Pattern& pattern, const Graph& graph, const Node& root, 
     }
   }
   // Input variables must be outside the deletion set, even when aliasing another binding.
-  for (Value value = 0; value < pattern.ValueCount(); ++value) {
+  for (int value = 0; value < static_cast<int>(pattern.ValueCount()); ++value) {
     if (!pattern.IsInput(value)) continue;
     auto it = producers.find(match.values[value]);
     if (it != producers.end() && distinct.count(it->second)) return false;
+  }
+  for (const auto& [handle, expected] : pattern.Constants()) {
+    const auto* tensor = graph_utils::GetConstantInitializer(graph, match.values[handle]->Name());
+    if (!tensor || tensor->dims_size() != 0 ||
+        tensor->data_location() == ONNX_NAMESPACE::TensorProto_DataLocation_EXTERNAL)
+      return false;
+    const bool floating = std::holds_alternative<float>(expected);
+    if (tensor->data_type() !=
+        (floating ? ONNX_NAMESPACE::TensorProto_DataType_FLOAT : ONNX_NAMESPACE::TensorProto_DataType_INT64))
+      return false;
+    Initializer initializer(graph, *tensor, graph.ModelPath());
+    if (initializer.size() != 1) return false;
+    if (floating ? *initializer.data<float>() != std::get<float>(expected)
+                 : *initializer.data<int64_t>() != std::get<int64_t>(expected))
+      return false;
   }
   for (size_t i = 0; i + 1 < match.nodes.size(); ++i) {
     const Node& node = *match.nodes[i];
@@ -103,8 +135,9 @@ Status Replace(Graph& graph, const Pattern& pattern, const Match& match, const R
   ORT_RETURN_IF(imported == graph.DomainToVersionMap().end(), "Replacement domain is not imported: ", domain);
   InlinedVector<NodeArg*> inputs;
   for (Value value : recipe.inputs) {
-    ORT_RETURN_IF(value >= match.values.size() || !pattern.IsInput(value),
-                  "Replacement inputs must be pattern input variables.");
+    ORT_RETURN_IF(
+        value.handle < 0 || static_cast<size_t>(value.handle) >= match.values.size() || !pattern.IsInput(value),
+        "Replacement inputs must be pattern input variables.");
     inputs.push_back(graph.GetNodeArg(match.values[value]->Name()));
   }
   const Node& root = *match.nodes.back();
@@ -169,32 +202,354 @@ Status Replace(Graph& graph, const Pattern& pattern, const Match& match, const R
 }
 }  // namespace
 
-Value Pattern::Input() {
+AttributeMatcher AttributeMatcher::Equal(std::string name, int64_t value) {
+  return {std::move(name), [value](const auto& attribute) {
+            return attribute.type() == ONNX_NAMESPACE::AttributeProto_AttributeType_INT && attribute.i() == value;
+          }};
+}
+
+AttributeMatcher AttributeMatcher::Equal(std::string name, float value) {
+  ORT_ENFORCE(std::isfinite(value), "Attribute float constants must be finite.");
+  return {std::move(name), [value](const auto& attribute) {
+            return attribute.type() == ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT && attribute.f() == value;
+          }};
+}
+
+AttributeMatcher AttributeMatcher::Equal(std::string name, std::string value) {
+  return {std::move(name), [value = std::move(value)](const auto& attribute) {
+            return attribute.type() == ONNX_NAMESPACE::AttributeProto_AttributeType_STRING && attribute.s() == value;
+          }};
+}
+
+Value Pattern::AddValue(std::string_view name) {
   ORT_ENFORCE(value_count_ < 256, "Patterns are limited to 256 values.");
-  return value_count_++;
+  if (!name.empty()) {
+    ORT_ENFORCE(std::none_of(values_.begin(), values_.end(), [&](const auto& value) { return value.name == name; }),
+                "Duplicate pattern value name: ", name);
+  }
+  Value value{std::string(name), static_cast<int>(value_count_++)};
+  values_.push_back(value);
+  return value;
+}
+
+Value Pattern::Input(std::string_view name) { return AddValue(name); }
+
+Value Pattern::Constant(float constant) {
+  ORT_ENFORCE(std::isfinite(constant), "Pattern float constants must be finite.");
+  auto value = AddValue("");
+  constants_.emplace(value.handle, constant);
+  return value;
+}
+
+Value Pattern::Constant(int64_t constant) {
+  auto value = AddValue("");
+  constants_.emplace(value.handle, constant);
+  return value;
+}
+
+Value Pattern::NamedValue(std::string_view name) const {
+  auto it = std::find_if(values_.begin(), values_.end(), [&](const auto& value) { return value.name == name; });
+  ORT_ENFORCE(!name.empty() && it != values_.end(), "Unknown pattern value: ", name);
+  return *it;
+}
+
+void Pattern::Name(Value value, std::string_view name) {
+  ORT_ENFORCE(value.handle >= 0 && static_cast<size_t>(value.handle) < value_count_ && !name.empty(),
+              "Invalid pattern value or empty name.");
+  ORT_ENFORCE(std::none_of(values_.begin(), values_.end(),
+                           [&](const auto& other) { return other.handle != value.handle && other.name == name; }),
+              "Duplicate pattern value name: ", name);
+  values_[value.handle].name = name;
+  for (auto& node : nodes_) {
+    for (auto& output : node.outputs)
+      if (output.handle == value.handle) output.name = name;
+    for (auto& input : node.inputs)
+      if (input.handle == value.handle) input.name = name;
+  }
+}
+
+void Pattern::Attributes(std::initializer_list<AttributeMatcher> matchers) {
+  Attributes(InlinedVector<AttributeMatcher, 1>(matchers));
+}
+
+void Pattern::Attributes(InlinedVector<AttributeMatcher, 1> matchers) {
+  ORT_ENFORCE(!nodes_.empty(), "Attribute matchers require a pattern node.");
+  InlinedHashSet<std::string> names;
+  for (const auto& attr : nodes_.back().attributes) names.insert(attr.name);
+  for (const auto& attr : matchers) {
+    ORT_ENFORCE(!attr.name.empty() && attr.predicate && names.insert(attr.name).second,
+                "Invalid or duplicate attribute matcher: ", attr.name);
+  }
+  auto& target = nodes_.back().attributes;
+  target.insert(target.end(), std::make_move_iterator(matchers.begin()), std::make_move_iterator(matchers.end()));
 }
 
 Value Pattern::Op(Operator op, std::initializer_list<Value> inputs) { return MultiOp(std::move(op), inputs, 1)[0]; }
 
 InlinedVector<Value> Pattern::MultiOp(Operator op, std::initializer_list<Value> inputs, size_t output_count) {
+  return MultiOp(std::move(op), gsl::span<const Value>(inputs.begin(), inputs.size()), output_count);
+}
+
+InlinedVector<Value> Pattern::MultiOp(Operator op, gsl::span<const Value> inputs, size_t output_count) {
   ORT_ENFORCE(!op.name.empty(), "Pattern operators need a name.");
   ORT_ENFORCE(nodes_.size() < 64, "Patterns are limited to 64 nodes.");
   ORT_ENFORCE(output_count > 0 && output_count <= 64, "Pattern operators need between 1 and 64 outputs.");
   ORT_ENFORCE(value_count_ <= 256 - output_count && inputs.size() <= 64,
               "Patterns are limited to 256 values and 64 inputs per operator.");
   if (op.domain == kOnnxDomainAlias) op.domain = kOnnxDomain;
-  for (Value input : inputs) ORT_ENFORCE(input < value_count_, "Pattern inputs must already be defined.");
+  for (Value input : inputs)
+    ORT_ENFORCE(input.handle >= 0 && static_cast<size_t>(input.handle) < value_count_,
+                "Pattern inputs must already be defined.");
   InlinedVector<Value> outputs;
-  for (size_t i = 0; i < output_count; ++i) outputs.push_back(value_count_++);
-  nodes_.push_back({std::move(op), InlinedVector<Value>(inputs), outputs});
+  for (size_t i = 0; i < output_count; ++i) outputs.push_back(AddValue(""));
+  InlinedVector<Value> canonical_inputs;
+  for (Value input : inputs) canonical_inputs.push_back(values_[input.handle]);
+  nodes_.push_back({std::move(op), std::move(canonical_inputs), outputs, {}});
   return outputs;
 }
 
 bool Pattern::IsInput(Value value) const {
+  if (value.handle < 0 || static_cast<size_t>(value.handle) >= value_count_) return false;
   return std::none_of(nodes_.begin(), nodes_.end(), [value](const auto& node) {
     return std::find(node.outputs.begin(), node.outputs.end(), value) != node.outputs.end();
   });
 }
+
+namespace {
+class PatternParser {
+ public:
+  explicit PatternParser(std::string_view text) : text_(text) {}
+
+  Status Parse(Pattern& destination) {
+    ORT_RETURN_IF_ERROR(Next());
+    ORT_RETURN_IF_ERROR(Expect("("));
+    if (token_ != ")") {
+      do {
+        std::string name;
+        ORT_RETURN_IF_ERROR(Identifier(name));
+        ORT_RETURN_IF(symbols_.count(name), Error("duplicate input name"));
+        ORT_RETURN_IF(pattern_.ValueCount() >= 256, Error("too many values"));
+        symbols_.emplace(name, pattern_.Input(name));
+        if (token_ != ",") break;
+        ORT_RETURN_IF_ERROR(Next());
+      } while (true);
+    }
+    ORT_RETURN_IF_ERROR(Expect(")"));
+    ORT_RETURN_IF_ERROR(Expect("=>"));
+    bool returned = false;
+    while (kind_ != Kind::End) {
+      if (kind_ == Kind::Symbol && token_ == ";") {
+        ORT_RETURN_IF_ERROR(Next());
+        continue;
+      }
+      InlinedVector<std::string> names;
+      if (kind_ == Kind::Identifier && token_ == "return") {
+        returned = true;
+        ORT_RETURN_IF_ERROR(Next());
+      } else {
+        do {
+          std::string name;
+          ORT_RETURN_IF_ERROR(Identifier(name));
+          ORT_RETURN_IF(symbols_.count(name) || std::find(names.begin(), names.end(), name) != names.end(),
+                        Error("duplicate assignment name"));
+          names.push_back(std::move(name));
+          if (token_ != ",") break;
+          ORT_RETURN_IF_ERROR(Next());
+        } while (true);
+        ORT_RETURN_IF_ERROR(Expect("="));
+      }
+      ORT_RETURN_IF_ERROR(Call(names));
+      if (returned) {
+        if (kind_ == Kind::Symbol && token_ == ";") ORT_RETURN_IF_ERROR(Next());
+        ORT_RETURN_IF(kind_ != Kind::End, Error("unexpected text after return"));
+        break;
+      }
+    }
+    ORT_RETURN_IF(!returned, Error("missing return"));
+    InlinedHashSet<int> reachable;
+    for (Value output : pattern_.Nodes().back().outputs) reachable.insert(output.handle);
+    for (auto it = pattern_.Nodes().rbegin(); it != pattern_.Nodes().rend(); ++it) {
+      ORT_RETURN_IF(std::none_of(it->outputs.begin(), it->outputs.end(),
+                                 [&](Value output) { return reachable.count(output.handle); }),
+                    Error("disconnected pattern node"));
+      for (Value output : it->outputs) reachable.insert(output.handle);
+      for (Value input : it->inputs) reachable.insert(input.handle);
+    }
+    ORT_RETURN_IF(reachable.size() != pattern_.ValueCount(), Error("unused input"));
+    destination = std::move(pattern_);
+    return Status::OK();
+  }
+
+ private:
+  Status Error(const char* message) const {
+    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Pattern parse error at byte ", token_start_, ": ", message);
+  }
+
+  static bool Alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
+  static bool Digit(char c) { return c >= '0' && c <= '9'; }
+
+  Status Next() {
+    while (position_ < text_.size() && std::isspace(static_cast<unsigned char>(text_[position_]))) ++position_;
+    token_start_ = position_;
+    token_.clear();
+    kind_ = Kind::End;
+    if (position_ == text_.size()) return Status::OK();
+    kind_ = Kind::Symbol;
+    char c = text_[position_++];
+    if (Alpha(c)) {
+      kind_ = Kind::Identifier;
+      while (position_ < text_.size() &&
+             (Alpha(text_[position_]) || Digit(text_[position_]) || text_[position_] == '.'))
+        ++position_;
+    } else if (Digit(c) || c == '-' || c == '+' || c == '.') {
+      kind_ = Kind::Number;
+      while (position_ < text_.size()) {
+        char d = text_[position_];
+        if (!Digit(d) && d != '.' && d != 'e' && d != 'E' && d != '+' && d != '-') break;
+        ++position_;
+      }
+    } else if (c == '\'' || c == '"') {
+      kind_ = Kind::String;
+      bool closed = false;
+      while (position_ < text_.size()) {
+        char d = text_[position_++];
+        if (d == c) {
+          closed = true;
+          break;
+        }
+        if (d == '\\') {
+          ORT_RETURN_IF(position_ == text_.size(), Error("unterminated string escape"));
+          d = text_[position_++];
+          ORT_RETURN_IF(d != '\\' && d != '\'' && d != '"', Error("unsupported string escape"));
+        }
+        token_.push_back(d);
+      }
+      ORT_RETURN_IF(!closed, Error("unterminated string"));
+      return Status::OK();
+    } else if ((c == '=' && position_ < text_.size() && text_[position_] == '>') ||
+               (c == ':' && position_ < text_.size() && text_[position_] == ':')) {
+      ++position_;
+    } else {
+      ORT_RETURN_IF(std::string_view("(),=;").find(c) == std::string_view::npos, Error("unexpected character"));
+    }
+    token_ = text_.substr(token_start_, position_ - token_start_);
+    return Status::OK();
+  }
+
+  Status Expect(std::string_view token) {
+    ORT_RETURN_IF(kind_ != Kind::Symbol || token_ != token, Error("unexpected token"));
+    return Next();
+  }
+  Status Identifier(std::string& name) {
+    ORT_RETURN_IF(kind_ != Kind::Identifier || token_ == "return" || token_.find('.') != std::string::npos,
+                  Error("expected value identifier"));
+    name = token_;
+    return Next();
+  }
+
+  Status Number(std::variant<float, int64_t>& result) {
+    ORT_RETURN_IF(kind_ != Kind::Number, Error("expected numeric literal"));
+    std::string_view number = token_;
+    if (!number.empty() && number.front() == '+') number.remove_prefix(1);
+    if (number.find_first_of(".eE") != std::string_view::npos) {
+      float value;
+      auto parsed = std::from_chars(number.data(), number.data() + number.size(), value);
+      ORT_RETURN_IF(parsed.ec != std::errc{} || parsed.ptr != number.data() + number.size() || !std::isfinite(value),
+                    Error("invalid or nonfinite float literal"));
+      result = value;
+    } else {
+      int64_t value;
+      auto parsed = std::from_chars(number.data(), number.data() + number.size(), value);
+      ORT_RETURN_IF(parsed.ec != std::errc{} || parsed.ptr != number.data() + number.size(),
+                    Error("invalid integer literal"));
+      result = value;
+    }
+    return Next();
+  }
+
+  Status Call(const InlinedVector<std::string>& names) {
+    ORT_RETURN_IF(kind_ != Kind::Identifier || token_ == "return", Error("expected operator name"));
+    Operator op{token_, ""};
+    ORT_RETURN_IF_ERROR(Next());
+    if (token_ == "::") {
+      op.domain = std::move(op.name);
+      ORT_RETURN_IF_ERROR(Next());
+      ORT_RETURN_IF(kind_ != Kind::Identifier, Error("expected qualified operator name"));
+      op.name = token_;
+      ORT_RETURN_IF_ERROR(Next());
+    }
+    ORT_RETURN_IF_ERROR(Expect("("));
+    InlinedVector<Value> inputs;
+    InlinedVector<AttributeMatcher, 1> attributes;
+    InlinedHashSet<std::string> attribute_names;
+    bool keyword = false;
+    if (token_ != ")") {
+      do {
+        if (kind_ == Kind::Identifier) {
+          std::string name = token_;
+          ORT_RETURN_IF_ERROR(Next());
+          if (token_ == "=") {
+            keyword = true;
+            ORT_RETURN_IF(!attribute_names.insert(name).second, Error("duplicate attribute"));
+            ORT_RETURN_IF_ERROR(Next());
+            if (kind_ == Kind::String) {
+              attributes.push_back(AttributeMatcher::Equal(name, token_));
+              ORT_RETURN_IF_ERROR(Next());
+            } else {
+              std::variant<float, int64_t> number;
+              ORT_RETURN_IF_ERROR(Number(number));
+              attributes.push_back(
+                  std::visit([&](auto value) { return AttributeMatcher::Equal(name, value); }, number));
+            }
+          } else {
+            ORT_RETURN_IF(keyword, Error("positional input after attribute"));
+            auto found = symbols_.find(name);
+            ORT_RETURN_IF(found == symbols_.end(), Error("undefined input value"));
+            inputs.push_back(found->second);
+          }
+        } else {
+          ORT_RETURN_IF(keyword, Error("positional input after attribute"));
+          std::variant<float, int64_t> number;
+          ORT_RETURN_IF_ERROR(Number(number));
+          ORT_RETURN_IF(pattern_.ValueCount() >= 256, Error("too many values"));
+          inputs.push_back(std::visit([&](auto value) { return pattern_.Constant(value); }, number));
+        }
+        ORT_RETURN_IF(inputs.size() > 64, Error("too many operator inputs"));
+        if (token_ != ",") break;
+        ORT_RETURN_IF_ERROR(Next());
+      } while (true);
+    }
+    ORT_RETURN_IF_ERROR(Expect(")"));
+    size_t outputs = names.empty() ? 1 : names.size();
+    ORT_RETURN_IF(outputs > 64 || pattern_.Nodes().size() >= 64 || pattern_.ValueCount() + outputs > 256,
+                  Error("pattern limits exceeded"));
+    auto values = pattern_.MultiOp(std::move(op), gsl::span<const Value>(inputs), outputs);
+    pattern_.Attributes(std::move(attributes));
+    for (size_t i = 0; i < names.size(); ++i) {
+      pattern_.Name(values[i], names[i]);
+      symbols_.emplace(names[i], pattern_.NamedValue(names[i]));
+    }
+    return Status::OK();
+  }
+
+  enum class Kind {
+    End,
+    Symbol,
+    Identifier,
+    Number,
+    String
+  };
+  std::string_view text_;
+  size_t position_ = 0;
+  size_t token_start_ = 0;
+  Kind kind_ = Kind::Symbol;
+  std::string token_;
+  Pattern pattern_;
+  InlinedHashMap<std::string, Value> symbols_;
+};
+}  // namespace
+
+Status Pattern::Parse(std::string_view text, Pattern& destination) { return PatternParser(text).Parse(destination); }
 
 PatternRewriter::PatternRewriter(Rules rules, Options options)
     : GraphTransformer("PatternRewriter"), rules_(std::move(rules)), options_(options) {
@@ -215,18 +570,23 @@ PatternRewriter::PatternRewriter(Rules rules, Options options)
     }
     // Every node must reach the last node. Disconnected definitions are not patterns.
     const auto& root_outputs = rule.pattern.Nodes().back().outputs;
-    InlinedHashSet<Value> reachable(root_outputs.begin(), root_outputs.end());
+    InlinedHashSet<int> reachable;
+    for (Value output : root_outputs) reachable.insert(output.handle);
     for (auto it = rule.pattern.Nodes().rbegin(); it != rule.pattern.Nodes().rend(); ++it) {
       ORT_ENFORCE(
           std::any_of(it->outputs.begin(), it->outputs.end(), [&](Value output) { return reachable.count(output); }),
           "Disconnected pattern node.");
-      reachable.insert(it->outputs.begin(), it->outputs.end());
-      reachable.insert(it->inputs.begin(), it->inputs.end());
+      for (Value output : it->outputs) reachable.insert(output.handle);
+      for (Value input : it->inputs) reachable.insert(input.handle);
     }
     ORT_ENFORCE(reachable.size() == rule.pattern.ValueCount(), "Unused pattern input.");
     invalidation_depth_ = std::max(invalidation_depth_, rule.pattern.Nodes().size());
     if (!options_.indexed) continue;
     std::string signature = Signature(rule.pattern);
+    // Opaque predicates cannot be compared safely; keep their plans distinct.
+    if (std::any_of(rule.pattern.Nodes().begin(), rule.pattern.Nodes().end(),
+                    [](const auto& node) { return !node.attributes.empty(); }))
+      signature += "#" + std::to_string(i);
     auto [it, inserted] = signatures.emplace(signature, groups_.size());
     if (inserted) {
       const auto& root = rule.pattern.Nodes().back().op;
@@ -319,7 +679,7 @@ Status PatternRewriter::Run(Graph& graph, Statistics& statistics) const {
     if (options_.match_only || !winning_pattern) continue;
     ++statistics.matches;
     InlinedVector<NodeIndex> affected;
-    for (Value value = 0; value < winning_pattern->ValueCount(); ++value) {
+    for (int value = 0; value < static_cast<int>(winning_pattern->ValueCount()); ++value) {
       if (!winning_pattern->IsInput(value)) continue;
       auto it = producers.find(winning_match.values[value]);
       if (it != producers.end()) affected.push_back(it->second);

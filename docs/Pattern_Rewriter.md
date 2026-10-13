@@ -34,7 +34,8 @@ are the additional capabilities over hand-written selectors.
 
 ## Defining a rule
 
-The small DSL uses integer value handles. An input introduces a variable;
+The small DSL uses `Value {std::string name; int handle;}`. A name helps diagnose
+patterns; only the handle determines binding identity. An input introduces a variable;
 `Op` introduces one output, while `MultiOp` introduces an ordered output list.
 Reusing a handle requires the identical
 `NodeArg`, not merely the same shape or equivalent contents. Pattern operators
@@ -44,13 +45,16 @@ not to individual nodes or their schema since-versions.
 ```cpp
 using namespace onnxruntime::rewrite;
 Pattern p;
-auto x = p.Input();
+auto x = p.Input("x");
 auto h = p.Op("HardSigmoid", {x});
+p.Name(h, "sigmoid");
+p.Attributes({AttributeMatcher::Equal("alpha", 1.0f / 6.0f),
+              AttributeMatcher::Equal("beta", 0.5f)});
 p.Op("Mul", {h, x});
 Rule rule{
     "HardSigmoidMul", p,
     {{kOnnxDomain, 14, 21}},  // inclusive imported opset range
-    guard,  // checks float32, alpha=1/6, beta=1/2
+    guard,  // checks float32; attributes are checked by the pattern
     [x](const Graph&, const Match&) {
       return Replacement{"HardSwish", kOnnxDomain, {x}, {}};
     }};
@@ -65,6 +69,94 @@ argument selects another domain, e.g. `p.Op("FusedMatMul", {x, y}, kMSDomain)`.
 The original `Op(Operator{name, domain}, inputs)` overload remains available.
 Name overloads accept literals, `std::string` and `std::string_view`; template
 deduction keeps the original braced operator form unambiguous.
+
+`p.NamedValue("sigmoid")` retrieves a named handle. Nonempty names must be unique.
+`p.Name(value, name)` updates the canonical name and existing node definitions;
+subsequent operators also use that canonical name. Previously returned `Value`
+copies are not renamed in place. `Value` converts to `int` for indexing
+`Match::values`; an unnamed value has an empty name, and a default value has
+invalid handle -1.
+
+### Attribute matchers and literal constants
+
+`p.Attributes(...)` attaches matchers to the most recently defined node.
+Each `AttributeMatcher` contains an attribute name and a boolean predicate on
+`const AttributeProto&`. Missing attributes fail the match; schema defaults are
+not synthesized. Equality factories check both attribute type and value:
+`Equal("axis", 1)` requires INT, `Equal("alpha", 0.5f)` requires FLOAT,
+and `Equal("mode", std::string("linear"))` requires STRING. Extra unmatched
+attributes are permitted. Arbitrary predicates are also supported:
+
+```cpp
+p.Attributes({{"axis", [](const ONNX_NAMESPACE::AttributeProto& value) {
+  return value.type() == ONNX_NAMESPACE::AttributeProto_AttributeType_INT &&
+         value.i() < 0;
+}}});
+```
+
+Predicates are trusted, pure C++ callbacks, with the same locality and lifetime
+requirements as rule guards. Duplicate/empty attribute names, empty callbacks,
+or attachment before any node are errors.
+
+`p.Constant(3.0f)` introduces a float32 scalar initializer constraint;
+`p.Constant(int64_t{3})` introduces an int64 constraint. Integer literals in C++
+select int64; `double` arguments are converted to float32. Float constants must
+be finite. Matching requires an immutable rank-zero initializer of the exact
+type and value; a one-element vector, an overridable initializer, or external-data
+initializer does not match. These leaf handles can be used as replacement inputs,
+but matching never creates tensors.
+
+### Textual patterns
+
+`Pattern::Parse(text, destination)` returns a `Status` and replaces `destination`
+only on success. The requested branched pattern can be written directly:
+
+```cpp
+Pattern p;
+ORT_RETURN_IF_ERROR(Pattern::Parse(R"(
+  (x, low, high, divisor) =>
+    add = Add(x, 3.0)
+    clip = Clip(add, low, high)
+    mul = Mul(clip, x)
+    return Div(mul, divisor)
+)", p));
+auto x = p.NamedValue("x");
+```
+
+The header declares named inputs. Assignment names label operator outputs.
+Reusing `x` enforces exact binding identity. Decimal/scientific literals become
+float32 scalar constants, while integer spellings become int64 constants.
+This text describes structure, **not a semantically complete HardSwish rule**:
+the rule guard must additionally establish float32, low=0, high=6 and divisor=6.
+The numerical test retains those checks before executing the replacement.
+
+Attributes use Python keyword syntax, after positional inputs:
+`h = HardSigmoid(x, alpha = 0.16666667, beta = 0.5)`.
+Signed/scientific numbers and single/double-quoted string attributes are supported.
+Only escaped quotes and backslashes are supported in strings.
+The parsed spelling determines the attribute type: `axis=1` differs from `axis=1.0`.
+An empty quoted string is valid.
+
+Multiple-output assignments and qualified domains are supported:
+
+```text
+(x) => a, b = Split(x, axis=0); return Concat(a, b, axis=0)
+(x, y) => mm = com.microsoft::FusedMatMul(x, y, alpha=0.5); return Identity(mm)
+```
+
+Unqualified operators use the standard ONNX domain. Whitespace/newlines separate
+tokens; semicolons may separate assignments. Values are ASCII identifiers.
+Definitions must precede use; every input and node must reach the final operator.
+There must be a final `return Op(...)`, with no subsequent statements.
+The parser checks duplicate names/attributes, undefined references, numeric range,
+disconnected definitions and the same 64-node/256-value/64-input-output limits as
+the C++ builder. Errors include a byte offset and leave the destination unchanged.
+A one-node parsed pattern is valid, but cannot form a node-count-decreasing rule.
+
+The language intentionally excludes nested calls, lists/tensor literals, optional
+placeholders, booleans, comments, `return` of an existing value and multi-output
+`return` calls (use the C++ API for multi-output roots). It describes only matching:
+opset requirements, semantic guards and replacement recipes remain explicit C++.
 
 ### Multiple outputs
 
@@ -160,9 +252,14 @@ eligibility rather than partition-independent structural matches.
 Construction validates connected acyclic definitions, used inputs, rule-level
 domain/opset requirements, and limits of 64 nodes, 256 values and 64 inputs/outputs per operator.
 It buckets groups by root op/domain and interns identical structural signatures,
-including ordered output handles and binding identities but not rule-level import ranges.
-Rules with identical topology but different attribute/constant conditions share
-one structural match, even when their applicability ranges differ.
+including ordered output handles, binding identities and scalar literal type/value
+constraints, but not diagnostic names or rule-level import ranges.
+Rules with identical topology and literal constraints can share one structural
+match even when their guards or applicability ranges differ. Patterns containing
+attribute predicates currently receive separate plans, including equality predicates:
+opaque `std::function` callbacks cannot safely be compared. This conservative
+choice preserves correctness at the cost of repeated matching for attribute-heavy
+rule sets; arbitrary callbacks also have no engine-imposed time bound.
 There is **no arbitrary-prefix trie**: different structural
 plans still match independently. This is intentionally a simpler, measurable
 starting point than a decision DAG compiler.
@@ -179,7 +276,8 @@ The call then builds a producer index and topological worklist once. Matching wa
 the compiled node definitions backward without recursive search, alternation,
 commutative backtracking, or unbounded neighborhood exploration. Each node checks
 op/domain, exact input/output counts, repeated bindings and layer annotation
-agreement. Provider eligibility is a separate generic check. All non-root outputs
+agreement, plus any attribute predicates and scalar literal constraints.
+Provider eligibility is a separate generic check. All non-root outputs
 must be internal: graph outputs,
 external consumers (including implicit subgraph captures), and pattern inputs
 produced inside the deletion set prevent replacement.

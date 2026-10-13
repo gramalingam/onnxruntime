@@ -4,6 +4,64 @@ These are measurements of the real ORT graph rewrite implementation described in
 [Pattern_Rewriter.md](Pattern_Rewriter.md), not a standalone matcher simulation.
 The implementation is experimental and opt-in; the default optimizer is unchanged.
 Raw measurements are in [Pattern_Rewriter_Benchmark.csv](Pattern_Rewriter_Benchmark.csv).
+The original tables below record revision
+`8a2b73c7e7818925c161d1fd7e4c7ce93f0acba6`; they are retained as historical measurements.
+The named-value/parser/attribute-matcher follow-up is measured separately in
+[Pattern_Rewriter_Language_Benchmark.csv](Pattern_Rewriter_Language_Benchmark.csv)
+and the next section, rather than silently replacing the original measurements.
+
+## Named-value and pattern-language follow-up
+
+The same CPU Release build configuration, decoder generator, full 1080-row
+matrix, two warmups and nine repeats were rerun after adding named handles,
+scalar literal constraints, attribute predicates and the text parser.
+HardSigmoid/Mul now uses node attribute matchers instead of equivalent guard
+checks. The benchmark still constructs its patterns through the C++ builder;
+preparation includes building/compiling those rules, **not text parsing latency**.
+The parser is exercised by correctness tests, including an executed HardSwish fusion.
+No decoder operator distribution or benchmark workload definition changed.
+
+At 32 layers / 2241 nodes / 500 rules, all times are milliseconds:
+
+| Workload | Reference engine median | Indexed engine median | Indexed engine max | Indexed preparation median | Indexed Resolve median | Indexed total median |
+|---|---:|---:|---:|---:|---:|---:|
+| Active match-only | 64.5107 | 20.7664 | 25.0146 | 4.0833 | 0.0283 | 24.8781 |
+| Adversarial semantic misses | 64.2870 | 19.6209 | 21.4712 | 3.8433 | 0.0302 | 23.4582 |
+| Successful rewriting | 73.3457 | 25.0688 | 45.5535 | 3.9737 | 22.3129 | 51.9711 |
+| Synthetic distinct structural misses | 67.3232 | 55.9487 | 79.9540 | 11.0489 | 0.0287 | 66.8546 |
+
+The largest indexed engine observation across the complete matrix was 79.9540 ms.
+This remains empirical evidence for subsecond cost at the tested scale, not a
+guarantee for arbitrary patterns, callbacks or graphs. Names increase pattern
+storage and copying cost. Attribute-predicate plans deliberately do not share
+structural matches, so a large set of attribute-heavy rules can cost more than
+the measured decoder rule variants. For example, the 500-rule active match-only
+indexed run now performs 27,264 structural checks rather than the historical
+1,024, while guards (10,688), matches (128), visits (2,241) and output nodes
+(2,241) are unchanged. Successful rewriting still removes 128 patterns and
+leaves 1,793 nodes. The earlier extrapolation budgets below
+belong to the historical revision and should not be treated as updated budgets.
+
+Validation: CPU Release incremental build passed; **46 correctness/regression
+tests passed** (35 rewriter tests and 11 existing optimizer tests); the full
+benchmark passed. The summarizer checked nine repeats in every group,
+deterministic counters and indexed/reference agreement. Numerical decoder
+results remained max absolute error 0 for decode and 2.98023e-08 for prefill;
+prefill max relative error with denominator floor 1e-6 was 2.73599e-07.
+
+Reproduction from the worktree, with CMake available on PATH:
+
+```powershell
+.\.venv\Scripts\python.exe tools\ci_build\build.py --build_dir build\rewriter --config Release --build --parallel 4 --target onnxruntime_test_all --skip_tests
+$env:ORT_REWRITER_BENCHMARK_CSV = Join-Path (Get-Location) 'docs\Pattern_Rewriter_Language_Benchmark.csv'
+Push-Location build\rewriter\Release\Release
+.\onnxruntime_test_all.exe --gtest_filter="PatternRewriterTests.*:GraphTransformationTests.MatMulScaleFusion*:GraphTransformationTests.QuickGelu*"
+.\onnxruntime_test_all.exe --gtest_also_run_disabled_tests --gtest_filter="PatternRewriterBenchmark.DISABLED_Decoder"
+Pop-Location
+.\.venv\Scripts\python.exe tools\ci_build\summarize_rewriter_benchmark.py docs\Pattern_Rewriter_Language_Benchmark.csv
+```
+
+All four commands passed for the recorded follow-up measurements.
 
 ## Configuration and scope
 

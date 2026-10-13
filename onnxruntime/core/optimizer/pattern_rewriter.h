@@ -7,13 +7,36 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <variant>
 
 #include "core/optimizer/graph_transformer.h"
 
 namespace onnxruntime {
 namespace rewrite {
 
-using Value = size_t;
+struct Value {
+  std::string name;
+  int handle = -1;
+  Value() = default;
+  Value(int id) : handle(id) {}
+  Value(std::string label, int id) : name(std::move(label)), handle(id) {}
+  // Handles index Match::values; names are diagnostic and do not affect identity.
+  operator int() const { return handle; }
+};
+
+struct AttributeMatcher {
+  std::string name;
+  std::function<bool(const ONNX_NAMESPACE::AttributeProto&)> predicate;
+  bool Matches(const ONNX_NAMESPACE::AttributeProto& value) const { return predicate(value); }
+  static AttributeMatcher Equal(std::string name, int64_t value);
+  static AttributeMatcher Equal(std::string name, int value) { return Equal(std::move(name), int64_t{value}); }
+  static AttributeMatcher Equal(std::string name, float value);
+  static AttributeMatcher Equal(std::string name, double value) {
+    return Equal(std::move(name), static_cast<float>(value));
+  }
+  static AttributeMatcher Equal(std::string name, std::string value);
+};
 
 struct Operator {
   std::string name;
@@ -30,13 +53,23 @@ struct OpsetRequirement {
 // Reusing a Value requires exactly the same NodeArg, including for input variables.
 class Pattern {
  public:
-  Value Input();
+  Value Input(std::string_view name = "");
+  Value Constant(float value);
+  Value Constant(int64_t value);
+  Value Constant(int value) { return Constant(int64_t{value}); }
+  Value Constant(double value) { return Constant(static_cast<float>(value)); }
+  Value NamedValue(std::string_view name) const;
+  void Name(Value value, std::string_view name);
+  void Attributes(std::initializer_list<AttributeMatcher> matchers);
+  void Attributes(InlinedVector<AttributeMatcher, 1> matchers);
+  static Status Parse(std::string_view text, Pattern& destination);
   Value Op(Operator op, std::initializer_list<Value> inputs);
   template <typename Name, std::enable_if_t<std::is_convertible_v<Name, std::string_view>, int> = 0>
   Value Op(Name&& name, std::initializer_list<Value> inputs, std::string_view domain = "") {
     return Op(Operator{std::string(std::string_view(name)), std::string(domain)}, inputs);
   }
   InlinedVector<Value> MultiOp(Operator op, std::initializer_list<Value> inputs, size_t output_count);
+  InlinedVector<Value> MultiOp(Operator op, gsl::span<const Value> inputs, size_t output_count);
   template <typename Name, std::enable_if_t<std::is_convertible_v<Name, std::string_view>, int> = 0>
   InlinedVector<Value> MultiOp(Name&& name, std::initializer_list<Value> inputs, size_t output_count,
                                std::string_view domain = "") {
@@ -47,14 +80,19 @@ class Pattern {
     Operator op;
     InlinedVector<Value> inputs;
     InlinedVector<Value> outputs;
+    InlinedVector<AttributeMatcher, 1> attributes;
   };
   const auto& Nodes() const { return nodes_; }
   size_t ValueCount() const { return value_count_; }
   bool IsInput(Value value) const;
+  const auto& Constants() const { return constants_; }
 
  private:
   size_t value_count_ = 0;
   InlinedVector<NodePattern, 1> nodes_;
+  InlinedVector<Value> values_;
+  InlinedHashMap<int, std::variant<float, int64_t>> constants_;
+  Value AddValue(std::string_view name);
 };
 
 struct Match {
