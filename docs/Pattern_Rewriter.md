@@ -51,19 +51,28 @@ p.Name(h, "sigmoid");
 p.Attributes({AttributeMatcher::Equal("alpha", 1.0f / 6.0f),
               AttributeMatcher::Equal("beta", 0.5f)});
 p.Op("Mul", {h, x});
+auto guard = [](const Graph&, const Match& m) {
+  for (const NodeArg* value : m.values) {
+    const auto* type = value->TypeAsProto();
+    if (!type || !type->has_tensor_type() ||
+        type->tensor_type().elem_type() != ONNX_NAMESPACE::TensorProto_DataType_FLOAT)
+      return false;
+  }
+  return true;
+};
+Replacement replacement("(x) => HardSwish(x)");
 Rule rule{
     "HardSigmoidMul", p,
     {{kOnnxDomain, 14, 21}},  // inclusive imported opset range
-    guard,  // checks float32; attributes are checked by the pattern
-    [](const Graph&, const Match& m) {
-      return Replacement{"HardSwish", kOnnxDomain, {m.valueOf("x")}, {}};
-    }};
+    guard, replacement};
 auto transformer = std::make_unique<PatternRewriter>(Rules{rule});
 ORT_RETURN_IF_ERROR(session.RegisterGraphTransformer(std::move(transformer),
                                                     TransformerLevel::Level1));
 ```
 
 `pattern_rewriter_rules.cc` contains complete readable guard/recipe examples.
+Each example defines its pattern, guard and replacement separately, assembles a
+named `Rule rule`, and registers it with `rules.push_back(std::move(rule))`.
 `Op(name, inputs)` defaults to the standard ONNX domain; the optional third
 argument selects another domain, e.g. `p.Op("FusedMatMul", {x, y}, kMSDomain)`.
 The original `Op(Operator{name, domain}, inputs)` overload remains available.
@@ -203,9 +212,8 @@ opset requirements and semantic guards remain explicit C++.
 `Replacement(std::string_view)` parses a reusable replacement definition, once:
 
 ```cpp
-Rule rule{
-    "HardSwish", pattern, {{kOnnxDomain, 14, 21}}, guard,
-    Replacement("(x) => HardSwish(x)")};
+Replacement replacement("(x) => HardSwish(x)");
+Rule rule{"HardSwish", pattern, {{kOnnxDomain, 14, 21}}, guard, replacement};
 ```
 
 The final operator call may omit `return`. Multi-node definitions use the same

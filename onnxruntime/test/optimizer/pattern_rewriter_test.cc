@@ -78,11 +78,12 @@ size_t Count(const Graph& graph, const std::string& op) {
 
 Rule IdentityPair(const char* name = "identity", bool accept = true) {
   Pattern p("(x) => a = Identity(x); return Identity(a)");
-  return {name,
-          p,
-          {{kOnnxDomain, 1, 21}},
-          [accept](const Graph&, const Match&) { return accept; },
-          [](const Graph&, const Match& m) { return Replacement{"Identity", kOnnxDomain, {m.valueOf("x")}, {}}; }};
+  auto guard = [accept](const Graph&, const Match&) { return accept; };
+  auto replacement = [](const Graph&, const Match& m) {
+    return Replacement{"Identity", kOnnxDomain, {m.valueOf("x")}, {}};
+  };
+  Rule rule{name, p, {{kOnnxDomain, 1, 21}}, guard, replacement};
+  return rule;
 }
 
 Rule IdentitySplit() {
@@ -90,57 +91,56 @@ Rule IdentitySplit() {
   auto x = p.Input();
   auto first = p.Op("Identity", {x});
   p.MultiOp("Split", {first}, 2);
-  return {"IdentitySplit",
-          p,
-          {{kOnnxDomain, 13, 17}},
-          [](const Graph&, const Match&) { return true; },
-          [x](const Graph&, const Match& match) {
-            return Replacement{"Split", kOnnxDomain, {x}, match.nodes.back()->GetAttributes()};
-          }};
+  auto guard = [](const Graph&, const Match&) { return true; };
+  auto replacement = [x](const Graph&, const Match& match) {
+    return Replacement{"Split", kOnnxDomain, {x}, match.nodes.back()->GetAttributes()};
+  };
+  Rule rule{"IdentitySplit", p, {{kOnnxDomain, 13, 17}}, guard, replacement};
+  return rule;
 }
 
 Rule SplitConcat() {
   Pattern p("(x) => a, b = Split(x); return Concat(a, b)");
-  return {"SplitConcat",
-          p,
-          {{kOnnxDomain, 13, 17}},
-          [](const Graph&, const Match& match) {
-            const auto& split_attributes = match.nodes[0]->GetAttributes();
-            auto axis = split_attributes.find("axis");
-            return (axis == split_attributes.end() || axis->second.i() == 0) &&
-                   match.nodes[1]->GetAttributes().at("axis").i() == 0;
-          },
-          [](const Graph&, const Match& m) { return Replacement{"Identity", kOnnxDomain, {m.valueOf("x")}, {}}; }};
+  auto guard = [](const Graph&, const Match& match) {
+    const auto& split_attributes = match.nodes[0]->GetAttributes();
+    auto axis = split_attributes.find("axis");
+    return (axis == split_attributes.end() || axis->second.i() == 0) &&
+           match.nodes[1]->GetAttributes().at("axis").i() == 0;
+  };
+  auto replacement = [](const Graph&, const Match& m) {
+    return Replacement{"Identity", kOnnxDomain, {m.valueOf("x")}, {}};
+  };
+  Rule rule{"SplitConcat", p, {{kOnnxDomain, 13, 17}}, guard, replacement};
+  return rule;
 }
 
 // Multi-output adaptation of ONNXScript's LayerNormBiasFusion; unused statistics may be removed.
 Rule LayerNormBias() {
   Pattern p("(x, scale, bias) => y, mean, inv_std = LayerNormalization(x, scale); return Add(y, bias)");
-  return {"LayerNormBias",
-          p,
-          {{kOnnxDomain, 17, 17}},
-          [](const Graph&, const Match& match) {
-            const auto* shape = match.valueOf("x")->Shape();
-            const auto* scale_shape = match.valueOf("scale")->Shape();
-            const auto* bias_shape = match.valueOf("bias")->Shape();
-            if (!shape || shape->dim_size() < 1 || !scale_shape || !bias_shape || scale_shape->dim_size() != 1 ||
-                bias_shape->dim_size() != 1)
-              return false;
-            const auto& width = shape->dim(shape->dim_size() - 1);
-            const auto& scale_width = scale_shape->dim(0);
-            const auto& bias_width = bias_shape->dim(0);
-            auto axis = match.nodes[0]->GetAttributes().find("axis");
-            return width.has_dim_value() && width.dim_value() > 0 && scale_width.has_dim_value() &&
-                   bias_width.has_dim_value() && width.dim_value() == scale_width.dim_value() &&
-                   width.dim_value() == bias_width.dim_value() &&
-                   (axis == match.nodes[0]->GetAttributes().end() || axis->second.i() == -1);
-          },
-          [](const Graph&, const Match& match) {
-            return Replacement{"LayerNormalization",
-                               "",
-                               {match.valueOf("x"), match.valueOf("scale"), match.valueOf("bias")},
-                               match.nodes[0]->GetAttributes()};
-          }};
+  auto guard = [](const Graph&, const Match& match) {
+    const auto* shape = match.valueOf("x")->Shape();
+    const auto* scale_shape = match.valueOf("scale")->Shape();
+    const auto* bias_shape = match.valueOf("bias")->Shape();
+    if (!shape || shape->dim_size() < 1 || !scale_shape || !bias_shape || scale_shape->dim_size() != 1 ||
+        bias_shape->dim_size() != 1)
+      return false;
+    const auto& width = shape->dim(shape->dim_size() - 1);
+    const auto& scale_width = scale_shape->dim(0);
+    const auto& bias_width = bias_shape->dim(0);
+    auto axis = match.nodes[0]->GetAttributes().find("axis");
+    return width.has_dim_value() && width.dim_value() > 0 && scale_width.has_dim_value() &&
+           bias_width.has_dim_value() && width.dim_value() == scale_width.dim_value() &&
+           width.dim_value() == bias_width.dim_value() &&
+           (axis == match.nodes[0]->GetAttributes().end() || axis->second.i() == -1);
+  };
+  auto replacement = [](const Graph&, const Match& match) {
+    return Replacement{"LayerNormalization",
+                       "",
+                       {match.valueOf("x"), match.valueOf("scale"), match.valueOf("bias")},
+                       match.nodes[0]->GetAttributes()};
+  };
+  Rule rule{"LayerNormBias", p, {{kOnnxDomain, 17, 17}}, guard, replacement};
+  return rule;
 }
 
 // Small-weight eager decoder: B=1, Hq=4, Hkv=2, D=4. Cache length is 3.
@@ -1255,11 +1255,9 @@ TEST(PatternRewriterTests, PriorityAcrossInterleavedStructuralGroups) {
     auto first = p.Op({"Identity", ""}, {input});
     auto second = p.Op({"Identity", ""}, {first});
     p.Op({"Identity", ""}, {second});
-    Rule higher_priority{"higher_priority",
-                         p,
-                         {{kOnnxDomain, 1, 21}},
-                         [](const Graph&, const Match&) { return true; },
-                         [input](const Graph&, const Match&) { return Replacement{"Identity", "", {input}, {}}; }};
+    auto guard = [](const Graph&, const Match&) { return true; };
+    auto replacement = [input](const Graph&, const Match&) { return Replacement{"Identity", "", {input}, {}}; };
+    Rule higher_priority{"higher_priority", p, {{kOnnxDomain, 1, 21}}, guard, replacement};
     Statistics stats;
     ASSERT_STATUS_OK(
         PatternRewriter({rejected, higher_priority, lower_priority}, {.indexed = indexed}).Run(test.graph, stats));
@@ -1611,11 +1609,9 @@ TEST(PatternRewriterTests, BranchedSharedNodeBindings) {
     auto psum = p.Op({"Add", ""}, {px, py});
     auto pproduct = p.Op({"Mul", ""}, {psum, px});
     p.Op({"Add", ""}, {psum, pproduct});
-    Rule rule{"diamond",
-              p,
-              {{kOnnxDomain, 7, 21}},
-              [](const Graph&, const Match&) { return true; },
-              [](const Graph&, const Match&) { return Replacement{"Identity", "", {0}, {}}; }};
+    auto guard = [](const Graph&, const Match&) { return true; };
+    auto replacement = [](const Graph&, const Match&) { return Replacement{"Identity", "", {0}, {}}; };
+    Rule rule{"diamond", p, {{kOnnxDomain, 7, 21}}, guard, replacement};
     Statistics stats;
     // Structural-only test: this deliberately has no semantically equivalent replacement.
     ASSERT_STATUS_OK(PatternRewriter({rule}, {.match_only = true}).Run(test.graph, stats));
