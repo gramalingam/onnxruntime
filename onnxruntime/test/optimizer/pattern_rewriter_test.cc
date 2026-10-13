@@ -86,6 +86,67 @@ Rule IdentityPair(const char* name = "identity", bool accept = true) {
           [x](const Graph&, const Match&) { return Replacement{"Identity", kOnnxDomain, {x}, {}}; }};
 }
 
+Rule IdentitySplit() {
+  Pattern p;
+  auto x = p.Input();
+  auto first = p.Op("Identity", {x});
+  p.MultiOp("Split", {first}, 2);
+  return {"IdentitySplit",
+          p,
+          {{kOnnxDomain, 13, 17}},
+          [](const Graph&, const Match&) { return true; },
+          [x](const Graph&, const Match& match) {
+            return Replacement{"Split", kOnnxDomain, {x}, match.nodes.back()->GetAttributes()};
+          }};
+}
+
+Rule SplitConcat() {
+  Pattern p;
+  auto x = p.Input();
+  auto pieces = p.MultiOp("Split", {x}, 2);
+  p.Op("Concat", {pieces[0], pieces[1]});
+  return {"SplitConcat",
+          p,
+          {{kOnnxDomain, 13, 17}},
+          [](const Graph&, const Match& match) {
+            const auto& split_attributes = match.nodes[0]->GetAttributes();
+            auto axis = split_attributes.find("axis");
+            return (axis == split_attributes.end() || axis->second.i() == 0) &&
+                   match.nodes[1]->GetAttributes().at("axis").i() == 0;
+          },
+          [x](const Graph&, const Match&) { return Replacement{"Identity", kOnnxDomain, {x}, {}}; }};
+}
+
+// Multi-output adaptation of ONNXScript's LayerNormBiasFusion; unused statistics may be removed.
+Rule LayerNormBias() {
+  Pattern p;
+  auto x = p.Input(), scale = p.Input(), bias = p.Input();
+  auto outputs = p.MultiOp("LayerNormalization", {x, scale}, 3);
+  p.Op("Add", {outputs[0], bias});
+  return {"LayerNormBias",
+          p,
+          {{kOnnxDomain, 17, 17}},
+          [=](const Graph&, const Match& match) {
+            const auto* shape = match.values[x]->Shape();
+            const auto* scale_shape = match.values[scale]->Shape();
+            const auto* bias_shape = match.values[bias]->Shape();
+            if (!shape || shape->dim_size() < 1 || !scale_shape || !bias_shape || scale_shape->dim_size() != 1 ||
+                bias_shape->dim_size() != 1)
+              return false;
+            const auto& width = shape->dim(shape->dim_size() - 1);
+            const auto& scale_width = scale_shape->dim(0);
+            const auto& bias_width = bias_shape->dim(0);
+            auto axis = match.nodes[0]->GetAttributes().find("axis");
+            return width.has_dim_value() && width.dim_value() > 0 && scale_width.has_dim_value() &&
+                   bias_width.has_dim_value() && width.dim_value() == scale_width.dim_value() &&
+                   width.dim_value() == bias_width.dim_value() &&
+                   (axis == match.nodes[0]->GetAttributes().end() || axis->second.i() == -1);
+          },
+          [=](const Graph&, const Match& match) {
+            return Replacement{"LayerNormalization", "", {x, scale, bias}, match.nodes[0]->GetAttributes()};
+          }};
+}
+
 // Small-weight eager decoder: B=1, Hq=4, Hkv=2, D=4. Cache length is 3.
 // See the design document for the model/export sources and deliberate simplifications.
 void BuildDecoder(ModelTestBuilder& b, size_t layers, int64_t sequence = 1) {
@@ -234,6 +295,65 @@ TEST(PatternRewriterTests, HardSigmoidAttributeGuard) {
     EXPECT_EQ(stats.rewrites, correct ? 1u : 0u);
     ASSERT_STATUS_OK(test.graph.Resolve());
   }
+}
+
+TEST(PatternRewriterTests, GenericExecutionProviderPolicy) {
+  for (bool indexed : {false, true}) {
+    for (bool match_only : {false, true}) {
+      for (int scenario = 0; scenario < 5; ++scenario) {
+        TestGraph test;
+        auto* x = test.builder.MakeInput<float>({2}, -1.0f, 1.0f);
+        auto* first = test.builder.MakeIntermediate();
+        auto& a = test.builder.AddNode("Identity", {x}, {first});
+        auto& b = test.builder.AddNode("Identity", {first}, {test.builder.MakeOutput()});
+        test.builder.SetGraphOutputs();
+        ASSERT_STATUS_OK(test.graph.Resolve());
+        if (scenario == 1) {
+          a.SetExecutionProviderType(kCpuExecutionProvider);
+          b.SetExecutionProviderType(kCpuExecutionProvider);
+        }
+        if (scenario >= 2) {
+          a.SetExecutionProviderType(scenario == 4 ? kCpuExecutionProvider : kCudaExecutionProvider);
+          b.SetExecutionProviderType(kCudaExecutionProvider);
+        }
+        Options options{.match_only = match_only, .indexed = indexed};
+        if (scenario >= 3) options.compatible_execution_providers.insert(kCudaExecutionProvider);
+        auto rule = IdentityPair();
+        int guards = 0;
+        rule.guard = [&guards](const Graph&, const Match&) {
+          ++guards;
+          return true;
+        };
+        const auto expected_provider = b.GetExecutionProviderType();
+        Statistics stats;
+        ASSERT_STATUS_OK(PatternRewriter({rule}, options).Run(test.graph, stats));
+        const bool supported = scenario == 0 || scenario == 1 || scenario == 3;
+        EXPECT_EQ(guards, supported ? 1 : 0);
+        EXPECT_EQ(stats.matches, supported ? 1u : 0u);
+        EXPECT_EQ(stats.rewrites, supported && !match_only ? 1u : 0u);
+        ASSERT_STATUS_OK(test.graph.Resolve());
+        if (stats.rewrites) {
+          EXPECT_EQ(test.graph.Nodes().begin()->GetExecutionProviderType(), expected_provider);
+        }
+      }
+    }
+  }
+}
+
+TEST(PatternRewriterTests, ExampleRulesDoNotCheckExecutionProvider) {
+  TestGraph test;
+  BuildHardSwish(test.builder);
+  test.builder.SetGraphOutputs();
+  ASSERT_STATUS_OK(test.graph.Resolve());
+  for (auto& node : test.graph.Nodes()) node.SetExecutionProviderType(kCudaExecutionProvider);
+  Options options;
+  options.compatible_execution_providers.insert(kCudaExecutionProvider);
+  Statistics stats;
+  // Graph-only validation: permitting a provider is not evidence of GPU kernel execution.
+  ASSERT_STATUS_OK(PatternRewriter(MakeExampleRules(), options).Run(test.graph, stats));
+  EXPECT_EQ(stats.rewrites, 1u);
+  ASSERT_STATUS_OK(test.graph.Resolve());
+  EXPECT_EQ(test.graph.Nodes().begin()->GetExecutionProviderType(), kCudaExecutionProvider);
 }
 
 TEST(PatternRewriterTests, PriorityOverlapTerminationAndMatchOnly) {
@@ -517,7 +637,7 @@ TEST(PatternRewriterTests, LayerAnnotationsAndRootConsumers) {
   }
 }
 
-TEST(PatternRewriterTests, MultiOutputRejection) {
+TEST(PatternRewriterTests, OutputCountMismatch) {
   TestGraph test;
   auto& b = test.builder;
   auto* x = b.MakeInput<float>({2}, -1.0f, 1.0f);
@@ -535,6 +655,248 @@ TEST(PatternRewriterTests, MultiOutputRejection) {
   Statistics stats;
   ASSERT_STATUS_OK(PatternRewriter({rule}).Run(test.graph, stats));
   EXPECT_EQ(stats.rewrites, 0u);
+}
+
+TEST(PatternRewriterTests, MultiOpDefinitionsAndOverloads) {
+  Pattern p;
+  auto x = p.Input();
+  std::string identity = "Identity";
+  auto a = p.Op(identity, {x});
+  auto b = p.Op(std::string_view(identity), {a}, kOnnxDomainAlias);
+  auto outputs = p.MultiOp({"Split", kOnnxDomainAlias}, {b}, 2);
+  EXPECT_EQ(outputs.size(), 2u);
+  EXPECT_NE(outputs[0], outputs[1]);
+  EXPECT_TRUE(p.IsInput(x));
+  EXPECT_FALSE(p.IsInput(outputs[0]));
+  EXPECT_FALSE(p.IsInput(outputs[1]));
+  EXPECT_EQ(p.Nodes().back().op.domain, kOnnxDomain);
+  const auto count = p.ValueCount();
+  EXPECT_THROW(p.MultiOp("Split", {b}, 0), OnnxRuntimeException);
+  EXPECT_THROW(p.MultiOp("Split", {b}, 65), OnnxRuntimeException);
+  EXPECT_THROW(p.MultiOp("Split", {999}, 2), OnnxRuntimeException);
+  EXPECT_EQ(p.ValueCount(), count);
+  for (int i = 0; i < 3; ++i) p.MultiOp("Split", {b}, 64);
+  EXPECT_THROW(p.MultiOp("Split", {b}, 64), OnnxRuntimeException);
+}
+
+TEST(PatternRewriterTests, MultiOutputIntermediateBoundariesAndBindings) {
+  for (bool indexed : {false, true}) {
+    for (int scenario = 0; scenario < 5; ++scenario) {
+      TestGraph test;
+      auto* x = test.builder.MakeInput<float>({4}, -1.0f, 1.0f);
+      auto* a = test.builder.MakeIntermediate();
+      auto* b = scenario == 1 ? test.builder.MakeOutput() : test.builder.MakeIntermediate();
+      test.builder.AddNode("Split", {x}, {a, b});
+      auto& concat = test.builder.AddNode("Concat", {a, scenario == 3 ? a : b}, {test.builder.MakeOutput()});
+      concat.AddAttribute("axis", int64_t{0});
+      if (scenario == 2) test.builder.AddNode("Identity", {b}, {test.builder.MakeOutput()});
+      if (scenario == 4) {
+        // A repeated output binding must refer to the same node, not a second Split.
+        auto* c = test.builder.MakeIntermediate();
+        auto* d = test.builder.MakeIntermediate();
+        test.builder.AddNode("Split", {x}, {c, d});
+        concat.MutableInputDefs()[1] = d;
+      }
+      test.builder.SetGraphOutputs();
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      Statistics stats;
+      ASSERT_STATUS_OK(PatternRewriter({SplitConcat()}, {.indexed = indexed}).Run(test.graph, stats));
+      EXPECT_EQ(stats.rewrites, scenario == 0 ? 1u : 0u);
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      if (scenario == 0) EXPECT_EQ(test.graph.NumberOfNodes(), 1);
+    }
+  }
+}
+
+TEST(PatternRewriterTests, MultiOutputProducerReachedThroughSecondOutput) {
+  for (bool indexed : {false, true}) {
+    TestGraph test;
+    auto* x = test.builder.MakeInput<float>({4}, -1.0f, 1.0f);
+    auto* a = test.builder.MakeIntermediate();
+    auto* b = test.builder.MakeIntermediate();
+    test.builder.AddNode("Split", {x}, {a, b});
+    test.builder.AddNode("Identity", {b}, {test.builder.MakeOutput()});
+    test.builder.SetGraphOutputs();
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    Pattern pattern;
+    auto input = pattern.Input();
+    auto outputs = pattern.MultiOp("Split", {input}, 2);
+    pattern.Op("Identity", {outputs[1]});
+    auto rule = SplitConcat();
+    rule.pattern = pattern;
+    rule.guard = [](const Graph&, const Match&) { return true; };
+    Statistics stats;
+    // Only match: an Identity replacement would not preserve slicing semantics.
+    ASSERT_STATUS_OK(PatternRewriter({rule}, {.match_only = true, .indexed = indexed}).Run(test.graph, stats));
+    EXPECT_EQ(stats.matches, 1u);
+    EXPECT_EQ(stats.rewrites, 0u);
+  }
+}
+
+TEST(PatternRewriterTests, MultiOutputRootEdgesAndInvalidRecipe) {
+  for (bool indexed : {false, true}) {
+    TestGraph test;
+    auto* x = test.builder.MakeInput<float>({4}, -1.0f, 1.0f);
+    auto* middle = test.builder.MakeIntermediate();
+    auto* a = test.builder.MakeOutput();
+    auto* b = test.builder.MakeOutput();
+    test.builder.AddNode("Identity", {x}, {middle});
+    test.builder.AddNode("Split", {middle}, {a, b});
+    test.builder.AddNode("Neg", {a}, {test.builder.MakeOutput()});
+    test.builder.AddNode("Add", {b, b}, {test.builder.MakeOutput()});
+    test.builder.SetGraphOutputs();
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    auto invalid = IdentitySplit();
+    invalid.replacement = [](const Graph&, const Match&) { return Replacement{"Identity", "", {0}, {}}; };
+    Statistics stats;
+    EXPECT_FALSE(PatternRewriter({invalid}, {.indexed = indexed}).Run(test.graph, stats).IsOK());
+    EXPECT_EQ(test.graph.NumberOfNodes(), 4);
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    auto wrong_count = IdentityPair("single_output_split");
+    Pattern single_output;
+    auto input = single_output.Input();
+    auto first = single_output.Op("Identity", {input});
+    single_output.Op("Split", {first});
+    wrong_count.pattern = single_output;
+    ASSERT_STATUS_OK(PatternRewriter({wrong_count, IdentitySplit()}, {.indexed = indexed}).Run(test.graph, stats));
+    EXPECT_EQ(stats.rewrites, 1u);
+    const Node* producer = test.graph.GetProducerNode(a->Name());
+    ASSERT_NE(producer, nullptr);
+    EXPECT_EQ(producer, test.graph.GetProducerNode(b->Name()));
+    EXPECT_EQ(producer->OutputDefs()[0], a);
+    EXPECT_EQ(producer->OutputDefs()[1], b);
+    EXPECT_EQ(producer->GetOutputEdgesCount(), 3);
+    size_t slot0 = 0, slot1 = 0;
+    for (auto edge = producer->OutputEdgesBegin(); edge != producer->OutputEdgesEnd(); ++edge) {
+      if (edge->GetSrcArgIndex() == 0) ++slot0;
+      if (edge->GetSrcArgIndex() == 1) ++slot1;
+    }
+    EXPECT_EQ(slot0, 1u);
+    EXPECT_EQ(slot1, 2u);
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    ASSERT_STATUS_OK(PatternRewriter({IdentitySplit()}, {.indexed = indexed}).Run(test.graph, stats));
+    EXPECT_EQ(stats.rewrites, 0u);
+  }
+}
+
+TEST(PatternRewriterTests, MultiOutputImplicitCaptureBoundary) {
+  for (bool indexed : {false, true}) {
+    for (bool root : {false, true}) {
+      TestGraph test;
+      auto& b = test.builder;
+      auto* x = b.MakeInput<float>({4}, -1.0f, 1.0f);
+      auto* split_input = x;
+      if (root) {
+        split_input = b.MakeIntermediate();
+        b.AddNode("Identity", {x}, {split_input});
+      }
+      auto* a = b.MakeIntermediate();
+      auto* c = b.MakeIntermediate();
+      b.AddNode("Split", {split_input}, {a, c});
+      b.AddNode("Concat", {a, c}, {b.MakeOutput()}).AddAttribute("axis", int64_t{0});
+      ONNX_NAMESPACE::GraphProto branch;
+      branch.set_name("captured_split_output");
+      auto* identity = branch.add_node();
+      identity->set_op_type("Identity");
+      identity->add_input(c->Name());
+      identity->add_output("branch_out");
+      auto* output = branch.add_output();
+      output->set_name("branch_out");
+      output->mutable_type()->mutable_tensor_type()->set_elem_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+      output->mutable_type()->mutable_tensor_type()->mutable_shape()->add_dim()->set_dim_value(2);
+      auto& if_node = b.AddNode("If", {b.MakeInput<bool>({}, std::vector<bool>{true})}, {b.MakeOutput()});
+      if_node.AddAttribute("then_branch", branch);
+      if_node.AddAttribute("else_branch", branch);
+      b.SetGraphOutputs();
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      Statistics stats;
+      ASSERT_STATUS_OK(PatternRewriter({IdentitySplit(), SplitConcat()}, {.indexed = indexed}).Run(test.graph, stats));
+      EXPECT_EQ(stats.rewrites, root ? 1u : 0u);
+      const Node* producer = test.graph.GetProducerNode(c->Name());
+      ASSERT_NE(producer, nullptr);
+      EXPECT_EQ(producer->OutputDefs()[1], c);
+      ASSERT_STATUS_OK(test.graph.Resolve());
+    }
+  }
+}
+
+TEST(PatternRewriterTests, NumericalMultiOutputPatterns) {
+  for (bool indexed : {false, true}) {
+    TransformerTester(
+        [](ModelTestBuilder& b) {
+          auto* x = b.MakeInput<float>({4}, -1.0f, 1.0f);
+          auto* a = b.MakeIntermediate();
+          auto* c = b.MakeIntermediate();
+          b.AddNode("Split", {x}, {a, c});
+          b.AddNode("Concat", {a, c}, {b.MakeOutput()}).AddAttribute("axis", int64_t{0});
+        },
+        [](InferenceSessionWrapper& session) {
+          EXPECT_EQ(Count(session.GetGraph(), "Split"), 0u);
+          EXPECT_EQ(Count(session.GetGraph(), "Concat"), 0u);
+          EXPECT_EQ(Count(session.GetGraph(), "Identity"), 1u);
+        },
+        TransformerLevel::Default, TransformerLevel::Level1, 17, 0.0, 0.0,
+        std::make_unique<PatternRewriter>(Rules{SplitConcat()}, Options{.indexed = indexed}));
+    TransformerTester(
+        [](ModelTestBuilder& b) {
+          auto* x = b.MakeInput<float>({4}, -1.0f, 1.0f);
+          auto* middle = b.MakeIntermediate();
+          auto* a = b.MakeOutput();
+          auto* c = b.MakeOutput();
+          b.AddNode("Identity", {x}, {middle});
+          b.AddNode("Split", {middle}, {a, c});
+          b.AddNode("Neg", {a}, {b.MakeOutput()});
+          b.AddNode("Add", {c, c}, {b.MakeOutput()});
+        },
+        [](InferenceSessionWrapper& session) {
+          EXPECT_EQ(Count(session.GetGraph(), "Identity"), 0u);
+          EXPECT_EQ(Count(session.GetGraph(), "Split"), 1u);
+        },
+        TransformerLevel::Default, TransformerLevel::Level1, 17, 0.0, 0.0,
+        std::make_unique<PatternRewriter>(Rules{IdentitySplit()}, Options{.indexed = indexed}));
+  }
+}
+
+TEST(PatternRewriterTests, OnnxscriptMultiOutputLayerNormBias) {
+  for (bool indexed : {false, true}) {
+    for (int scenario = 0; scenario < 3; ++scenario) {
+      TestGraph test;
+      auto& b = test.builder;
+      auto* x = b.MakeInput<float>({2, 4}, -1.0f, 1.0f);
+      auto* y = b.MakeIntermediate();
+      auto* mean = scenario == 1 ? b.MakeOutput() : b.MakeIntermediate();
+      auto* inverse_std = b.MakeIntermediate();
+      b.AddNode("LayerNormalization", {x, b.MakeInitializer<float>({4}, 0.8f, 1.2f)}, {y, mean, inverse_std});
+      b.AddNode("Add", {y, b.MakeInitializer<float>({4}, -0.1f, 0.1f)}, {b.MakeOutput()});
+      if (scenario == 2) b.AddNode("Identity", {inverse_std}, {b.MakeOutput()});
+      b.SetGraphOutputs();
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      Statistics stats;
+      ASSERT_STATUS_OK(PatternRewriter({LayerNormBias()}, {.indexed = indexed}).Run(test.graph, stats));
+      EXPECT_EQ(stats.rewrites, scenario == 0 ? 1u : 0u);
+      ASSERT_STATUS_OK(test.graph.Resolve());
+    }
+    TransformerTester(
+        [](ModelTestBuilder& b) {
+          auto* x = b.MakeInput<float>({2, 4}, -1.0f, 1.0f);
+          auto* y = b.MakeIntermediate();
+          b.AddNode("LayerNormalization", {x, b.MakeInitializer<float>({4}, 0.8f, 1.2f)},
+                    {y, b.MakeIntermediate(), b.MakeIntermediate()});
+          b.AddNode("Add", {y, b.MakeInitializer<float>({4}, -0.1f, 0.1f)}, {b.MakeOutput()});
+        },
+        [](InferenceSessionWrapper& session) {
+          EXPECT_EQ(Count(session.GetGraph(), "LayerNormalization"), 1u);
+          EXPECT_EQ(Count(session.GetGraph(), "Add"), 0u);
+          for (const auto& node : session.GetGraph().Nodes()) {
+            if (node.OpType() == "LayerNormalization") {
+              EXPECT_EQ(node.InputDefs().size(), 3u);
+              EXPECT_EQ(node.OutputDefs().size(), 1u);
+            }
+          }
+        },
+        TransformerLevel::Default, TransformerLevel::Level1, 17, 1e-6, 1e-5,
+        std::make_unique<PatternRewriter>(Rules{LayerNormBias()}, Options{.indexed = indexed}));
+  }
 }
 
 TEST(PatternRewriterTests, NumericalMultiOutputLeafPreservation) {

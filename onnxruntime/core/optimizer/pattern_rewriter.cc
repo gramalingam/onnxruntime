@@ -20,7 +20,9 @@ std::string Signature(const Pattern& pattern) {
   stream << pattern.ValueCount() << ':';
   for (const auto& node : pattern.Nodes()) {
     stream << node.op.domain.size() << ':' << node.op.domain << node.op.name.size() << ':' << node.op.name;
-    stream << '/' << node.output;
+    stream << '/';
+    for (Value output : node.outputs) stream << output << ',';
+    stream << '/';
     for (Value input : node.inputs) stream << ',' << input;
     stream << ';';
   }
@@ -43,21 +45,27 @@ bool MatchPattern(const Pattern& pattern, const Graph& graph, const Node& root, 
   for (size_t i = pattern.Nodes().size(); i-- > 0;) {
     const auto& expected = pattern.Nodes()[i];
     const Node* node = match.nodes[i];
-    if (!node && match.values[expected.output]) {
-      auto it = producers.find(match.values[expected.output]);
-      if (it != producers.end()) node = graph.GetNode(it->second);
+    if (!node) {
+      for (Value output : expected.outputs) {
+        if (!match.values[output]) continue;
+        auto it = producers.find(match.values[output]);
+        if (it != producers.end()) node = graph.GetNode(it->second);
+        break;
+      }
     }
     if (!node || !distinct.insert(node->Index()).second || node->OpType() != expected.op.name ||
         node->Domain() != expected.op.domain || node->InputDefs().size() != expected.inputs.size() ||
-        node->OutputDefs().size() != 1 || !node->GetAttributeNameToSubgraphMap().empty() ||
-        !node->ImplicitInputDefs().empty() || node->GetLayeringAnnotation() != root.GetLayeringAnnotation() ||
-        node->GetExecutionProviderType() != root.GetExecutionProviderType()) {
+        node->OutputDefs().size() != expected.outputs.size() || !node->GetAttributeNameToSubgraphMap().empty() ||
+        !node->ImplicitInputDefs().empty() || node->GetLayeringAnnotation() != root.GetLayeringAnnotation()) {
       return false;
     }
     match.nodes[i] = node;
-    const NodeArg* output = node->OutputDefs()[0];
-    if (!output->Exists() || (match.values[expected.output] && match.values[expected.output] != output)) return false;
-    match.values[expected.output] = output;
+    for (size_t j = 0; j < expected.outputs.size(); ++j) {
+      const NodeArg* output = node->OutputDefs()[j];
+      const NodeArg*& binding = match.values[expected.outputs[j]];
+      if (!output->Exists() || (binding && binding != output)) return false;
+      binding = output;
+    }
     for (size_t j = 0; j < expected.inputs.size(); ++j) {
       const NodeArg* actual = node->InputDefs()[j];
       const NodeArg*& binding = match.values[expected.inputs[j]];
@@ -81,6 +89,13 @@ bool MatchPattern(const Pattern& pattern, const Graph& graph, const Node& root, 
   return true;
 }
 
+bool CanRewritePartition(const Match& match, const Options& options) {
+  const auto& provider = match.nodes.back()->GetExecutionProviderType();
+  if (!provider.empty() && !options.compatible_execution_providers.count(provider)) return false;
+  return std::all_of(match.nodes.begin(), match.nodes.end(),
+                     [&](const Node* node) { return node->GetExecutionProviderType() == provider; });
+}
+
 Status Replace(Graph& graph, const Pattern& pattern, const Match& match, const Replacement& recipe,
                Producers& producers, NodeIndex& added) {
   const auto& domain = recipe.domain == kOnnxDomainAlias ? kOnnxDomain : recipe.domain;
@@ -93,8 +108,9 @@ Status Replace(Graph& graph, const Pattern& pattern, const Match& match, const R
     inputs.push_back(graph.GetNodeArg(match.values[value]->Name()));
   }
   const Node& root = *match.nodes.back();
-  NodeArg* output = graph.GetNodeArg(root.OutputDefs()[0]->Name());
-  Node& replacement = graph.AddNode(graph.GenerateNodeName("rewrite"), recipe.op, "PatternRewriter", inputs, {output},
+  InlinedVector<NodeArg*> outputs;
+  for (const NodeArg* output : root.OutputDefs()) outputs.push_back(graph.GetNodeArg(output->Name()));
+  Node& replacement = graph.AddNode(graph.GenerateNodeName("rewrite"), recipe.op, "PatternRewriter", inputs, outputs,
                                     root, &recipe.attributes, domain);
   // Validate the imported schema before deleting anything.
   if (!graph.SetOpSchemaFromRegistryForNode(replacement)) {
@@ -124,7 +140,7 @@ Status Replace(Graph& graph, const Pattern& pattern, const Match& match, const R
   InlinedVector<NodeIndex> removed;
   for (const Node* node : match.nodes) {
     removed.push_back(node->Index());
-    producers.erase(node->OutputDefs()[0]);
+    for (const NodeArg* output : node->OutputDefs()) producers.erase(output);
     for (const NodeArg* input : node->InputDefs()) {
       graph.RemoveConsumerNode(input->Name(), graph.GetNode(node->Index()));
     }
@@ -144,8 +160,10 @@ Status Replace(Graph& graph, const Pattern& pattern, const Match& match, const R
                   static_cast<int>(i));
   }
   for (const auto& edge : outgoing) graph.AddEdge(added, edge.destination, edge.source_arg, edge.destination_arg);
-  producers[output] = added;
-  graph.UpdateProducerNode(output->Name(), added);
+  for (NodeArg* output : outputs) {
+    producers[output] = added;
+    graph.UpdateProducerNode(output->Name(), added);
+  }
   graph.NotifyNodeReplacement(removed, added);
   return Status::OK();
 }
@@ -156,20 +174,26 @@ Value Pattern::Input() {
   return value_count_++;
 }
 
-Value Pattern::Op(Operator op, std::initializer_list<Value> inputs) {
+Value Pattern::Op(Operator op, std::initializer_list<Value> inputs) { return MultiOp(std::move(op), inputs, 1)[0]; }
+
+InlinedVector<Value> Pattern::MultiOp(Operator op, std::initializer_list<Value> inputs, size_t output_count) {
   ORT_ENFORCE(!op.name.empty(), "Pattern operators need a name.");
   ORT_ENFORCE(nodes_.size() < 64, "Patterns are limited to 64 nodes.");
-  ORT_ENFORCE(value_count_ < 256 && inputs.size() <= 64,
+  ORT_ENFORCE(output_count > 0 && output_count <= 64, "Pattern operators need between 1 and 64 outputs.");
+  ORT_ENFORCE(value_count_ <= 256 - output_count && inputs.size() <= 64,
               "Patterns are limited to 256 values and 64 inputs per operator.");
   if (op.domain == kOnnxDomainAlias) op.domain = kOnnxDomain;
   for (Value input : inputs) ORT_ENFORCE(input < value_count_, "Pattern inputs must already be defined.");
-  Value output = value_count_++;
-  nodes_.push_back({std::move(op), InlinedVector<Value>(inputs), output});
-  return output;
+  InlinedVector<Value> outputs;
+  for (size_t i = 0; i < output_count; ++i) outputs.push_back(value_count_++);
+  nodes_.push_back({std::move(op), InlinedVector<Value>(inputs), outputs});
+  return outputs;
 }
 
 bool Pattern::IsInput(Value value) const {
-  return std::none_of(nodes_.begin(), nodes_.end(), [value](const auto& node) { return node.output == value; });
+  return std::none_of(nodes_.begin(), nodes_.end(), [value](const auto& node) {
+    return std::find(node.outputs.begin(), node.outputs.end(), value) != node.outputs.end();
+  });
 }
 
 PatternRewriter::PatternRewriter(Rules rules, Options options)
@@ -190,9 +214,13 @@ PatternRewriter::PatternRewriter(Rules rules, Options options)
       ORT_ENFORCE(domains.count(node.op.domain), "Missing rule opset requirement for domain: ", node.op.domain);
     }
     // Every node must reach the last node. Disconnected definitions are not patterns.
-    InlinedHashSet<Value> reachable{rule.pattern.Nodes().back().output};
+    const auto& root_outputs = rule.pattern.Nodes().back().outputs;
+    InlinedHashSet<Value> reachable(root_outputs.begin(), root_outputs.end());
     for (auto it = rule.pattern.Nodes().rbegin(); it != rule.pattern.Nodes().rend(); ++it) {
-      ORT_ENFORCE(reachable.count(it->output), "Disconnected pattern node.");
+      ORT_ENFORCE(
+          std::any_of(it->outputs.begin(), it->outputs.end(), [&](Value output) { return reachable.count(output); }),
+          "Disconnected pattern node.");
+      reachable.insert(it->outputs.begin(), it->outputs.end());
       reachable.insert(it->inputs.begin(), it->inputs.end());
     }
     ORT_ENFORCE(reachable.size() == rule.pattern.ValueCount(), "Unused pattern input.");
@@ -258,7 +286,7 @@ Status PatternRewriter::Run(Graph& graph, Statistics& statistics) const {
       statistics.candidates += rule_ids.size();
       ++statistics.structural_checks;
       Match match;
-      if (!MatchPattern(pattern, graph, *root, producers, match)) return;
+      if (!MatchPattern(pattern, graph, *root, producers, match) || !CanRewritePartition(match, options_)) return;
       for (size_t id : rule_ids) {
         if (!options_.match_only && id >= winner) break;
         ++statistics.guards;

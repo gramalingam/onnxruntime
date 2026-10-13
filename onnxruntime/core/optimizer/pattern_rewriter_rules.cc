@@ -11,8 +11,6 @@
 namespace onnxruntime {
 namespace rewrite {
 namespace {
-Operator Op(const char* name) { return {name, kOnnxDomain}; }
-
 ONNX_NAMESPACE::AttributeProto FloatAttribute(const char* name, float value) {
   ONNX_NAMESPACE::AttributeProto attr;
   attr.set_name(name);
@@ -29,9 +27,7 @@ ONNX_NAMESPACE::AttributeProto IntAttribute(const char* name, int64_t value) {
   return attr;
 }
 
-bool FloatCpu(const Match& match) {
-  const auto& provider = match.nodes.back()->GetExecutionProviderType();
-  if (!provider.empty() && provider != kCpuExecutionProvider) return false;
+bool Float32(const Match& match) {
   for (const NodeArg* value : match.values) {
     const auto* type = value->TypeAsProto();
     if (!type || !type->has_tensor_type() ||
@@ -71,15 +67,15 @@ Rules MakeExampleRules() {
   {
     Pattern p;
     auto x = p.Input(), bias = p.Input(), low = p.Input(), high = p.Input(), divisor = p.Input();
-    auto add = p.Op(Op("Add"), {x, bias});
-    auto clip = p.Op(Op("Clip"), {add, low, high});
-    auto mul = p.Op(Op("Mul"), {clip, x});
-    p.Op(Op("Div"), {mul, divisor});
+    auto add = p.Op("Add", {x, bias});
+    auto clip = p.Op("Clip", {add, low, high});
+    auto mul = p.Op("Mul", {clip, x});
+    p.Op("Div", {mul, divisor});
     rules.push_back({"HardSwish",
                      p,
                      {{kOnnxDomain, 14, 21}},
                      [=](const Graph& graph, const Match& m) {
-                       return FloatCpu(m) && Scalar(graph, *m.values[bias]) == 3.0f &&
+                       return Float32(m) && Scalar(graph, *m.values[bias]) == 3.0f &&
                               Scalar(graph, *m.values[low]) == 0.0f && Scalar(graph, *m.values[high]) == 6.0f &&
                               Scalar(graph, *m.values[divisor]) == 6.0f;
                      },
@@ -88,13 +84,13 @@ Rules MakeExampleRules() {
   {
     Pattern p;
     auto x = p.Input();
-    auto sigmoid = p.Op(Op("HardSigmoid"), {x});
-    p.Op(Op("Mul"), {sigmoid, x});
+    auto sigmoid = p.Op("HardSigmoid", {x});
+    p.Op("Mul", {sigmoid, x});
     rules.push_back({"HardSigmoidMul",
                      p,
                      {{kOnnxDomain, 14, 21}},
                      [](const Graph&, const Match& m) {
-                       return FloatCpu(m) && Float(*m.nodes[0], "alpha", 1.0f / 6.0f) &&
+                       return Float32(m) && Float(*m.nodes[0], "alpha", 1.0f / 6.0f) &&
                               Float(*m.nodes[0], "beta", 0.5f);
                      },
                      [=](const Graph&, const Match&) { return Replacement{"HardSwish", kOnnxDomain, {x}, {}}; }});
@@ -103,14 +99,14 @@ Rules MakeExampleRules() {
   {
     Pattern p;
     auto x = p.Input(), y = p.Input(), divisor = p.Input();
-    auto mm = p.Op(Op("MatMul"), {x, y});
-    p.Op(Op("Div"), {mm, divisor});
+    auto mm = p.Op("MatMul", {x, y});
+    p.Op("Div", {mm, divisor});
     rules.push_back({"MatMulDiv",
                      p,
                      {{kOnnxDomain, 9, 21}, {kMSDomain, 1, 1}},
                      [=](const Graph& graph, const Match& m) {
                        auto scalar = Scalar(graph, *m.values[divisor]);
-                       return FloatCpu(m) && scalar && *scalar != 0.0f && std::isfinite(1.0f / *scalar);
+                       return Float32(m) && scalar && *scalar != 0.0f && std::isfinite(1.0f / *scalar);
                      },
                      [=](const Graph& graph, const Match& m) {
                        NodeAttributes attributes;
@@ -121,13 +117,13 @@ Rules MakeExampleRules() {
   {
     Pattern p;
     auto x = p.Input(), y = p.Input();
-    auto transpose = p.Op(Op("Transpose"), {y});
-    p.Op(Op("MatMul"), {x, transpose});
+    auto transpose = p.Op("Transpose", {y});
+    p.Op("MatMul", {x, transpose});
     rules.push_back({"TransposeMatMul",
                      p,
                      {{kOnnxDomain, 9, 21}, {kMSDomain, 1, 1}},
                      [=](const Graph&, const Match& m) {
-                       if (!FloatCpu(m)) return false;
+                       if (!Float32(m)) return false;
                        const auto* shape = m.values[y]->Shape();
                        if (!shape || shape->dim_size() < 2) return false;
                        auto it = m.nodes[0]->GetAttributes().find("perm");
@@ -150,8 +146,8 @@ Rules MakeExampleRules() {
   {
     Pattern p;
     auto x = p.Input(), y = p.Input(), divisor = p.Input();
-    auto mm = p.Op({"FusedMatMul", kMSDomain}, {x, y});
-    p.Op(Op("Div"), {mm, divisor});
+    auto mm = p.Op("FusedMatMul", {x, y}, kMSDomain);
+    p.Op("Div", {mm, divisor});
     rules.push_back({"FusedMatMulDiv",
                      p,
                      {{kOnnxDomain, 9, 21}, {kMSDomain, 1, 1}},
@@ -159,7 +155,7 @@ Rules MakeExampleRules() {
                        auto scalar = Scalar(graph, *m.values[divisor]);
                        auto it = m.nodes[0]->GetAttributes().find("alpha");
                        float alpha = it == m.nodes[0]->GetAttributes().end() ? 1.0f : it->second.f();
-                       return FloatCpu(m) && scalar && *scalar != 0.0f && std::isfinite(alpha / *scalar);
+                       return Float32(m) && scalar && *scalar != 0.0f && std::isfinite(alpha / *scalar);
                      },
                      [=](const Graph& graph, const Match& m) {
                        auto attributes = m.nodes[0]->GetAttributes();
@@ -172,19 +168,19 @@ Rules MakeExampleRules() {
   {
     Pattern p;
     auto x = p.Input(), scale = p.Input(), exponent = p.Input(), epsilon = p.Input();
-    auto square = p.Op(Op("Pow"), {x, exponent});
-    auto mean = p.Op(Op("ReduceMean"), {square});
-    auto add = p.Op(Op("Add"), {mean, epsilon});
-    auto sqrt = p.Op(Op("Sqrt"), {add});
-    auto reciprocal = p.Op(Op("Reciprocal"), {sqrt});
-    auto normalize = p.Op(Op("Mul"), {x, reciprocal});
-    p.Op(Op("Mul"), {normalize, scale});
+    auto square = p.Op("Pow", {x, exponent});
+    auto mean = p.Op("ReduceMean", {square});
+    auto add = p.Op("Add", {mean, epsilon});
+    auto sqrt = p.Op("Sqrt", {add});
+    auto reciprocal = p.Op("Reciprocal", {sqrt});
+    auto normalize = p.Op("Mul", {x, reciprocal});
+    p.Op("Mul", {normalize, scale});
     rules.push_back(
         {"RmsNormalization",
          p,
          {{kOnnxDomain, 7, 17}},
          [=](const Graph& graph, const Match& m) {
-           if (!FloatCpu(m) || Scalar(graph, *m.values[exponent]) != 2.0f) return false;
+           if (!Float32(m) || Scalar(graph, *m.values[exponent]) != 2.0f) return false;
            auto eps = Scalar(graph, *m.values[epsilon]);
            const auto* shape = m.values[x]->Shape();
            const auto* scale_shape = m.values[scale]->Shape();

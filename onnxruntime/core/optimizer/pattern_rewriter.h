@@ -5,6 +5,8 @@
 #include <functional>
 #include <initializer_list>
 #include <string>
+#include <string_view>
+#include <type_traits>
 
 #include "core/optimizer/graph_transformer.h"
 
@@ -30,11 +32,21 @@ class Pattern {
  public:
   Value Input();
   Value Op(Operator op, std::initializer_list<Value> inputs);
+  template <typename Name, std::enable_if_t<std::is_convertible_v<Name, std::string_view>, int> = 0>
+  Value Op(Name&& name, std::initializer_list<Value> inputs, std::string_view domain = "") {
+    return Op(Operator{std::string(std::string_view(name)), std::string(domain)}, inputs);
+  }
+  InlinedVector<Value> MultiOp(Operator op, std::initializer_list<Value> inputs, size_t output_count);
+  template <typename Name, std::enable_if_t<std::is_convertible_v<Name, std::string_view>, int> = 0>
+  InlinedVector<Value> MultiOp(Name&& name, std::initializer_list<Value> inputs, size_t output_count,
+                               std::string_view domain = "") {
+    return MultiOp(Operator{std::string(std::string_view(name)), std::string(domain)}, inputs, output_count);
+  }
 
   struct NodePattern {
     Operator op;
     InlinedVector<Value> inputs;
-    Value output;
+    InlinedVector<Value> outputs;
   };
   const auto& Nodes() const { return nodes_; }
   size_t ValueCount() const { return value_count_; }
@@ -80,6 +92,8 @@ struct Statistics {
 struct Options {
   bool match_only = false;
   bool indexed = true;  // false is the rule-by-rule reference implementation.
+  // Unassigned nodes are always eligible. Assigned nodes must share an allowed provider.
+  InlinedHashSet<std::string> compatible_execution_providers{kCpuExecutionProvider};
 };
 
 // Immutable compiled rules; statistics belong to a call, not this transformer.
@@ -102,7 +116,7 @@ class PatternRewriter final : public GraphTransformer {
   Options options_;
 };
 
-// Conservative CPU/unassigned, float32 examples adapted from genuine ONNXScript rules.
+// Float32 examples adapted from genuine ONNXScript rules; EP eligibility is controlled by Options.
 Rules MakeExampleRules();
 
 }  // namespace rewrite

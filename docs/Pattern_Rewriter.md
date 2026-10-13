@@ -4,7 +4,9 @@
 It is **not registered in the default optimization pipeline**, and introduces no
 session configuration switch or public C ABI. C++ callers may register it using
 `InferenceSession::RegisterGraphTransformer`, just like existing custom transformers.
-The examples target CPU or unassigned float32 graphs, not arbitrary EP kernels.
+The example predicates are provider-independent and restrict types to float32.
+The engine's generic partition policy defaults to CPU or unassigned graphs;
+allowing other EPs requires the caller to verify replacement kernel compatibility.
 
 ## Source investigation and supported examples
 
@@ -21,6 +23,7 @@ the right architecture for ORT:
 | [`ort_fusions/fused_matmul_rule_sets.py`](https://github.com/microsoft/onnxscript/blob/9ff5a7c7718ab99d2ee0fa9b5effee2c543f3e36/onnxscript/rewriter/ort_fusions/fused_matmul_rule_sets.py) | MatMul/scalar Div, FusedMatMul/scalar Div (preserving attributes), and last-two-dimension Transpose/MatMul |
 | [`ort_fusions/rms_normalization.py`](https://github.com/microsoft/onnxscript/blob/9ff5a7c7718ab99d2ee0fa9b5effee2c543f3e36/onnxscript/rewriter/ort_fusions/rms_normalization.py) | Float32 Pow/ReduceMean/Add/Sqrt/Reciprocal/Mul/Mul to SimplifiedLayerNormalization |
 | [`ort_fusions/softmax.py`](https://github.com/microsoft/onnxscript/blob/9ff5a7c7718ab99d2ee0fa9b5effee2c543f3e36/onnxscript/rewriter/ort_fusions/softmax.py) | Studied but deliberately not enabled: fp16 cast removal needs a separately verified precision/EP policy |
+| [`rules/fusion/_layer_norm.py`, `LayerNormBiasFusion`](https://github.com/microsoft/onnxscript/blob/9ff5a7c7718ab99d2ee0fa9b5effee2c543f3e36/onnxscript/rewriter/rules/fusion/_layer_norm.py) | Test-only adaptation matches all three LayerNormalization outputs, fuses a trailing bias Add, and rejects observable statistics |
 
 Existing ORT `SelectorActionRegistry` already dispatches selectors by root op/domain
 and version. `QuickGeluFusion` illustrates repeated inputs and provider restrictions,
@@ -31,8 +34,9 @@ are the additional capabilities over hand-written selectors.
 
 ## Defining a rule
 
-The small DSL uses integer value handles. An input introduces a variable; an
-operator introduces a single output. Reusing a handle requires the identical
+The small DSL uses integer value handles. An input introduces a variable;
+`Op` introduces one output, while `MultiOp` introduces an ordered output list.
+Reusing a handle requires the identical
 `NodeArg`, not merely the same shape or equivalent contents. Pattern operators
 specify only name and domain. **Model-imported opset ranges belong to the rule**,
 not to individual nodes or their schema since-versions.
@@ -41,12 +45,12 @@ not to individual nodes or their schema since-versions.
 using namespace onnxruntime::rewrite;
 Pattern p;
 auto x = p.Input();
-auto h = p.Op({"HardSigmoid", kOnnxDomain}, {x});
-p.Op({"Mul", kOnnxDomain}, {h, x});
+auto h = p.Op("HardSigmoid", {x});
+p.Op("Mul", {h, x});
 Rule rule{
     "HardSigmoidMul", p,
     {{kOnnxDomain, 14, 21}},  // inclusive imported opset range
-    guard,  // checks float32, CPU/unassigned, alpha=1/6, beta=1/2
+    guard,  // checks float32, alpha=1/6, beta=1/2
     [x](const Graph&, const Match&) {
       return Replacement{"HardSwish", kOnnxDomain, {x}, {}};
     }};
@@ -56,11 +60,49 @@ ORT_RETURN_IF_ERROR(session.RegisterGraphTransformer(std::move(transformer),
 ```
 
 `pattern_rewriter_rules.cc` contains complete readable guard/recipe examples.
+`Op(name, inputs)` defaults to the standard ONNX domain; the optional third
+argument selects another domain, e.g. `p.Op("FusedMatMul", {x, y}, kMSDomain)`.
+The original `Op(Operator{name, domain}, inputs)` overload remains available.
+Name overloads accept literals, `std::string` and `std::string_view`; template
+deduction keeps the original braced operator form unambiguous.
+
+### Multiple outputs
+
+`MultiOp(name, inputs, output_count, domain)` returns an ordered vector of distinct
+value handles. `domain` is optional, and an `Operator` overload is also available.
+For example:
+
+```cpp
+Pattern p;
+auto x = p.Input();
+auto pieces = p.MultiOp("Split", {x}, 2);
+p.Op("Concat", {pieces[0], pieces[1]});
+```
+
+The output count must match the node exactly. Matching can find a producer
+through any output, including its second or later output, and checks every
+bound output against its exact output slot. Unused outputs of a connected node
+are allowed in the definition, but cannot be graph outputs or have external
+consumers if the node is deleted. The tests include Split/Concat and a genuine
+ONNXScript LayerNorm-bias adaptation with unused mean/inverse-standard-deviation
+outputs; exposing either statistic prevents its deletion.
+
+A multi-output root is also supported. The single replacement node inherits
+**all root outputs in the original order**, including their names, types, shapes,
+graph-output status, and consumers. The recipe does not need an output list.
+Its schema must permit that output count. Identity/Split to Split tests execute
+both root outputs and downstream fanout, including repeated uses of output 1.
+This does not yet support mapping observable outputs from multiple matched nodes
+to arbitrary replacement slots, or matching omitted optional output placeholders.
+
+### Guards, applicability and integration
+
 Guards and recipes are trusted C++ code: they must be pure, guards must depend on
 local bindings/attributes/constants rather than mutable global graph conditions,
 they must not retain match
-pointers, and must establish semantic equivalence and replacement type/kernel
-compatibility. The engine provides structural and deletion safety; it cannot prove
+pointers, and must establish semantic equivalence and replacement type
+compatibility. The caller must establish kernel compatibility for its EP policy.
+The engine provides structural and deletion safety; it cannot prove
 an arbitrary callback's mathematical correctness. Guard false means an ordinary
 nonmatch; invalid patterns or recipes report explicit errors.
 
@@ -92,12 +134,33 @@ ORT_RETURN_IF_ERROR(graph.Resolve());            // required after rewriting
 Callers must not concurrently mutate a graph. Compiled rules and options are
 immutable and per-call state/statistics are local.
 
+### Generic execution-provider policy
+
+Rules do not inspect EP assignments. After structural matching and before rule
+guards, the engine applies `CanRewritePartition`: all matched nodes must have
+the same assignment, and an assigned EP must belong to
+`Options::compatible_execution_providers`. Unassigned nodes are always eligible.
+The default allowed set contains only CPU, preserving the verified execution scope.
+Callers can opt into an EP (or clear the set for unassigned-only rewrites):
+
+```cpp
+Options options;
+options.compatible_execution_providers.insert(kCudaExecutionProvider);
+PatternRewriter rewriter(MakeExampleRules(), options);
+```
+
+The replacement inherits the root's assignment. Allowing an EP is a caller assertion
+of kernel/precision compatibility, not automatic kernel discovery or evidence of
+GPU execution. Mixed assignments are rejected even if both EPs are allowed. This
+generic policy also applies in match-only mode, which measures safe rewrite
+eligibility rather than partition-independent structural matches.
+
 ## Compilation, matching, mutation, and termination
 
 Construction validates connected acyclic definitions, used inputs, rule-level
-domain/opset requirements, and limits of 64 nodes, 256 values and 64 inputs per operator.
+domain/opset requirements, and limits of 64 nodes, 256 values and 64 inputs/outputs per operator.
 It buckets groups by root op/domain and interns identical structural signatures,
-including binding identities but not rule-level import ranges.
+including ordered output handles and binding identities but not rule-level import ranges.
 Rules with identical topology but different attribute/constant conditions share
 one structural match, even when their applicability ranges differ.
 There is **no arbitrary-prefix trie**: different structural
@@ -115,15 +178,16 @@ imports, not the enclosing model's.
 The call then builds a producer index and topological worklist once. Matching walks
 the compiled node definitions backward without recursive search, alternation,
 commutative backtracking, or unbounded neighborhood exploration. Each node checks
-op/domain, exact input count, one output, repeated bindings, provider and
-layer annotation agreement. All non-root outputs must be internal: graph outputs,
+op/domain, exact input/output counts, repeated bindings and layer annotation
+agreement. Provider eligibility is a separate generic check. All non-root outputs
+must be internal: graph outputs,
 external consumers (including implicit subgraph captures), and pattern inputs
 produced inside the deletion set prevent replacement.
 
 Registration order defines priority even across different structural groups.
 Match-only mode reports all passing rule guards; rewrite mode selects only the
 first passing rule. Replacements may consume **only input variables**, retain the
-root's output `NodeArg` (name/type/shape and external users), and inherit its
+root's output `NodeArg`s (name/type/shape and external users), and inherit its
 execution provider and layer annotation. The replacement domain must be declared
 in the rule requirements and already imported. Replacement schema/attribute checks
 precede deletion. ORT edges and producer/consumer indexes are updated; removed
@@ -155,8 +219,9 @@ mathematical worst-case guarantees for arbitrary rules or models.
 
 ## Intentional limitations and precision
 
-Only single-output matched nodes and single-node/single-output replacements are
-supported. Multi-output producers, optional/missing inputs, variadic patterns,
+Matched nodes may have multiple outputs, but replacements remain single-node
+and must preserve the root's complete ordered output list. Optional/missing
+inputs or outputs, variadic patterns,
 model-local function rewriting, tensor synthesis, domain-import edits, alternative
 patterns and implicit commutation are unsupported. Control-flow nodes are not
 matched, but `Apply` rewrites inside their subgraphs. External tensor data and

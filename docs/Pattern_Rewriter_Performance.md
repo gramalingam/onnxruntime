@@ -7,8 +7,8 @@ Raw measurements are in [Pattern_Rewriter_Benchmark.csv](Pattern_Rewriter_Benchm
 
 ## Configuration and scope
 
-Measured October 13, 2026, after migrating applicability to rule-level import
-ranges, on Windows 11 Enterprise 10.0.26100, Dell Precision
+Measured October 13, 2026, after adding multi-output patterns, concise constructors
+and generic EP policy, on Windows 11 Enterprise 10.0.26100, Dell Precision
 5820 Tower X-Series, Intel Core i9-10920X (nominal 3.50 GHz, 24 logical processors),
 approximately 64 GiB RAM. ORT base revision:
 `42518d89d7c5393baf97d69f8c2670668c40decf`, version 1.32.0.
@@ -68,15 +68,15 @@ At 32 layers / 2241 nodes / 500 rules:
 
 | Workload | Reference engine median ms | Indexed engine median ms | Indexed engine max ms | Engine speedup | Indexed preparation median ms | Indexed Resolve median ms | Reference total median ms | Indexed total median ms |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Active match-only | 56.1170 | 11.1454 | 12.1992 | 5.03x | 3.0375 | 0.0109 | 56.5110 | 14.1701 |
-| Same-structure semantic misses | 52.7693 | 11.2454 | 12.9956 | 4.69x | 2.9337 | 0.0133 | 53.1632 | 14.6545 |
-| Successful rewriting | 59.0984 | 13.8497 | 17.9727 | 4.27x | 2.8381 | 15.9662 | 79.3526 | 33.2214 |
-| Synthetic distinct structural misses | 61.1454 | 50.4680 | 54.7899 | 1.21x | 8.4203 | 0.0219 | 62.0567 | 59.2537 |
+| Active match-only | 70.6460 | 13.3980 | 22.2259 | 5.27x | 4.3209 | 0.0208 | 71.4841 | 18.8780 |
+| Same-structure semantic misses | 72.5865 | 11.7040 | 28.8747 | 6.20x | 3.2723 | 0.0162 | 73.1829 | 15.0976 |
+| Successful rewriting | 76.4116 | 16.3844 | 33.4006 | 4.66x | 3.4737 | 19.8251 | 97.6291 | 42.6921 |
+| Synthetic distinct structural misses | 72.6219 | 74.4585 | 86.9363 | 0.98x | 9.0458 | 0.0267 | 74.5306 | 83.8081 |
 
-The synthetic case improves only about **5% end-to-end** when preparation is included.
+The synthetic case is **slower end-to-end** when preparation is included.
 Distinct plans do not share prefixes, and compilation is more expensive than the
-reference. This modest gain is sensitive to host noise; the earlier node-version
-implementation was slightly slower end-to-end on the same workload. Root indexing
+reference. These results are sensitive to host noise; an earlier import-filtered
+implementation was modestly faster on the same workload. Root indexing
 alone does not solve every large-rule-set workload.
 Conversely, an immutable compiled transformer can amortize preparation across
 graphs; the benchmark deliberately charges preparation to every run.
@@ -85,35 +85,38 @@ Rule-count scaling for successful rewriting on the same 32-layer graph:
 
 | Rules | Reference engine median ms | Indexed engine median ms | Indexed preparation median ms | Indexed Resolve median ms | Rewrites |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 4.2304 | 4.2336 | 0.0487 | 21.3210 | 64 |
-| 10 | 5.9163 | 5.8939 | 0.1142 | 19.0531 | 128 |
-| 100 | 16.1076 | 7.6142 | 0.6775 | 21.1160 | 128 |
-| 300 | 39.5080 | 12.7172 | 2.0887 | 19.4651 | 128 |
-| 500 | 59.0984 | 13.8497 | 2.8381 | 15.9662 | 128 |
+| 1 | 4.9963 | 5.4241 | 0.0575 | 24.8174 | 64 |
+| 10 | 6.0513 | 6.3679 | 0.1280 | 22.1893 | 128 |
+| 100 | 17.2254 | 6.8823 | 0.7320 | 19.0990 | 128 |
+| 300 | 39.1072 | 12.5730 | 2.1582 | 20.0874 | 128 |
+| 500 | 76.4116 | 16.3844 | 3.4737 | 19.8251 | 128 |
 
 One rule includes only RMSNorm and therefore performs fewer rewrites. Indexing has
-overhead: at one rule, active match-only on 32 layers measured 2.1630 ms indexed
-versus 1.7440 ms reference. There is no claim that indexing always wins.
+overhead: at one rule, active match-only on 32 layers measured 2.4979 ms indexed
+versus 2.4580 ms reference. There is no claim that indexing always wins.
 
 Layer scaling with 500 rules, indexed implementation (median / maximum of nine):
 
 | Layers | Workload | Engine ms | Final Resolve ms | Preparation ms | Total ms |
 |---:|---|---:|---:|---:|---:|
-| 1 | Active match-only | 0.3044 / 0.3558 | 0.0003 / 0.0003 | 2.7565 / 3.0317 | 3.0562 / 3.3878 |
-| 8 | Active match-only | 2.5450 / 2.8323 | 0.0021 / 0.0038 | 3.0551 / 3.7659 | 5.6184 / 6.4384 |
-| 32 | Active match-only | 11.1454 / 12.1992 | 0.0109 / 0.0224 | 3.0375 / 3.8524 | 14.1701 / 16.0740 |
-| 1 | Semantic misses | 0.3058 / 0.3420 | 0.0003 / 0.0004 | 2.7639 / 3.0397 | 3.0661 / 3.3771 |
-| 8 | Semantic misses | 2.7329 / 3.6636 | 0.0027 / 0.0108 | 3.1306 / 4.0923 | 5.8990 / 7.7667 |
-| 32 | Semantic misses | 11.2454 / 12.9956 | 0.0133 / 0.0450 | 2.9337 / 3.6696 | 14.6545 / 16.3258 |
-| 1 | Rewriting | 0.3655 / 0.4051 | 0.3925 / 0.4417 | 2.7517 / 3.0277 | 3.5067 / 3.8745 |
-| 8 | Rewriting | 3.1418 / 3.4517 | 3.7279 / 5.3076 | 3.0703 / 3.6653 | 10.2405 / 11.4026 |
-| 32 | Rewriting | 13.8497 / 17.9727 | 15.9662 / 19.7425 | 2.8381 / 3.9390 | 33.2214 / 37.1322 |
-| 1 | Synthetic misses | 1.6808 / 1.7417 | 0.0006 / 0.0011 | 8.2579 / 8.8746 | 9.8978 / 10.5562 |
-| 8 | Synthetic misses | 14.0484 / 18.8847 | 0.0057 / 0.0099 | 8.1347 / 8.7927 | 22.1533 / 27.6270 |
-| 32 | Synthetic misses | 50.4680 / 54.7899 | 0.0219 / 0.0277 | 8.4203 / 10.6919 | 59.2537 / 62.7946 |
+| 1 | Active match-only | 0.3494 / 0.3716 | 0.0004 / 0.0008 | 3.3583 / 3.5701 | 3.7042 / 3.9421 |
+| 8 | Active match-only | 3.3238 / 4.6376 | 0.0040 / 0.0070 | 3.5224 / 4.1014 | 6.7686 / 8.2005 |
+| 32 | Active match-only | 13.3980 / 22.2259 | 0.0208 / 0.0237 | 4.3209 / 11.9689 | 18.8780 / 34.2185 |
+| 1 | Semantic misses | 0.3672 / 0.6532 | 0.0005 / 0.0007 | 3.3979 / 4.9755 | 3.8006 / 5.3490 |
+| 8 | Semantic misses | 2.8641 / 8.2150 | 0.0057 / 0.0109 | 3.5428 / 13.3055 | 6.8985 / 21.5277 |
+| 32 | Semantic misses | 11.7040 / 28.8747 | 0.0162 / 0.0293 | 3.2723 / 3.4929 | 15.0976 / 32.3371 |
+| 1 | Rewriting | 0.4197 / 0.6654 | 0.4468 / 1.9302 | 3.3783 / 5.2108 | 4.2666 / 6.3475 |
+| 8 | Rewriting | 3.4031 / 4.7259 | 4.0870 / 5.0392 | 3.8477 / 4.9182 | 11.5174 / 13.1849 |
+| 32 | Rewriting | 16.3844 / 33.4006 | 19.8251 / 33.2741 | 3.4737 / 5.3419 | 42.6921 / 67.2441 |
+| 1 | Synthetic misses | 1.8062 / 2.1824 | 0.0009 / 0.0014 | 9.5869 / 13.4720 | 11.3684 / 15.2904 |
+| 8 | Synthetic misses | 15.3799 / 18.3429 | 0.0068 / 0.0076 | 10.7740 / 27.7695 | 26.1607 / 46.1200 |
+| 32 | Synthetic misses | 74.4585 / 86.9363 | 0.0267 / 0.0297 | 9.0458 / 10.3327 | 83.8081 / 96.4596 |
 
 These maxima are observed tails, not p99 estimates. With nine repetitions and an
 unisolated host, occasional scheduling outliers are expected; raw rows are retained.
+This refresh has visibly larger outliers in both implementations than the earlier
+measurements. Differences between separately measured commits do not isolate the
+cost of the multi-output support or generic EP policy.
 Final Resolve is a significant part of successful rewriting and cannot be ignored
 when estimating initialization cost. Tensor inference speed is not benchmarked.
 
@@ -149,10 +152,10 @@ derived component budgets (which is more conservative than an observed joint sum
 
 | 500-rule workload | Preparation budget ms | Engine budget ms | Resolve budget ms | Combined budget ms |
 |---|---:|---:|---:|---:|
-| Active match-only | 7.7048 | 60.9960 | 0.1120 | 68.8128 |
-| Semantic misses | 8.1846 | 73.2720 | 0.2250 | 81.6816 |
-| Rewriting | 7.8780 | 89.8635 | 106.1520 | 203.8935 |
-| Synthetic distinct structural misses | 21.3838 | 377.6940 | 0.1980 | 399.2758 |
+| Active match-only | 23.9378 | 111.1295 | 0.1400 | 135.2073 |
+| Semantic misses | 26.6110 | 164.3000 | 0.2180 | 191.1290 |
+| Rewriting | 10.6838 | 167.0030 | 166.3705 | 344.0573 |
+| Synthetic distinct structural misses | 55.5390 | 434.6815 | 0.1520 | 490.3725 |
 
 These are empirical planning budgets, **not mathematical worst-case guarantees,
 confidence intervals or measured 80-layer results**. A two-times margin is a
@@ -174,9 +177,9 @@ $env:ORT_REWRITER_BENCHMARK_CSV = "C:\repos\copilot-worktrees\onnxruntime\gramal
 .\onnxruntime_test_all.exe --gtest_also_run_disabled_tests --gtest_filter="PatternRewriterBenchmark.DISABLED_Decoder"
 ```
 
-Results: configuration and CPU Release build **passed**; **32 correctness/regression
-tests passed** (21 rewriter tests, 11 existing MatMulScaleFusion/QuickGelu tests);
-the disabled benchmark **passed** in 39.511 seconds, including untimed work.
+Results: configuration and CPU Release build **passed**; **41 correctness/regression
+tests passed** (30 rewriter tests, 11 existing MatMulScaleFusion/QuickGelu tests);
+the disabled benchmark **passed** in 48.321 seconds, including untimed work.
 No full ORT suite or GPU build was run.
 
 Tests cover positive/negative structural matches, repeated bindings and a shared-node
@@ -188,6 +191,15 @@ inclusive range boundaries across schema changes, rejected graphs sharing a
 schema with accepted graphs, missing/additional domains, alias normalization,
 invalid/duplicate requirements, filtering before guards, priority within shared
 plans, and reuse of a compiled transformer across import contexts.
+Provider tests cover unassigned/CPU nodes, rejected assigned EPs, explicit generic
+EP opt-in, mixed assignments, and policy-before-guard ordering. These are graph
+tests; no GPU execution is claimed. Multi-output tests cover exact output counts,
+bindings reached through a nonzero output slot, ordered/repeated/shared bindings,
+unused outputs, secondary graph outputs/external consumers/implicit captures,
+all-root-output preservation, slot-specific fanout, invalid replacement arity,
+repeated application, and executed Split/Concat and Identity/Split rewrites.
+An executed test-only adaptation of ONNXScript's `LayerNormBiasFusion` matches
+three LayerNormalization outputs and fuses Add only when statistics are unobserved.
 Executed tests cover HardSwish,
 MatMul/Div, Transpose/MatMul, combined Transpose/Div, a retained Dropout output,
 and the complete two-layer decoder including all present KV outputs. CPU HardSwish
