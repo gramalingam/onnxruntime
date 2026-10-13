@@ -10,6 +10,8 @@
 #include <unordered_map>
 
 #include "core/optimizer/pattern_rewriter.h"
+#include "core/graph/graph_utils.h"
+#include "core/optimizer/initializer.h"
 #include "core/platform/env.h"
 #include "test/optimizer/graph_transform_test_fixture.h"
 #include "test/unittest_util/graph_transform_test_builder.h"
@@ -706,7 +708,19 @@ TEST(PatternRewriterTests, ParsedHardSwishConstantsAndExecution) {
   EXPECT_EQ(parsed.NamedValue("divisor").handle, 3);
   EXPECT_EQ(parsed.Nodes()[0].outputs[0].name, "add");
   EXPECT_EQ(parsed.Constants().size(), 1u);
-  parsed.Name(parsed.Nodes()[0].inputs[1], "bias");
+  auto semantic_guard = [type_guard = MakeExampleRules()[0].guard](const Graph& graph, const Match& match) {
+    if (!type_guard(graph, match)) return false;
+    for (const auto& [name, expected] :
+         {std::pair{"low", 0.0f}, std::pair{"high", 6.0f}, std::pair{"divisor", 6.0f}}) {
+      const auto* tensor = graph_utils::GetConstantInitializer(graph, match.valueOf(name)->Name());
+      if (!tensor || tensor->dims_size() != 0 || tensor->data_type() != ONNX_NAMESPACE::TensorProto_DataType_FLOAT ||
+          tensor->data_location() == ONNX_NAMESPACE::TensorProto_DataLocation_EXTERNAL)
+        return false;
+      Initializer initializer(graph, *tensor, graph.ModelPath());
+      if (initializer.size() != 1 || *initializer.data<float>() != expected) return false;
+    }
+    return true;
+  };
   for (bool indexed : {false, true}) {
     for (int scenario = 0; scenario < 4; ++scenario) {
       TestGraph test;
@@ -743,6 +757,7 @@ TEST(PatternRewriterTests, ParsedHardSwishConstantsAndExecution) {
       }
       auto rule = MakeExampleRules()[0];
       rule.pattern = parsed;
+      rule.guard = semantic_guard;
       Statistics stats;
       ASSERT_STATUS_OK(PatternRewriter({rule}, {.indexed = indexed}).Run(test.graph, stats));
       EXPECT_EQ(stats.rewrites, scenario == 0 ? 1u : 0u);
@@ -751,6 +766,7 @@ TEST(PatternRewriterTests, ParsedHardSwishConstantsAndExecution) {
   }
   auto rule = MakeExampleRules()[0];
   rule.pattern = parsed;
+  rule.guard = semantic_guard;
   TransformerTester([](ModelTestBuilder& b) { BuildHardSwish(b); },
                     [](InferenceSessionWrapper& session) {
                       EXPECT_EQ(Count(session.GetGraph(), "HardSigmoid"), 1u);
@@ -758,6 +774,69 @@ TEST(PatternRewriterTests, ParsedHardSwishConstantsAndExecution) {
                     },
                     TransformerLevel::Default, TransformerLevel::Level1, 17, 1e-6, 1e-5,
                     std::make_unique<PatternRewriter>(Rules{rule}));
+}
+
+TEST(PatternRewriterTests, ExampleFixedConstantsArePatternLiterals) {
+  const auto rule = MakeExampleRules()[0];
+  EXPECT_EQ(rule.pattern.Constants().size(), 4u);
+  EXPECT_EQ(rule.pattern.NamedValue("x").handle, 0);
+  for (auto name : {"bias", "low", "high", "divisor"})
+    EXPECT_THROW(rule.pattern.NamedValue(name), OnnxRuntimeException);
+  for (bool indexed : {false, true}) {
+    for (auto op : {"Add", "Clip", "Div"}) {
+      for (int slot = op == std::string_view("Clip") ? 1 : 0;
+           slot < (op == std::string_view("Clip") ? 3 : 1); ++slot) {
+        for (int scenario = 0; scenario < 4; ++scenario) {
+          TestGraph test;
+          BuildHardSwish(test.builder);
+          test.builder.SetGraphOutputs();
+          ASSERT_STATUS_OK(test.graph.Resolve());
+          const NodeArg* argument = nullptr;
+          for (const auto& node : test.graph.Nodes()) {
+            if (node.OpType() == op) argument = node.InputDefs()[op == std::string_view("Clip") ? slot : 1];
+          }
+          ASSERT_NE(argument, nullptr);
+          const auto* original = test.graph.GetInitializer(argument->Name(), false);
+          ASSERT_NE(original, nullptr);
+          auto tensor = *original;
+          if (scenario == 0) {
+            tensor.clear_raw_data();
+            tensor.clear_float_data();
+            tensor.add_float_data(9.0f);
+          }
+          if (scenario == 1) {
+            tensor.add_dims(1);
+            test.graph.GetNodeArg(argument->Name())->ClearShape();
+          }
+          if (scenario == 2) {
+            tensor.clear_raw_data();
+            tensor.clear_float_data();
+            tensor.add_float_data(std::numeric_limits<float>::infinity());
+          }
+          if (scenario != 3) {
+            test.graph.RemoveInitializedTensor(argument->Name());
+            test.graph.AddInitializedTensor(tensor);
+          } else {
+            auto inputs = test.graph.GetInputsIncludingInitializers();
+            inputs.push_back(argument);
+            test.graph.SetInputs(inputs);
+          }
+          ASSERT_STATUS_OK(test.graph.Resolve());
+          Statistics stats;
+          ASSERT_STATUS_OK(PatternRewriter({rule}, {.indexed = indexed}).Run(test.graph, stats));
+          EXPECT_EQ(stats.rewrites, 0u) << op << " input " << slot << " scenario " << scenario;
+          EXPECT_EQ(test.graph.NumberOfNodes(), 4u);
+        }
+      }
+    }
+  }
+#ifndef DISABLE_CONTRIB_OPS
+  const auto rms = MakeExampleRules().back();
+  ASSERT_EQ(rms.pattern.Constants().size(), 1u);
+  EXPECT_FLOAT_EQ(std::get<float>(rms.pattern.Constants().begin()->second), 2.0f);
+  EXPECT_THROW(rms.pattern.NamedValue("exponent"), OnnxRuntimeException);
+  EXPECT_NO_THROW(rms.pattern.NamedValue("epsilon"));
+#endif
 }
 
 TEST(PatternRewriterTests, ParsedAttributesMultiOutputsAndDomains) {

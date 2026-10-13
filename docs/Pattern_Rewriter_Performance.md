@@ -72,7 +72,8 @@ All four commands passed for the recorded follow-up measurements.
 ## Multi-node replacement and parse-once follow-up
 
 The current replacement-plan implementation was measured using the same build,
-machine and decoder matrix. Raw current decoder results are in
+machine and decoder matrix, refreshed after the PR feedback that moves fixed
+HardSwish/RMSNorm constants into pattern literals. Raw current decoder results are in
 [Pattern_Rewriter_Replacement_Benchmark.csv](Pattern_Rewriter_Replacement_Benchmark.csv).
 These measurements include parsing the six example patterns and two textual
 replacement plans in preparation, plus per-rule compilation of replacement input
@@ -83,14 +84,18 @@ At 32 layers / 2241 nodes / 500 rules, all times are milliseconds:
 
 | Workload | Reference engine median | Indexed engine median | Indexed engine max | Indexed preparation median | Indexed Resolve median | Indexed total median |
 |---|---:|---:|---:|---:|---:|---:|
-| Active match-only | 57.9851 | 19.4515 | 20.8962 | 4.0799 | 0.0238 | 23.5048 |
-| Adversarial semantic misses | 59.9347 | 20.4246 | 21.5715 | 4.0817 | 0.0246 | 24.4483 |
-| Successful rewriting | 66.7473 | 23.5457 | 24.5314 | 3.9599 | 18.8356 | 46.3994 |
-| Synthetic distinct structural misses | 68.8041 | 53.8021 | 80.3349 | 11.2572 | 0.0281 | 65.1687 |
+| Active match-only | 110.7260 | 29.3926 | 33.2167 | 7.5689 | 0.0485 | 37.0282 |
+| Adversarial semantic misses | 108.1120 | 29.0003 | 45.7008 | 7.4227 | 0.0491 | 36.5264 |
+| Successful rewriting | 87.0699 | 34.6788 | 42.8362 | 7.9438 | 30.5408 | 80.9836 |
+| Synthetic distinct structural misses | 129.2190 | 102.5050 | 114.3900 | 17.4608 | 0.0497 | 120.1967 |
 
 Both implementations still agree on visits, matches, rewrites and output node
 counts across all 1080 rows. The successful 500-rule decoder run performs 128
 rewrites, leaving 1793 nodes.
+This refresh is broadly slower than the preceding run, including the synthetic
+structural-miss workload that does not use the changed literal patterns.
+These shared-host measurements are not a controlled before/after experiment,
+and the difference cannot be attributed solely to this source change.
 
 A separate **synthetic replacement microbenchmark**, not a model-derived decoder,
 uses 1000 independent four-node HardSwish decompositions (4000 initial nodes).
@@ -105,9 +110,9 @@ Raw results are in [Pattern_Rewriter_Replacement_Plans.csv](Pattern_Rewriter_Rep
 
 | Mode | Preparation median ms | Engine median ms | Engine max ms | Resolve median ms | Output nodes |
 |---|---:|---:|---:|---:|---:|
-| 0: callback-built HardSwish | 0.1263 | 47.9877 | 49.8680 | 36.4286 | 1000 |
-| 1: parsed HardSwish | 0.1315 | 45.2831 | 62.1462 | 35.4819 | 1000 |
-| 2: parsed HardSigmoid/Mul sequence | 0.1414 | 77.2673 | 91.1039 | 50.3654 | 2000 |
+| 0: callback-built HardSwish | 0.1994 | 93.0203 | 100.9640 | 60.7728 | 1000 |
+| 1: parsed HardSwish | 0.1841 | 78.6248 | 93.3256 | 57.2869 | 1000 |
+| 2: parsed HardSigmoid/Mul sequence | 0.2211 | 134.9450 | 155.3510 | 78.4332 | 2000 |
 
 The similar single-node timings are not evidence of a universal speedup:
 shared-machine variation is visible in the maxima. The two-node plan necessarily
@@ -115,13 +120,15 @@ does more creation, edge and Resolve work. This demonstrates that parsing can be
 paid once while the same plan drives 1000 successful rewrites; the benchmark does
 not measure or endorse parsing inside a per-match callback.
 
-Validation: CPU Release build passed, **52 correctness/regression tests passed**
-(41 rewriter, 11 existing optimizer), and both disabled benchmarks passed.
+Validation: CPU Release build passed, **53 correctness/regression tests passed**
+(42 rewriter, 11 existing optimizer), and both disabled benchmarks passed.
 New executed tests cover HardSwish-to-HardSigmoid/Mul, branched Split/Concat,
 multi-output roots, and synthesized float32/int64 scalar initializers.
 Negative tests verify staged-node/initializer cleanup on schema failure,
 invalid output references, undeclared domains and nondecreasing replacements.
 Plan reuse and invalidation are checked in indexed and reference modes.
+Fixed-constant tests reject wrong values, singleton-vector ranks, nonfinite
+values and overridable initializers at every HardSwish constant position.
 Decoder numerical errors remain unchanged from the earlier section.
 
 Use the same build command and correctness filter above. Benchmark reproduction:

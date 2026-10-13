@@ -146,6 +146,23 @@ This text describes structure, **not a semantically complete HardSwish rule**:
 the rule guard must additionally establish float32, low=0, high=6 and divisor=6.
 The numerical test retains those checks before executing the replacement.
 
+The actual example rule eliminates those fixed bindings entirely:
+
+```cpp
+Pattern p(R"(
+  (x) =>
+    add = Add(x, 3.0)
+    clip = Clip(add, 0.0, 6.0)
+    mul = Mul(clip, x)
+    return Div(mul, 6.0)
+)");
+```
+
+Its guard only checks float32, since the pattern checks every fixed scalar.
+RMSNorm similarly uses `Pow(x, 2.0)` directly; epsilon remains a named binding
+because its value varies and is copied to the fused operator's attributes.
+MatMul division factors also remain variable for computed scaling attributes.
+
 Attributes use Python keyword syntax, after positional inputs:
 `h = HardSigmoid(x, alpha = 0.16666667, beta = 0.5)`.
 Signed/scientific numbers and single/double-quoted string attributes are supported.

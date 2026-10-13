@@ -60,20 +60,16 @@ Rules MakeExampleRules() {
   Rules rules;
   {
     Pattern p(R"(
-      (x, bias, low, high, divisor) =>
-        add = Add(x, bias)
-        clip = Clip(add, low, high)
+      (x) =>
+        add = Add(x, 3.0)
+        clip = Clip(add, 0.0, 6.0)
         mul = Mul(clip, x)
-        return Div(mul, divisor)
+        return Div(mul, 6.0)
     )");
     rules.push_back({"HardSwish",
                      p,
                      {{kOnnxDomain, 14, 21}},
-                     [](const Graph& graph, const Match& m) {
-                       return Float32(m) && Scalar(graph, *m.valueOf("bias")) == 3.0f &&
-                              Scalar(graph, *m.valueOf("low")) == 0.0f && Scalar(graph, *m.valueOf("high")) == 6.0f &&
-                              Scalar(graph, *m.valueOf("divisor")) == 6.0f;
-                     },
+                     [](const Graph&, const Match& m) { return Float32(m); },
                      Replacement("(x) => HardSwish(x)")});
   }
   {
@@ -151,8 +147,8 @@ Rules MakeExampleRules() {
   }
   {
     Pattern p(R"(
-      (x, scale, exponent, epsilon) =>
-        square = Pow(x, exponent)
+      (x, scale, epsilon) =>
+        square = Pow(x, 2.0)
         mean = ReduceMean(square)
         add = Add(mean, epsilon)
         sqrt = Sqrt(add)
@@ -165,7 +161,7 @@ Rules MakeExampleRules() {
          p,
          {{kOnnxDomain, 7, 17}},
          [](const Graph& graph, const Match& m) {
-           if (!Float32(m) || Scalar(graph, *m.valueOf("exponent")) != 2.0f) return false;
+           if (!Float32(m)) return false;
            auto eps = Scalar(graph, *m.valueOf("epsilon"));
            const auto* shape = m.valueOf("x")->Shape();
            const auto* scale_shape = m.valueOf("scale")->Shape();
