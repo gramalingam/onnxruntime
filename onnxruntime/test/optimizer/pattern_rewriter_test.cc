@@ -1,7 +1,9 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -11,6 +13,7 @@
 #include "core/optimizer/pattern_rewriter.h"
 #include "core/graph/graph_utils.h"
 #include "core/optimizer/initializer.h"
+#include "core/platform/env.h"
 #include "test/optimizer/graph_transform_test_fixture.h"
 #include "test/unittest_util/graph_transform_test_builder.h"
 #include "test/util/include/asserts.h"
@@ -3490,6 +3493,165 @@ TEST(PatternRewriterTests, NumericalDecoderPrefillAndDecode) {
   }
 }
 #endif
+
+// Explicitly enabled benchmark, not part of regular correctness runs.
+TEST(PatternRewriterBenchmark, DISABLED_Decoder) {
+#ifdef DISABLE_CONTRIB_OPS
+  GTEST_SKIP() << "The active decoder benchmark requires contrib operators.";
+#else
+  using Clock = std::chrono::steady_clock;
+  auto ms = [](auto begin, auto end) { return std::chrono::duration<double, std::milli>(end - begin).count(); };
+  auto logger = DefaultLoggingManager().CreateLogger("pattern_rewriter_benchmark", logging::Severity::kERROR, false);
+  const auto destination = Env::Default().GetEnvironmentVar("ORT_REWRITER_BENCHMARK_CSV");
+  ASSERT_FALSE(destination.empty()) << "Set ORT_REWRITER_BENCHMARK_CSV to an output CSV path.";
+  std::ofstream csv(destination);
+  ASSERT_TRUE(csv.is_open());
+  csv << "layers,nodes,rules,workload,indexed,repeat,prepare_ms,engine_ms,resolve_ms,visited,candidates,"
+         "structural_checks,guards,matches,rewrites,output_nodes\n";
+  for (size_t layers : {1u, 8u, 32u}) {
+    TestGraph source;
+    BuildDecoder(source.builder, layers);
+    source.builder.SetGraphOutputs();
+    ASSERT_STATUS_OK(source.graph.Resolve());
+    InlinedHashMap<std::string, size_t> histogram;
+    InlinedVector<std::string> operators;
+    for (const auto& node : source.graph.Nodes()) {
+      if (++histogram[node.OpType()] == 1) operators.push_back(node.OpType());
+    }
+    std::sort(operators.begin(), operators.end());
+    std::cout << "decoder layers=" << layers << " nodes=" << source.graph.NumberOfNodes()
+              << " inputs=" << source.graph.GetInputs().size() << " outputs=" << source.graph.GetOutputs().size()
+              << " operators=";
+    for (const auto& op : operators) std::cout << op << ':' << histogram.at(op) << ' ';
+    std::cout << '\n';
+    const auto proto = source.model.ToProto();
+    for (size_t count : {1u, 10u, 100u, 300u, 500u}) {
+      for (int workload = 0; workload < 4; ++workload) {
+        for (bool indexed : {false, true}) {
+          for (int repeat = -2; repeat < 9; ++repeat) {
+            // Loading, generation, and copying are deliberately outside timing.
+            Model model(proto, nullptr, *logger);
+            Graph& graph = model.MainGraph();
+            ASSERT_STATUS_OK(graph.Resolve());
+            auto begin_prepare = Clock::now();
+            auto examples = MakeExampleRules();
+            // Put the decoder's active RMSNorm pattern first, including in the one-rule case.
+            std::rotate(examples.begin(), examples.end() - 1, examples.end());
+            Rules rules;
+            for (size_t i = 0; i < count; ++i) {
+              Rule rule = examples[i % examples.size()];
+              rule.name += std::to_string(i);
+              // Same-root, same-structure adversarial rejection after full matching.
+              // Active rules are placed last to force evaluation of all preceding callbacks.
+              if (workload == 1 || i + examples.size() < count) {
+                auto original = rule.check_and_bind;
+                rule.check_and_bind = [original](const Graph& g, Match& m) {
+                  bool supported = !original || original(g, m);
+                  return supported && m.nodes.back()->Name() == "deliberately_absent_benchmark_name";
+                };
+              }
+              if (workload == 3) {
+                // Distinct, synthetic same-Mul-root structural nonmatches, with common suffixes.
+                std::ostringstream pattern;
+                pattern << "(x) => {";
+                for (size_t bit = 0; bit < 9; ++bit) {
+                  pattern << "v" << bit << " = " << ((i & (size_t{1} << bit)) ? "Tanh" : "Sigmoid") << "(";
+                  if (bit == 0) {
+                    pattern << "x";
+                  } else {
+                    pattern << "v" << bit - 1;
+                  }
+                  pattern << ");";
+                }
+                pattern << "return Mul(x, v8);}";
+                rule.pattern = Pattern(pattern.str());
+                rule.check_and_bind = [](const Graph&, Match&) { return false; };
+                rule.replacement = Replacement("(x) => Identity(x)");
+              }
+              rules.push_back(std::move(rule));
+            }
+            PatternRewriter rewriter(std::move(rules), {.match_only = workload != 2, .indexed = indexed});
+            auto end_prepare = Clock::now();
+            Statistics stats;
+            auto begin_engine = Clock::now();
+            ASSERT_STATUS_OK(rewriter.Run(graph, stats));
+            auto end_engine = Clock::now();
+            auto begin_resolve = Clock::now();
+            ASSERT_STATUS_OK(graph.Resolve());
+            auto end_resolve = Clock::now();
+            if (repeat < 0) continue;
+            csv << layers << ',' << source.graph.NumberOfNodes() << ',' << count << ',' << workload << ',' << indexed
+                << ',' << repeat << ',' << ms(begin_prepare, end_prepare) << ',' << ms(begin_engine, end_engine) << ','
+                << ms(begin_resolve, end_resolve) << ',' << stats.visited << ',' << stats.candidates << ','
+                << stats.structural_checks << ',' << stats.check_and_bind_calls << ',' << stats.matches << ','
+                << stats.rewrites << ',' << graph.NumberOfNodes() << '\n';
+          }
+        }
+      }
+    }
+  }
+  csv.flush();
+  ASSERT_TRUE(csv.good()) << "Failed to write benchmark results.";
+#endif
+}
+
+TEST(PatternRewriterBenchmark, DISABLED_ReplacementPlans) {
+  using Clock = std::chrono::steady_clock;
+  auto ms = [](auto begin, auto end) { return std::chrono::duration<double, std::milli>(end - begin).count(); };
+  auto logger = DefaultLoggingManager().CreateLogger("replacement_benchmark", logging::Severity::kERROR, false);
+  const auto destination = Env::Default().GetEnvironmentVar("ORT_REWRITER_REPLACEMENT_CSV");
+  std::ofstream csv;
+  if (!destination.empty()) {
+    csv.open(destination);
+    ASSERT_TRUE(csv.is_open()) << "Failed to open replacement benchmark CSV.";
+    csv << "replacement_mode,repeat,prepare_ms,engine_ms,resolve_ms,rewrites,output_nodes\n";
+  }
+  TestGraph source;
+  for (int i = 0; i < 1000; ++i) BuildHardSwish(source.builder);
+  source.builder.SetGraphOutputs();
+  ASSERT_STATUS_OK(source.graph.Resolve());
+  const auto proto = source.model.ToProto();
+  std::cout << "replacement_mode,repeat,prepare_ms,engine_ms,resolve_ms,rewrites,output_nodes\n";
+  for (int mode = 0; mode < 3; ++mode) {
+    for (int repeat = -2; repeat < 9; ++repeat) {
+      Model model(proto, nullptr, *logger);
+      auto& graph = model.MainGraph();
+      ASSERT_STATUS_OK(graph.Resolve());
+      auto begin_prepare = Clock::now();
+      auto rule = MakeExampleRules()[0];
+      if (mode == 0) {
+        rule.replacement = [](const Graph&, const Match&) {
+          return Replacement("(x)=>HardSwish(x)");
+        };
+      } else if (mode == 1) {
+        rule.replacement = Replacement("(x)=>HardSwish(x)");
+      } else {
+        rule.replacement = Replacement("(x)=>h=HardSigmoid(x,alpha=0.16666667,beta=0.5);return Mul(h,x)");
+      }
+      PatternRewriter rewriter({rule});
+      auto end_prepare = Clock::now();
+      Statistics stats;
+      auto begin_engine = Clock::now();
+      ASSERT_STATUS_OK(rewriter.Run(graph, stats));
+      auto end_engine = Clock::now();
+      ASSERT_EQ(stats.rewrites, 1000u);
+      ASSERT_EQ(graph.NumberOfNodes(), mode == 2 ? 2000u : 1000u);
+      auto begin_resolve = Clock::now();
+      ASSERT_STATUS_OK(graph.Resolve());
+      auto end_resolve = Clock::now();
+      if (repeat < 0) continue;
+      std::ostringstream row;
+      row << mode << ',' << repeat << ',' << ms(begin_prepare, end_prepare) << ',' << ms(begin_engine, end_engine)
+          << ',' << ms(begin_resolve, end_resolve) << ',' << stats.rewrites << ',' << graph.NumberOfNodes() << '\n';
+      std::cout << "replacement_row," << row.str();
+      if (csv.is_open()) csv << row.str();
+    }
+  }
+  if (csv.is_open()) {
+    csv.flush();
+    ASSERT_TRUE(csv.good()) << "Failed to write replacement benchmark results.";
+  }
+}
 
 }  // namespace test
 }  // namespace onnxruntime

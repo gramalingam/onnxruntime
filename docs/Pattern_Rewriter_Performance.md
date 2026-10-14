@@ -1,0 +1,460 @@
+# Pattern rewriter: measured correctness and performance
+
+These are measurements of the real ORT graph rewrite implementation described in
+[Pattern_Rewriter.md](Pattern_Rewriter.md), not a standalone matcher simulation.
+The implementation is experimental and opt-in; the default optimizer is unchanged.
+Raw measurements are in [Pattern_Rewriter_Benchmark.csv](Pattern_Rewriter_Benchmark.csv).
+The original tables below record revision
+`8a2b73c7e7818925c161d1fd7e4c7ce93f0acba6`; they are retained as historical measurements.
+The named-value/parser/attribute-matcher follow-up is measured separately in
+[Pattern_Rewriter_Language_Benchmark.csv](Pattern_Rewriter_Language_Benchmark.csv)
+and the next section, rather than silently replacing the original measurements.
+
+**Rebased implementation:** All CSVs and tables below retain their historical
+measurements; they have not been remeasured after the core-only branch updates.
+The current benchmarks use text-only pattern/replacement definitions and
+`check_and_bind` callbacks. The CSV column `guards` now records
+`Statistics::check_and_bind_calls`. Replacement mode 0 now parses a replacement
+inside each callback because the programmatic recipe API was removed; its new
+results must not be compared as the same workload as historical mode 0.
+Modes 1 and 2 continue to reuse parsed plans. See
+[performance reproduction](Pattern_Rewriter.md#performance-reproduction) for
+the current benchmark commands and methodology.
+
+## Named-value and pattern-language follow-up
+
+The same CPU Release build configuration, decoder generator, full 1080-row
+matrix, two warmups and nine repeats were rerun after adding named handles,
+scalar literal constraints, attribute predicates and the text parser.
+HardSigmoid/Mul now uses node attribute matchers instead of equivalent guard
+checks. At the measured revision, the benchmark constructs its patterns through the C++ builder;
+preparation includes building/compiling those rules, **not text parsing latency**.
+The subsequent string-constructor migration converts all six example rules to
+text definitions. Those historical preparation timings therefore do not include
+the current parser cost; graph matching and mutation semantics are unchanged.
+The later `Match::valueOf` migration also introduces bounded name lookup in
+callbacks and binding validation for pointer-based replacement inputs. The
+recorded timings predate those changes and are not measurements of that API.
+The parser is exercised by correctness tests, including an executed HardSwish fusion.
+No decoder operator distribution or benchmark workload definition changed.
+
+At 32 layers / 2241 nodes / 500 rules, all times are milliseconds:
+
+| Workload | Reference engine median | Indexed engine median | Indexed engine max | Indexed preparation median | Indexed Resolve median | Indexed total median |
+|---|---:|---:|---:|---:|---:|---:|
+| Active match-only | 64.5107 | 20.7664 | 25.0146 | 4.0833 | 0.0283 | 24.8781 |
+| Adversarial semantic misses | 64.2870 | 19.6209 | 21.4712 | 3.8433 | 0.0302 | 23.4582 |
+| Successful rewriting | 73.3457 | 25.0688 | 45.5535 | 3.9737 | 22.3129 | 51.9711 |
+| Synthetic distinct structural misses | 67.3232 | 55.9487 | 79.9540 | 11.0489 | 0.0287 | 66.8546 |
+
+The largest indexed engine observation across the complete matrix was 79.9540 ms.
+This remains empirical evidence for subsecond cost at the tested scale, not a
+guarantee for arbitrary patterns, callbacks or graphs. Names increase pattern
+storage and copying cost. Attribute-predicate plans deliberately do not share
+structural matches, so a large set of attribute-heavy rules can cost more than
+the measured decoder rule variants. For example, the 500-rule active match-only
+indexed run now performs 27,264 structural checks rather than the historical
+1,024, while guards (10,688), matches (128), visits (2,241) and output nodes
+(2,241) are unchanged. Successful rewriting still removes 128 patterns and
+leaves 1,793 nodes. The earlier extrapolation budgets below
+belong to the historical revision and should not be treated as updated budgets.
+
+Validation: CPU Release incremental build passed; **46 correctness/regression
+tests passed** (35 rewriter tests and 11 existing optimizer tests); the full
+benchmark passed. The summarizer checked nine repeats in every group,
+deterministic counters and indexed/reference agreement. Numerical decoder
+results remained max absolute error 0 for decode and 2.98023e-08 for prefill;
+prefill max relative error with denominator floor 1e-6 was 2.73599e-07.
+
+Reproduction from the worktree, with CMake available on PATH:
+
+```powershell
+.\.venv\Scripts\python.exe tools\ci_build\build.py --build_dir build\rewriter --config Release --build --parallel 4 --target onnxruntime_test_all --skip_tests
+$env:ORT_REWRITER_BENCHMARK_CSV = Join-Path (Get-Location) 'docs\Pattern_Rewriter_Language_Benchmark.csv'
+Push-Location build\rewriter\Release\Release
+.\onnxruntime_test_all.exe --gtest_filter="PatternRewriterTests.*:GraphTransformationTests.MatMulScaleFusion*:GraphTransformationTests.QuickGelu*"
+.\onnxruntime_test_all.exe --gtest_also_run_disabled_tests --gtest_filter="PatternRewriterBenchmark.DISABLED_Decoder"
+Pop-Location
+.\.venv\Scripts\python.exe tools\ci_build\summarize_rewriter_benchmark.py docs\Pattern_Rewriter_Language_Benchmark.csv
+```
+
+All four commands passed for the recorded follow-up measurements.
+
+## Multi-node replacement and parse-once follow-up
+
+The initial replacement-plan implementation was measured using the same build,
+machine and decoder matrix, refreshed after the PR feedback that moves fixed
+HardSwish/RMSNorm constants into pattern literals. Raw decoder results for that revision are in
+[Pattern_Rewriter_Replacement_Benchmark.csv](Pattern_Rewriter_Replacement_Benchmark.csv).
+These measurements include parsing the six example patterns and two textual
+replacement plans in preparation, plus per-rule compilation of replacement input
+names to handles. Runtime does not reparse these replacements. The prior sections
+remain historical, not measurements of this version.
+
+At 32 layers / 2241 nodes / 500 rules, all times are milliseconds:
+
+| Workload | Reference engine median | Indexed engine median | Indexed engine max | Indexed preparation median | Indexed Resolve median | Indexed total median |
+|---|---:|---:|---:|---:|---:|---:|
+| Active match-only | 110.7260 | 29.3926 | 33.2167 | 7.5689 | 0.0485 | 37.0282 |
+| Adversarial semantic misses | 108.1120 | 29.0003 | 45.7008 | 7.4227 | 0.0491 | 36.5264 |
+| Successful rewriting | 87.0699 | 34.6788 | 42.8362 | 7.9438 | 30.5408 | 80.9836 |
+| Synthetic distinct structural misses | 129.2190 | 102.5050 | 114.3900 | 17.4608 | 0.0497 | 120.1967 |
+
+Both implementations still agree on visits, matches, rewrites and output node
+counts across all 1080 rows. The successful 500-rule decoder run performs 128
+rewrites, leaving 1793 nodes.
+This refresh is broadly slower than the preceding run, including the synthetic
+structural-miss workload that does not use the changed literal patterns.
+These shared-host measurements are not a controlled before/after experiment,
+and the difference cannot be attributed solely to this source change.
+
+A separate **synthetic replacement microbenchmark**, not a model-derived decoder,
+uses 1000 independent four-node HardSwish decompositions (4000 initial nodes).
+It compares callback-built single-node recipes with parsed single-node and
+parsed two-node replacements. Each mode uses two warmups and nine measured
+repetitions on fresh loaded/resolved graphs; generation/loading/initial Resolve
+are excluded. Preparation constructs the example rules and compiles the selected
+single active rule. Engine includes matching,
+guards, schema checking, mutation and invalidation, not just node construction.
+Final Resolve is separate. Every run performs exactly 1000 rewrites.
+Raw results are in [Pattern_Rewriter_Replacement_Plans.csv](Pattern_Rewriter_Replacement_Plans.csv).
+
+| Mode | Preparation median ms | Engine median ms | Engine max ms | Resolve median ms | Output nodes |
+|---|---:|---:|---:|---:|---:|
+| 0: callback-built HardSwish | 0.1994 | 93.0203 | 100.9640 | 60.7728 | 1000 |
+| 1: parsed HardSwish | 0.1841 | 78.6248 | 93.3256 | 57.2869 | 1000 |
+| 2: parsed HardSigmoid/Mul sequence | 0.2211 | 134.9450 | 155.3510 | 78.4332 | 2000 |
+
+The similar single-node timings are not evidence of a universal speedup:
+shared-machine variation is visible in the maxima. The two-node plan necessarily
+does more creation, edge and Resolve work. This demonstrates that parsing can be
+paid once while the same plan drives 1000 successful rewrites; the benchmark does
+not measure or endorse parsing inside a per-match callback.
+
+Validation: CPU Release build passed, **53 correctness/regression tests passed**
+(42 rewriter, 11 existing optimizer), and both disabled benchmarks passed.
+New executed tests cover HardSwish-to-HardSigmoid/Mul, branched Split/Concat,
+multi-output roots, and synthesized float32/int64 scalar initializers.
+Negative tests verify staged-node/initializer cleanup on schema failure,
+invalid output references, undeclared domains and nondecreasing replacements.
+Plan reuse and invalidation are checked in indexed and reference modes.
+Fixed-constant tests reject wrong values, singleton-vector ranks, nonfinite
+values and overridable initializers at every HardSwish constant position.
+Decoder numerical errors remain unchanged from the earlier section.
+
+Use the same build command and correctness filter above. Benchmark reproduction:
+
+```powershell
+$env:ORT_REWRITER_BENCHMARK_CSV = Join-Path (Get-Location) 'docs\Pattern_Rewriter_Replacement_Benchmark.csv'
+$env:ORT_REWRITER_REPLACEMENT_CSV = Join-Path (Get-Location) 'docs\Pattern_Rewriter_Replacement_Plans.csv'
+Push-Location build\rewriter\Release\Release
+.\onnxruntime_test_all.exe --gtest_also_run_disabled_tests --gtest_filter="PatternRewriterBenchmark.DISABLED_Decoder:PatternRewriterBenchmark.DISABLED_ReplacementPlans"
+Pop-Location
+.\.venv\Scripts\python.exe tools\ci_build\summarize_rewriter_benchmark.py docs\Pattern_Rewriter_Replacement_Benchmark.csv
+```
+
+Both commands passed. The replacement microbenchmark also prints its 27 measured
+rows to stdout, prefixed `replacement_row,`. Decoder matrix completeness, deterministic counters and
+reference/indexed agreement were checked by the summarizer.
+All timings and extrapolations are empirical, never worst-case guarantees.
+
+## Runtime attribute-binding follow-up
+
+The extra-binding implementation at revision `f8477c578b9c12c2fbde8894d37673bf855feaea`
+was measured with the same machine/build,
+decoder topology and 120-group matrix, two warmups and nine repeats.
+Raw results are in
+[Pattern_Rewriter_Extra_Bindings_Benchmark.csv](Pattern_Rewriter_Extra_Bindings_Benchmark.csv)
+and [Pattern_Rewriter_Extra_Bindings_Plans.csv](Pattern_Rewriter_Extra_Bindings_Plans.csv).
+Preparation now includes five textual replacement plans among the six example
+rules. MatMulDiv and RMSNorm capture reusable plans and compute their attributes
+through `Match::update`; TransposeMatMul uses a directly compiled literal plan.
+The synthetic distinct-pattern benchmark now supplies its own unused
+Identity recipe rather than retaining a recipe from an unrelated example.
+Its guard always rejects; this changes no matches, rewrites or graph topology.
+
+At 32 layers / 2241 nodes / 500 rules, times are milliseconds:
+
+| Workload | Reference engine median | Indexed preparation median | Indexed engine median | Indexed engine max | Indexed Resolve median | Indexed total median | Indexed total max |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Active match-only | 175.0040 | 4.4293 | 17.5090 | 18.7343 | 0.0185 | 21.9411 | 23.3651 |
+| Adversarial semantic misses | 163.3550 | 4.4323 | 17.7574 | 18.3372 | 0.0218 | 22.3052 | 22.8374 |
+| Successful rewriting | 184.9420 | 4.4839 | 21.0134 | 22.5267 | 18.6339 | 44.3469 | 47.5773 |
+| Synthetic distinct structural misses | 179.8110 | 10.4713 | 74.8953 | 85.2906 | 0.0290 | 85.5168 | 96.3855 |
+
+All 1080 rows pass the summarizer's matrix, repetition, deterministic-counter
+and reference/indexed agreement checks. The indexed active workloads retain
+27,264 structural checks and 10,688 guards at this scale. Active match-only
+records 128 matches and no rewrites; successful rewriting records 128 rewrites,
+2464 live visits and 1793 output nodes. Synthetic misses record 160,000
+structural checks, no guards/matches/rewrites and 2241 output nodes.
+
+The unchanged synthetic 4000-node replacement-plan microbenchmark produced
+27 rows, nine repetitions per mode, with deterministic 1000 rewrites:
+
+| Mode | Preparation median ms | Engine median ms | Resolve median ms | Output nodes |
+|---|---:|---:|---:|---:|
+| Callback-built HardSwish | 0.1636 | 49.9262 | 39.7976 | 1000 |
+| Parsed HardSwish | 0.1648 | 46.2917 | 37.1298 | 1000 |
+| Parsed HardSigmoid/Mul sequence | 0.1660 | 65.8021 | 44.9093 | 2000 |
+
+The decoder is the workload exercising computed bindings; this synthetic
+microbenchmark still compares literal plans. Separate-run timings vary broadly
+on the shared host, including the unchanged reference implementation. These
+measurements establish current cost and correctness, not a controlled estimate
+of extra-binding overhead or a universal speedup. Historical extrapolation
+budgets above remain historical, not recalibrated guarantees.
+
+Validation: CPU Release incremental build **passed**; **55 correctness/regression
+tests passed** (44 rewriter, 11 existing optimizer); both benchmarks **passed**
+(57 tests total). New coverage includes float/int/list bindings, string binding
+storage, renamed attributes, multiple bound attributes in a two-node plan,
+repeated updates, cross-graph plan reuse, missing bindings, schema rollback,
+name collisions, invalid parser references, rejected-rule isolation and
+match-only nonexecution. Executed MatMulDiv, RMSNorm and decoder tests exercise
+the migrated plans. Decode max absolute error remains 0; prefill max absolute
+error remains 2.98023e-08, with floored relative error 2.73599e-07.
+No full ORT suite or GPU build was run.
+
+Reproduction (the build, combined test/benchmark and summarizer commands all passed):
+
+```powershell
+.\.venv\Scripts\python.exe tools\ci_build\build.py --build_dir build\rewriter --config Release --build --parallel 4 --target onnxruntime_test_all --skip_tests
+$env:ORT_REWRITER_BENCHMARK_CSV = Join-Path (Get-Location) 'docs\Pattern_Rewriter_Extra_Bindings_Benchmark.csv'
+$env:ORT_REWRITER_REPLACEMENT_CSV = Join-Path (Get-Location) 'docs\Pattern_Rewriter_Extra_Bindings_Plans.csv'
+Push-Location build\rewriter\Release\Release
+.\onnxruntime_test_all.exe --gtest_also_run_disabled_tests --gtest_filter="PatternRewriterTests.*:GraphTransformationTests.MatMulScaleFusion*:GraphTransformationTests.QuickGelu*:PatternRewriterBenchmark.DISABLED_Decoder:PatternRewriterBenchmark.DISABLED_ReplacementPlans"
+Pop-Location
+.\.venv\Scripts\python.exe tools\ci_build\summarize_rewriter_benchmark.py docs\Pattern_Rewriter_Extra_Bindings_Benchmark.csv
+```
+
+The subsequent FusedMatMulDiv migration also uses a captured parsed plan, binding
+all five version-1 attributes and using schema defaults for omitted transpose
+settings. The same incremental build and correctness command passed **56 tests**
+(45 rewriter, 11 existing optimizer). The new numerical test verifies all 16
+transpose/batch-transpose combinations, nondefault alpha, and omitted attributes,
+in both indexed and reference modes. The raw timing tables above predate this
+additional migration; no new performance comparison is claimed for it.
+
+## Configuration and scope
+
+Measured October 13, 2026, after adding multi-output patterns, concise constructors
+and generic EP policy, on Windows 11 Enterprise 10.0.26100, Dell Precision
+5820 Tower X-Series, Intel Core i9-10920X (nominal 3.50 GHz, 24 logical processors),
+approximately 64 GiB RAM. ORT base revision:
+`42518d89d7c5393baf97d69f8c2670668c40decf`, version 1.32.0.
+CPU/static Release build, contrib enabled, MSVC 19.44.35228.0, Visual Studio 2022,
+CMake 3.31.6-msvc6, Python 3.13. Four build workers were used; compilation finished
+before measurement. No GPU, CPU affinity, or dedicated-host isolation was used.
+Matcher execution and graph mutation are single-threaded.
+
+The graphs are hand-constructed, model-derived Llama-style decoders, **not
+pretrained model exports**. Each layer contains RoPE, GQA, past/present KV caches,
+two RMSNorms, attention, residuals and a SiLU-gated MLP. Small float32 weights
+preserve the topology, not production tensor sizes. The design document provides
+source revisions, geometry, construction details and omitted exporter features.
+
+| Layers | Input nodes | Graph inputs | Graph outputs | Nodes after active 500-rule rewrite | Rewrites |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 71 | 3 | 3 | 57 | 4 |
+| 8 | 561 | 17 | 17 | 449 | 32 |
+| 32 | 2241 | 65 | 65 | 1793 | 128 |
+
+There are 70 nodes per layer plus one final Identity. The per-layer distribution
+is Add 7, Concat 4, Div 1, Expand 2, Gather 4, MatMul 9, Mul 10, Neg 2, Pow 2,
+Reciprocal 2, ReduceMean 2, Reshape 12, Sigmoid 1, Slice 4, Softmax 1, Sqrt 2,
+Transpose 5. Present K/V are graph outputs, not disposable intermediates.
+
+## Methodology
+
+The complete matrix has 1/8/32 layers, 1/10/100/300/500 rules, four workloads and
+indexed/reference implementations: 120 groups, nine measured repetitions each,
+**1080 CSV rows**. Each group has two additional warmups. Every run uses a fresh
+copied/resolved graph. Generation, loading, copying, initial Resolve and tensor
+execution are excluded from core timings.
+
+Preparation includes rule construction and compilation. Engine time includes
+per-graph rule import filtering, producer indexing, worklist construction, structural
+matching, guards, boundary checks, mutation and invalidation. Final Resolve is separate; error-level logging
+excludes warning output for removed initializers. All failed statuses remain
+fatal test failures. Total times below are medians of the per-repeat sum, not sums
+of independently selected medians.
+
+The rule-by-rule reference uses the same guards, matcher, mutation and worklist,
+with cheap root rejection before binding allocation. It does not compile root
+indexes or shared structural groups. This isolates dispatch/structural sharing,
+not differences in mathematical rules or an artificially allocation-heavy baseline.
+
+Hundreds of realistic rules are guarded variants of six genuine ONNXScript-derived
+patterns; active rules are last. They are **not hundreds of independent fusion
+algorithms**. The adversarial workload evaluates real semantic guards and then
+rejects otherwise eligible matches by a deliberately absent node name. A separate
+synthetic workload has distinct same-Mul-root patterns with nine Sigmoid/Tanh nodes;
+it exposes the lack of arbitrary-prefix sharing. Neither nonmatch workload consists
+only of inert different-root rules.
+
+## Results
+
+At 32 layers / 2241 nodes / 500 rules:
+
+| Workload | Reference engine median ms | Indexed engine median ms | Indexed engine max ms | Engine speedup | Indexed preparation median ms | Indexed Resolve median ms | Reference total median ms | Indexed total median ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Active match-only | 70.6460 | 13.3980 | 22.2259 | 5.27x | 4.3209 | 0.0208 | 71.4841 | 18.8780 |
+| Same-structure semantic misses | 72.5865 | 11.7040 | 28.8747 | 6.20x | 3.2723 | 0.0162 | 73.1829 | 15.0976 |
+| Successful rewriting | 76.4116 | 16.3844 | 33.4006 | 4.66x | 3.4737 | 19.8251 | 97.6291 | 42.6921 |
+| Synthetic distinct structural misses | 72.6219 | 74.4585 | 86.9363 | 0.98x | 9.0458 | 0.0267 | 74.5306 | 83.8081 |
+
+The synthetic case is **slower end-to-end** when preparation is included.
+Distinct plans do not share prefixes, and compilation is more expensive than the
+reference. These results are sensitive to host noise; an earlier import-filtered
+implementation was modestly faster on the same workload. Root indexing
+alone does not solve every large-rule-set workload.
+Conversely, an immutable compiled transformer can amortize preparation across
+graphs; the benchmark deliberately charges preparation to every run.
+
+Rule-count scaling for successful rewriting on the same 32-layer graph:
+
+| Rules | Reference engine median ms | Indexed engine median ms | Indexed preparation median ms | Indexed Resolve median ms | Rewrites |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 4.9963 | 5.4241 | 0.0575 | 24.8174 | 64 |
+| 10 | 6.0513 | 6.3679 | 0.1280 | 22.1893 | 128 |
+| 100 | 17.2254 | 6.8823 | 0.7320 | 19.0990 | 128 |
+| 300 | 39.1072 | 12.5730 | 2.1582 | 20.0874 | 128 |
+| 500 | 76.4116 | 16.3844 | 3.4737 | 19.8251 | 128 |
+
+One rule includes only RMSNorm and therefore performs fewer rewrites. Indexing has
+overhead: at one rule, active match-only on 32 layers measured 2.4979 ms indexed
+versus 2.4580 ms reference. There is no claim that indexing always wins.
+
+Layer scaling with 500 rules, indexed implementation (median / maximum of nine):
+
+| Layers | Workload | Engine ms | Final Resolve ms | Preparation ms | Total ms |
+|---:|---|---:|---:|---:|---:|
+| 1 | Active match-only | 0.3494 / 0.3716 | 0.0004 / 0.0008 | 3.3583 / 3.5701 | 3.7042 / 3.9421 |
+| 8 | Active match-only | 3.3238 / 4.6376 | 0.0040 / 0.0070 | 3.5224 / 4.1014 | 6.7686 / 8.2005 |
+| 32 | Active match-only | 13.3980 / 22.2259 | 0.0208 / 0.0237 | 4.3209 / 11.9689 | 18.8780 / 34.2185 |
+| 1 | Semantic misses | 0.3672 / 0.6532 | 0.0005 / 0.0007 | 3.3979 / 4.9755 | 3.8006 / 5.3490 |
+| 8 | Semantic misses | 2.8641 / 8.2150 | 0.0057 / 0.0109 | 3.5428 / 13.3055 | 6.8985 / 21.5277 |
+| 32 | Semantic misses | 11.7040 / 28.8747 | 0.0162 / 0.0293 | 3.2723 / 3.4929 | 15.0976 / 32.3371 |
+| 1 | Rewriting | 0.4197 / 0.6654 | 0.4468 / 1.9302 | 3.3783 / 5.2108 | 4.2666 / 6.3475 |
+| 8 | Rewriting | 3.4031 / 4.7259 | 4.0870 / 5.0392 | 3.8477 / 4.9182 | 11.5174 / 13.1849 |
+| 32 | Rewriting | 16.3844 / 33.4006 | 19.8251 / 33.2741 | 3.4737 / 5.3419 | 42.6921 / 67.2441 |
+| 1 | Synthetic misses | 1.8062 / 2.1824 | 0.0009 / 0.0014 | 9.5869 / 13.4720 | 11.3684 / 15.2904 |
+| 8 | Synthetic misses | 15.3799 / 18.3429 | 0.0068 / 0.0076 | 10.7740 / 27.7695 | 26.1607 / 46.1200 |
+| 32 | Synthetic misses | 74.4585 / 86.9363 | 0.0267 / 0.0297 | 9.0458 / 10.3327 | 83.8081 / 96.4596 |
+
+These maxima are observed tails, not p99 estimates. With nine repetitions and an
+unisolated host, occasional scheduling outliers are expected; raw rows are retained.
+This refresh has visibly larger outliers in both implementations than the earlier
+measurements. Differences between separately measured commits do not isolate the
+cost of the multi-output support or generic EP policy.
+Final Resolve is a significant part of successful rewriting and cannot be ignored
+when estimating initialization cost. Tensor inference speed is not benchmarked.
+
+### Counters and agreement
+
+Counters were deterministic across all repeats, and the summarizer verified that
+indexed/reference live visits, matches, rewrites and output nodes agree in every
+group. Representative 32-layer / 500-rule counters:
+
+| Workload | Implementation | Live visits | Candidates | Structural checks | Guards | Matches | Rewrites | Output nodes |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Active match-only | Indexed | 2241 | 85344 | 1024 | 10688 | 128 | 0 | 2241 |
+| Semantic misses | Indexed | 2241 | 85344 | 1024 | 10688 | 0 | 0 | 2241 |
+| Rewriting | Indexed | 2464 | 85344 | 1024 | 10688 | 128 | 128 | 1793 |
+| Synthetic misses | Indexed | 2241 | 160000 | 160000 | 0 | 0 | 0 | 2241 |
+
+Reference structural checks are 1,120,500 for the three match-only workloads and
+1,231,776 for rewriting. The identical-plan compilation keeps realistic structural
+checks at 1024 despite 500 guarded rules. Guards remain proportional to eligible
+variants: sharing structures does not eliminate arbitrary predicate costs.
+
+## Conservative empirical extrapolation
+
+An 80-layer graph with this exact topology has 5601 input nodes and, after the
+active multi-rule rewrite, 4481 nodes and 320 rewrites. This graph was **not measured**.
+The following deliberately padded estimates assume the same operator distribution,
+bounded fanout, local guard costs, schema imports, CPU and build configuration.
+
+For each engine/Resolve component, take the larger observed maximum-per-layer
+from 8 and 32 layers, multiply by 80, then multiply by two. Preparation is charged
+once at twice the largest observed maximum across 1/8/32 layers. Sum the independently
+derived component budgets (which is more conservative than an observed joint sum):
+
+| 500-rule workload | Preparation budget ms | Engine budget ms | Resolve budget ms | Combined budget ms |
+|---|---:|---:|---:|---:|
+| Active match-only | 23.9378 | 111.1295 | 0.1400 | 135.2073 |
+| Semantic misses | 26.6110 | 164.3000 | 0.2180 | 191.1290 |
+| Rewriting | 10.6838 | 167.0030 | 166.3705 | 344.0573 |
+| Synthetic distinct structural misses | 55.5390 | 434.6815 | 0.1520 | 490.3725 |
+
+These are empirical planning budgets, **not mathematical worst-case guarantees,
+confidence intervals or measured 80-layer results**. A two-times margin is a
+heuristic, not a proof. Different exports, large fanout, deep common-prefix
+nonmatches, expensive guards, mixed precision, quantization, large initializer
+payloads and memory/scheduler pressure can exceed them. Production export benchmarks
+are necessary before deploying broadly.
+
+## Correctness evidence and reproduction
+
+Run from the isolated worktree root with Visual Studio's CMake on PATH:
+
+```powershell
+.\.venv\Scripts\python.exe tools\ci_build\build.py --build_dir build\rewriter --config Release --update --skip_submodule_sync --parallel 4 --skip_tests --cmake_generator "Visual Studio 17 2022" --cmake_extra_defines FETCHCONTENT_TRY_FIND_PACKAGE_MODE=NEVER
+.\.venv\Scripts\python.exe tools\ci_build\build.py --build_dir build\rewriter --config Release --build --parallel 4 --target onnxruntime_test_all --skip_tests
+Set-Location build\rewriter\Release\Release
+.\onnxruntime_test_all.exe --gtest_filter="PatternRewriterTests.*:GraphTransformationTests.MatMulScaleFusion*:GraphTransformationTests.QuickGelu*"
+$env:ORT_REWRITER_BENCHMARK_CSV = "C:\repos\copilot-worktrees\onnxruntime\gramalingam-bookish-goggles\docs\Pattern_Rewriter_Benchmark.csv"
+.\onnxruntime_test_all.exe --gtest_also_run_disabled_tests --gtest_filter="PatternRewriterBenchmark.DISABLED_Decoder"
+```
+
+Results: configuration and CPU Release build **passed**; **41 correctness/regression
+tests passed** (30 rewriter tests, 11 existing MatMulScaleFusion/QuickGelu tests);
+the disabled benchmark **passed** in 48.321 seconds, including untimed work.
+No full ORT suite or GPU build was run.
+
+Tests cover positive/negative structural matches, repeated bindings and a shared-node
+diamond, graph outputs, fanout, implicit subgraph captures, leaf multi-output
+producers, layer annotations, opsets, invalid patterns/recipes/attributes, provider/type
+restrictions, immutable scalar constants, broadcasting rank, priority, overlap,
+mutation, repeated application and termination. Import-specific tests cover
+inclusive range boundaries across schema changes, rejected graphs sharing a
+schema with accepted graphs, missing/additional domains, alias normalization,
+invalid/duplicate requirements, filtering before guards, priority within shared
+plans, and reuse of a compiled transformer across import contexts.
+Provider tests cover unassigned/CPU nodes, rejected assigned EPs, explicit generic
+EP opt-in, mixed assignments, and policy-before-guard ordering. These are graph
+tests; no GPU execution is claimed. Multi-output tests cover exact output counts,
+bindings reached through a nonzero output slot, ordered/repeated/shared bindings,
+unused outputs, secondary graph outputs/external consumers/implicit captures,
+all-root-output preservation, slot-specific fanout, invalid replacement arity,
+repeated application, and executed Split/Concat and Identity/Split rewrites.
+An executed test-only adaptation of ONNXScript's `LayerNormBiasFusion` matches
+three LayerNormalization outputs and fuses Add only when statistics are unobserved.
+Executed tests cover HardSwish,
+MatMul/Div, Transpose/MatMul, combined Transpose/Div, a retained Dropout output,
+and the complete two-layer decoder including all present KV outputs. CPU HardSwish
+executes through its ONNX HardSigmoid/Mul function body; the structural test verifies
+the HardSwish replacement before session initialization, and the numerical test
+checks the expanded body rather than mistaking expansion for a failed fusion.
+
+| Two-layer numerical decoder | Outputs compared | Rewrites | Maximum absolute error | Maximum relative error, denominator floor 1e-6 |
+|---|---:|---:|---:|---:|
+| Decode, sequence 1 | 5 | 8 | 0 | 0 |
+| Causal prefill, sequence 4 | 5 | 8 | 2.98023e-08 | 2.73599e-07 |
+
+Every output element also passes the tolerance `2e-5 + 2e-4 * abs(reference)`.
+These random small-weight examples establish executed equivalence for representative
+cases, not every finite/extreme input or bitwise identity.
+
+From the repository root, these commands also **passed**:
+
+```powershell
+.\.venv\Scripts\python.exe tools\ci_build\summarize_rewriter_benchmark.py docs\Pattern_Rewriter_Benchmark.csv
+& "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\bin\clang-format.exe" --dry-run --Werror onnxruntime\core\optimizer\pattern_rewriter.h onnxruntime\core\optimizer\pattern_rewriter.cc onnxruntime\core\optimizer\pattern_rewriter_rules.cc onnxruntime\test\optimizer\pattern_rewriter_test.cc
+.\.venv\Scripts\python.exe -m ruff check tools\ci_build\summarize_rewriter_benchmark.py
+git --no-pager diff --check
+```
+
+The summarizer validates the full measured matrix and prints every group, including
+the smaller rule counts and baseline rows omitted from the selected tables above.

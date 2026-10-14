@@ -710,3 +710,61 @@ rule wins even across groups, and lower-priority work is skipped when possible.
 With `indexed=false`, the reference mode instead tries all opset-applicable
 rules in registration order at each node. Match-only mode processes one batch,
 counts all passing rules, and never applies replacements.
+
+## Performance reproduction
+
+The disabled benchmarks in `onnxruntime/test/optimizer/pattern_rewriter_test.cc`
+use the same linked ORT graph, schema, optimizer, and CPU components as the
+correctness tests. With a CPU Release `onnxruntime_test_all` build, run from its
+binary directory, using absolute output paths:
+
+```powershell
+$env:ORT_REWRITER_BENCHMARK_CSV = "C:\absolute\path\rewriter.csv"
+$env:ORT_REWRITER_REPLACEMENT_CSV = "C:\absolute\path\replacement.csv"
+.\onnxruntime_test_all.exe --gtest_also_run_disabled_tests --gtest_filter="PatternRewriterBenchmark.DISABLED_Decoder:PatternRewriterBenchmark.DISABLED_ReplacementPlans"
+```
+
+Then, from the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe tools\ci_build\summarize_rewriter_benchmark.py C:\absolute\path\rewriter.csv
+```
+
+`BuildDecoder` constructs a small eager Llama-style topology, not an exported
+pretrained model. Each layer contains two decomposed RMSNorms, Q/K/V projections,
+reshape/transposes, split-half RoPE, past/current KV concatenation, grouped-head
+expansion, causal attention, output projection, residual additions, and a
+SiLU-gated MLP. It uses batch 1, four query heads, two KV heads, head size 4,
+hidden width 16, MLP width 64, and past length 3. Benchmarks use decode sequence
+length 1 and 1/8/32 layers, with 1/10/100/300/500 rules:
+
+| Workload number | Meaning |
+|---|---|
+| 0 | Match-only, active examples last, realistic check-and-bind callbacks |
+| 1 | Match-only same-root/same-structure misses after genuine checks |
+| 2 | Successful rewriting, active examples last |
+| 3 | Synthetic distinct same-Mul-root nonmatches: nine Sigmoid/Tanh nodes |
+
+Workload 3 is synthetic stress, not a Llama operator distribution. Hundreds of
+rules are topology-equivalent variants of six example patterns, not hundreds of
+independently authored fusion algorithms. RMSNorm is selected for one rule.
+
+Rule creation/compilation, engine execution, and final Resolve are separately
+timed with `steady_clock`. Generation, model copying/loading, and initial Resolve
+are excluded. Engine time includes rule import filtering, indexes/worklists,
+matching, callbacks, boundary checks, mutation, and invalidation. Error-level
+logging excludes unused-initializer warning I/O without suppressing failures.
+Two warmups and nine measured runs use fresh graphs. The summary reports medians
+and maximum of nine, not a statistically significant p99, and verifies the full
+matrix, repeats, deterministic counters, and reference/indexed agreement.
+
+The CSV retains the historical `guards` column name for
+`Statistics::check_and_bind_calls`. The replacement microbenchmark uses 1000
+independent HardSwish decompositions. Mode 0 parses a single-node replacement in
+each callback; mode 1 reuses a parsed single-node plan; mode 2 reuses a parsed
+two-node HardSigmoid/Mul plan. Per-match parsing is a comparison baseline, not a
+recommended replacement strategy.
+
+Historical measurements and their limitations are recorded in
+[Pattern_Rewriter_Performance.md](Pattern_Rewriter_Performance.md). They predate
+the latest core API changes and are not measurements of the rebased implementation.
