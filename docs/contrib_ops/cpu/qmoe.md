@@ -111,6 +111,64 @@ For each input token:
 
 To reduce contention, the routing stage first builds thread-local expert-token maps and merges them afterward.
 
+### Open follow-up: equivalence to standard ONNX routing
+
+The quantized rewriter examples exposed the following differences in the CPU
+QMoE routing implementation. **These are recorded for investigation, not a
+decision to change the operator's existing behavior.** Changing a tie-break,
+normalization rule, or cutoff could affect existing models and needs an
+explicit compatibility decision.
+
+The relevant implementation is the routing loop in
+[`moe_quantization_cpu.cc`](../../../onnxruntime/contrib_ops/cpu/moe/moe_quantization_cpu.cc):
+`sorted_logits`, `std::partial_sort`, `has_router_weights`, and the
+`route_scale[route_idx] > 1e-8f` guards. The ONNX CPU TopK implementation is in
+[`top_k.cc`](../../../onnxruntime/core/providers/cpu/math/top_k.cc).
+
+| Difference | Current CPU QMoE behavior | Consequence for an ONNX decomposition |
+| --- | --- | --- |
+| Top-k ties | Descending lexicographic comparison of `(score, expert_index)` prefers the **higher** expert index on equal scores. ONNX TopK prefers the **lower** index. | A tie across the top-k boundary can change the selected expert set, not just its order. For scores `[1, 1, 0]` and `k=1`, QMoE selects expert 1; ONNX TopK selects expert 0. |
+| Implicit aggregation weights | Without `router_weights`, QMoE applies softmax over the selected logits regardless of `normalize_routing_weights`. | This implements TopK-then-Softmax, not unnormalized Softmax-then-TopK. For logits `[0, 0]` and `k=1`, the latter assigns weight `0.5`, whereas QMoE's implicit path assigns `1`. |
+| Route filtering | Only routes whose final weight is strictly greater than `1e-8f` are evaluated and accumulated. This also discards zero and negative weights. | A standard multiply-and-reduce does not drop small nonzero or negative contributions. Small routing weights alone do not bound the output error: an expert output may be large. |
+| Zero-sum explicit normalization | With `router_weights` and normalization enabled, a zero selected-weight sum yields an inverse sum of zero. For all-zero selected weights, the resulting weights are zero. | A literal ONNX `Div(selected, ReduceSum(selected))` produces `0/0` in that case, rather than zero. The intended zero-sum contract needs clarification. |
+
+The current
+[`MakeQuantizedFusionRules()` examples](../../Pattern_Rewriter.md#quantized-matmul-and-moe-fusion-examples)
+retain ONNX TopK/Softmax/normalization, scatter the selected indices into a
+0/1 selection mask, and scatter the computed mixing weights into the explicit
+`router_weights` input. QMoE receives the mask for selection and
+`normalize_routing_weights=0`. This preserves the ONNX-selected expert set,
+including ties, and avoids the implicit-softmax difference. Ties within the
+mask's selected entries cannot change the selected set, though accumulation
+order and floating-point rounding may still differ.
+
+**The mask/explicit-weight workaround does not remove QMoE's route cutoff.**
+Consequently, the examples are numerical-equivalence demonstrations within
+their documented scope, not an exact equivalence guarantee for arbitrary
+inputs. Their tests cover tied logits, all three routing forms, and ordinary
+finite numerical inputs; they do not settle cutoff, signed-weight, zero-sum,
+NaN, or infinity behavior.
+
+Before simplifying the workaround or generalizing these fusions, revisit:
+
+- Whether QMoE should adopt ONNX TopK's tie-break, expose an opt-in compatible
+  mode, or retain its current semantics with explicit documentation.
+- Whether implicit routing weights and `normalize_routing_weights` should
+  have a clearer schema contract; distinguish selected-logit softmax from
+  selection out of full-expert softmax.
+- Whether route filtering should be configurable or removable for
+  decomposition parity, and what error guarantees are possible.
+- The intended behavior for zero-sum or signed explicit weights and non-finite
+  values, including whether such inputs should be rejected.
+- Cross-EP and non-quantized MoE behavior. The observations above are confirmed
+  for this CPU QMoE implementation, not a claim of uniform behavior elsewhere.
+
+Regression coverage for a future decision should include ties at the selection
+boundary, ties introduced by softmax rounding, weights below/at/above `1e-8`,
+small weights paired with large expert outputs, negative and zero-sum weights,
+and non-finite inputs. Compare against executable ONNX decompositions and
+check selected expert identities as well as final values.
+
 ## Expert Execution
 
 After routing, the kernel processes experts independently:

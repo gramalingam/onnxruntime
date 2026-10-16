@@ -107,6 +107,11 @@ CPU QMoE's built-in top-k tie-break differs from ONNX TopK, and without
 disabled. The mask preserves exactly the ONNX-selected set, including ties,
 and explicit weights preserve all three routing semantics.
 
+The [CPU QMoE routing follow-up](contrib_ops/cpu/qmoe.md#open-follow-up-equivalence-to-standard-onnx-routing)
+records concrete counterexamples, the remaining route-cutoff limitation,
+zero-sum normalization differences, and questions to revisit before changing
+kernel behavior or simplifying this workaround.
+
 ### Scope and reproduction
 
 These are float32/int4, bias-free, full-block examples, not a general
