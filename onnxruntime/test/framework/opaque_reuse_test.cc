@@ -75,16 +75,30 @@ class SeedPrng final : public OpKernel {
 template <typename InputState, typename OutputState>
 class GeneratePrng final : public OpKernel {
  public:
-  explicit GeneratePrng(const OpKernelInfo& info) : OpKernel(info) {}
+  GeneratePrng(const OpKernelInfo& info, bool requires_reuse) : OpKernel(info), requires_reuse_(requires_reuse) {}
   Status Compute(OpKernelContext* ctx) const override {
     const TestPrng* input = ctx->Input<InputState>(0);
     TestPrng* output = ctx->Output<OutputState>(1);
+    ORT_RETURN_IF(requires_reuse_ && input != output, "MustInplace kernel received distinct state objects.");
     if (input != output) {
       output->CopyFrom(*input);
     } else {
       ++TestPrng::reused;
     }
     *ctx->Output(0, TensorShape{})->MutableData<float>() = output->Next();
+    return Status::OK();
+  }
+
+ private:
+  const bool requires_reuse_;
+};
+
+class AliasPrng final : public OpKernel {
+ public:
+  explicit AliasPrng(const OpKernelInfo& info) : OpKernel(info) {}
+  Status Compute(OpKernelContext* ctx) const override {
+    ORT_RETURN_IF_NOT(ctx->Input<TestPrng>(0) == ctx->Output<TestPrng>(0),
+                      "Alias kernel received distinct state objects.");
     return Status::OK();
   }
 };
@@ -111,8 +125,22 @@ class OpaqueReuseTest : public testing::Test {
     seed.Output(0, "state", "PRNG state", "T");
     seed.TypeConstraint("T", {"opaque(ort.test.prng,State)"}, "Test-only PRNG state");
     schemas.push_back(seed);
+    OpSchema alias("Alias", __FILE__, __LINE__);
+    alias.SetDomain(kPrngDomain).SinceVersion(1);
+    alias.Input(0, "state", "PRNG state", "T");
+    alias.Output(0, "next_state", "Unmodified PRNG state", "T");
+    alias.TypeConstraint("T", {"opaque(ort.test.prng,State)"}, "Test-only PRNG state");
+    schemas.push_back(alias);
     RegisterGenerate<TestPrng, TestPrng>(schemas, "Generate");
     RegisterGenerate<TestPrng, TestPrng>(schemas, "GenerateCopy", false);
+    RegisterGenerate<TestPrng, TestPrng>(schemas, "GenerateMust", false, {{0, 1}});
+    RegisterGenerate<TestPrng, TestPrng>(schemas, "GenerateMustBadInput", false, {{-1, 1}});
+    RegisterGenerate<TestPrng, TestPrng>(schemas, "GenerateMustBadOutput", false, {{0, 2}});
+    RegisterGenerate<TestPrng, TestPrng>(schemas, "GenerateMustDuplicate", false, {{0, 1}, {0, 1}});
+    RegisterGenerate<TestPrng, TestPrng>(schemas, "GenerateMustConflict", true, {{0, 1}});
+    RegisterGenerate<TestPrng, TestPrng>(schemas, "GenerateMustOptional", false, {{0, 1}}, true);
+    RegisterGenerate<TestPrng, OtherNamePrng>(schemas, "GenerateMustOtherName", false, {{0, 1}});
+    RegisterGenerate<TestPrng, OtherDomainPrng>(schemas, "GenerateMustOtherDomain", false, {{0, 1}});
     RegisterGenerate<TestPrng, OtherNamePrng>(schemas, "ToOtherName");
     RegisterGenerate<OtherNamePrng, TestPrng>(schemas, "FromOtherName");
     RegisterGenerate<TestPrng, OtherDomainPrng>(schemas, "ToOtherDomain");
@@ -124,6 +152,14 @@ class OpaqueReuseTest : public testing::Test {
     ASSERT_STATUS_OK(registry_->RegisterCustomKernel(
         seed_def, [](FuncManager&, const OpKernelInfo& info, std::unique_ptr<OpKernel>& kernel) {
           kernel = std::make_unique<SeedPrng>(info);
+          return Status::OK();
+        }));
+    KernelDefBuilder alias_def;
+    alias_def.SetName("Alias").SetDomain(kPrngDomain).SinceVersion(1).Provider(kCpuExecutionProvider);
+    alias_def.TypeConstraint("T", DataTypeImpl::GetType<TestPrng>()).Alias(0, 0);
+    ASSERT_STATUS_OK(registry_->RegisterCustomKernel(
+        alias_def, [](FuncManager&, const OpKernelInfo& info, std::unique_ptr<OpKernel>& kernel) {
+          kernel = std::make_unique<AliasPrng>(info);
           return Status::OK();
         }));
     model_ = std::make_unique<Model>(
@@ -138,14 +174,16 @@ class OpaqueReuseTest : public testing::Test {
   }
 
   template <typename InputState, typename OutputState>
-  void RegisterGenerate(std::vector<OpSchema>& schemas, const char* name, bool may_inplace = true) {
+  void RegisterGenerate(std::vector<OpSchema>& schemas, const char* name, bool may_inplace = true,
+                        const std::vector<std::pair<int, int>>& must_inplace = {}, bool optional_state = false) {
     const auto* input_type = DataTypeImpl::GetType<InputState>();
     const auto* output_type = DataTypeImpl::GetType<OutputState>();
     OpSchema generate(name, __FILE__, __LINE__);
     generate.SetDomain(kPrngDomain).SinceVersion(1);
-    generate.Input(0, "state", "PRNG state", "TInput");
+    generate.Input(0, "state", "PRNG state", "TInput", optional_state ? OpSchema::Optional : OpSchema::Single);
     generate.Output(0, "value", "Scalar sample", "tensor(float)");
-    generate.Output(1, "next_state", "Updated PRNG state", "TOutput");
+    generate.Output(1, "next_state", "Updated PRNG state", "TOutput",
+                    optional_state ? OpSchema::Optional : OpSchema::Single);
     generate.TypeConstraint("TInput", {DataTypeImpl::ToString(input_type)}, "Test-only PRNG state");
     generate.TypeConstraint("TOutput", {DataTypeImpl::ToString(output_type)}, "Test-only PRNG state");
     schemas.push_back(generate);
@@ -153,9 +191,15 @@ class OpaqueReuseTest : public testing::Test {
     def.SetName(name).SetDomain(kPrngDomain).SinceVersion(1).Provider(kCpuExecutionProvider);
     def.TypeConstraint("TInput", input_type).TypeConstraint("TOutput", output_type);
     if (may_inplace) def.MayInplace(0, 1);
+    if (must_inplace.size() == 1) {
+      def.MustInplace(must_inplace.front().first, must_inplace.front().second);
+    } else if (!must_inplace.empty()) {
+      def.MustInplace(must_inplace);
+    }
     ASSERT_STATUS_OK(registry_->RegisterCustomKernel(
-        def, [](FuncManager&, const OpKernelInfo& info, std::unique_ptr<OpKernel>& kernel) {
-          kernel = std::make_unique<GeneratePrng<InputState, OutputState>>(info);
+        def, [requires_reuse = !must_inplace.empty()](
+                 FuncManager&, const OpKernelInfo& info, std::unique_ptr<OpKernel>& kernel) {
+          kernel = std::make_unique<GeneratePrng<InputState, OutputState>>(info, requires_reuse);
           return Status::OK();
         }));
   }
@@ -211,6 +255,12 @@ class OpaqueReuseTest : public testing::Test {
     OrtValue seed;
     CreateMLValue<int64_t>(CPUAllocator::DefaultInstance(), {}, {42}, &seed);
     return {{"seed", seed}};
+  }
+
+  void ExpectInitializationFailure(const std::vector<std::string>& outputs, const char* message,
+                                   ExecutionMode mode = ExecutionMode::ORT_SEQUENTIAL) {
+    EXPECT_THAT([&] { Initialize(outputs, mode); },
+                testing::ThrowsMessage<OnnxRuntimeException>(testing::HasSubstr(message)));
   }
 
   static const AllocPlanPerValue& Plan(const InferenceSession& session, const std::string& name) {
@@ -435,6 +485,218 @@ TEST_F(OpaqueReuseTest, GraphInputOutputAliasRejectsPassThroughAndMutableOutputs
     EXPECT_EQ(TestPrng::reused.load(), 0);
     EXPECT_EQ(TestPrng::copied.load(), 0);
   }
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceInternalStateReusesForGraphOutput) {
+  AddSeed();
+  AddGenerate("s0", "v1", "s1", "GenerateMust");
+  auto session = Initialize({"v1", "s1"});
+  EXPECT_EQ(Plan(*session, "s1").alloc_kind, AllocKind::kReuse);
+
+  auto values = Run(*session, SeedFeed(), {"v1", "s1"});
+
+  EXPECT_EQ(values[1].Get<TestPrng>().State(), 42u + 0x9e3779b97f4a7c15ULL);
+  EXPECT_EQ(TestPrng::reused.load(), 1);
+  EXPECT_EQ(TestPrng::copied.load(), 0);
+  EXPECT_EQ(TestPrng::created.load(), 1);
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceGraphInputMutatesWithoutPreallocatedOutput) {
+  AddGenerate("s0", "v1", "s1", "GenerateMust");
+  auto session = Initialize({"v1", "s1"});
+  OrtValue state = PrngValue(42);
+  const auto* object = &state.Get<TestPrng>();
+
+  auto values = Run(*session, {{"s0", state}}, {"v1", "s1"});
+
+  EXPECT_EQ(&values[1].Get<TestPrng>(), object);
+  EXPECT_EQ(&state.Get<TestPrng>(), object);
+  EXPECT_EQ(state.Get<TestPrng>().State(), 42u + 0x9e3779b97f4a7c15ULL);
+  EXPECT_EQ(TestPrng::reused.load(), 1);
+  EXPECT_EQ(TestPrng::copied.load(), 0);
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsDistinctPreallocatedOutputBeforeExecution) {
+  AddGenerate("s0", "v1", "s1", "GenerateMust");
+  auto session = Initialize({"v1", "s1"});
+  OrtValue input = PrngValue(42);
+  OrtValue output = PrngValue(0);
+  std::vector<OrtValue> fetches(2);
+  fetches[1] = output;
+  const NameMLValMap feeds{{"s0", input}};
+  const std::vector<std::string> outputs{"v1", "s1"};
+
+  const auto status = session->Run(RunOptions{}, feeds, outputs, &fetches);
+
+  EXPECT_EQ(status.Code(), common::INVALID_ARGUMENT);
+  EXPECT_THAT(status.ErrorMessage(), testing::HasSubstr("kernel declares MustInplace"));
+  EXPECT_EQ(input.Get<TestPrng>().State(), 42u);
+  EXPECT_EQ(output.Get<TestPrng>().State(), 0u);
+  EXPECT_EQ(TestPrng::reused.load(), 0);
+  EXPECT_EQ(TestPrng::copied.load(), 0);
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsForkAtSessionInitialization) {
+  AddSeed();
+  AddGenerate("s0", "v1", "s1", "GenerateMust");
+  AddGenerate("s0", "v2", "s2");
+
+  ExpectInitializationFailure({"v1", "v2", "s1", "s2"}, "requires exclusive linear use");
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceChainReusesCallerObjectAcrossRuns) {
+  AddGenerate("s0", "v1", "s1", "GenerateMust");
+  AddGenerate("s1", "v2", "s2", "GenerateMust");
+  auto session = Initialize({"v1", "v2", "s2"});
+  OrtValue state = PrngValue(42);
+  uint64_t expected_state = 42;
+  for (int run = 0; run < 3; ++run) {
+    auto values = Run(*session, {{"s0", state}}, {"v1", "v2", "s2"});
+    expected_state += 2 * 0x9e3779b97f4a7c15ULL;
+    EXPECT_TRUE(values[2].SharesDataWith(state));
+    EXPECT_EQ(state.Get<TestPrng>().State(), expected_state);
+    EXPECT_EQ(TestPrng::reused.load(), 2 * (run + 1));
+    EXPECT_EQ(TestPrng::copied.load(), 0);
+    EXPECT_EQ(TestPrng::created.load(), 1);
+  }
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceAcceptsSameObjectIOBinding) {
+  AddGenerate("s0", "v1", "s1", "GenerateMust");
+  auto session = Initialize({"v1", "s1"});
+  OrtValue state = PrngValue(42);
+  std::unique_ptr<IOBinding> binding;
+  ASSERT_STATUS_OK(session->NewIOBinding(&binding));
+  ASSERT_STATUS_OK(binding->BindInput("s0", state));
+  ASSERT_STATUS_OK(binding->BindOutput("v1"));
+  ASSERT_STATUS_OK(binding->BindOutput("s1", state));
+
+  ASSERT_STATUS_OK(session->Run(RunOptions{}, *binding));
+
+  EXPECT_TRUE(binding->GetOutputs()[1].SharesDataWith(state));
+  EXPECT_EQ(state.Get<TestPrng>().State(), 42u + 0x9e3779b97f4a7c15ULL);
+  EXPECT_EQ(TestPrng::reused.load(), 1);
+  EXPECT_EQ(TestPrng::copied.load(), 0);
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsSharedModelInputsBeforeExecution) {
+  AddGenerate("s0", "v1", "s1", "GenerateMust");
+  AddGenerate("other", "v2", "s2", "GenerateCopy");
+  auto session = Initialize({"v1", "v2", "s1", "s2"});
+  OrtValue state = PrngValue(42);
+  const NameMLValMap feeds{{"s0", state}, {"other", state}};
+  const std::vector<std::string> outputs{"v1", "v2", "s1", "s2"};
+  std::vector<OrtValue> fetches;
+
+  const auto status = session->Run(RunOptions{}, feeds, outputs, &fetches);
+
+  EXPECT_EQ(status.Code(), common::INVALID_ARGUMENT);
+  EXPECT_THAT(status.ErrorMessage(), testing::HasSubstr("shares its object with another model input"));
+  EXPECT_EQ(state.Get<TestPrng>().State(), 42u);
+  EXPECT_EQ(TestPrng::reused.load(), 0);
+  EXPECT_EQ(TestPrng::copied.load(), 0);
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsPreallocatedInternalOutputBeforeExecution) {
+  AddSeed();
+  AddGenerate("s0", "v1", "s1", "GenerateMust");
+  auto session = Initialize({"v1", "s1"});
+  OrtValue state = PrngValue(0);
+  const std::vector<std::string> outputs{"v1", "s1"};
+  std::vector<OrtValue> fetches(2);
+  fetches[1] = state;
+
+  const auto status = session->Run(RunOptions{}, SeedFeed(), outputs, &fetches);
+
+  EXPECT_EQ(status.Code(), common::INVALID_ARGUMENT);
+  EXPECT_THAT(status.ErrorMessage(), testing::HasSubstr("overrides a MustInplace allocation"));
+  EXPECT_EQ(state.Get<TestPrng>().State(), 0u);
+  EXPECT_EQ(TestPrng::reused.load(), 0);
+  EXPECT_EQ(TestPrng::copied.load(), 0);
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsObservableInputAtSessionInitialization) {
+  AddSeed();
+  AddGenerate("s0", "v1", "s1", "GenerateMust");
+
+  ExpectInitializationFailure({"s0", "v1", "s1"}, "because it is also a graph output");
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsObservableModelInputAtSessionInitialization) {
+  AddGenerate("s0", "v1", "s1", "GenerateMust");
+
+  ExpectInitializationFailure({"s0", "v1", "s1"}, "because it is also a graph output");
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsObservableAliasedAllocationAtSessionInitialization) {
+  AddSeed();
+  model_->MainGraph().AddNode("alias", "Alias", "", {&State("s0")}, {&State("alias")}, nullptr, kPrngDomain);
+  AddGenerate("alias", "v1", "s1", "GenerateMust");
+
+  ExpectInitializationFailure({"s0", "v1", "s1"}, "requires exclusive ownership of the MustInplace allocation");
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsMissingInputAtSessionInitialization) {
+  AddGenerate("", "v1", "s1", "GenerateMustOptional");
+
+  ExpectInitializationFailure({"v1", "s1"}, "requires MustInplace input and output values to be present");
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsMissingOutputAtSessionInitialization) {
+  AddSeed();
+  AddGenerate("s0", "v1", "", "GenerateMustOptional");
+
+  ExpectInitializationFailure({"v1"}, "requires MustInplace input and output values to be present");
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsInvalidInputIndexAtSessionInitialization) {
+  AddSeed();
+  AddGenerate("s0", "v1", "s1", "GenerateMustBadInput");
+
+  ExpectInitializationFailure({"v1", "s1"}, "invalid MustInplace mapping");
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsInvalidOutputIndexAtSessionInitialization) {
+  AddSeed();
+  AddGenerate("s0", "v1", "s1", "GenerateMustBadOutput");
+
+  ExpectInitializationFailure({"v1", "s1"}, "invalid MustInplace mapping");
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsDuplicateMappingsAtSessionInitialization) {
+  AddSeed();
+  AddGenerate("s0", "v1", "s1", "GenerateMustDuplicate");
+
+  ExpectInitializationFailure({"v1", "s1"}, "multiple MustInplace mappings for output");
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsConflictingMayInplaceAtSessionInitialization) {
+  AddSeed();
+  AddGenerate("s0", "v1", "s1", "GenerateMustConflict");
+
+  ExpectInitializationFailure({"v1", "s1"}, "alias declarations conflicting with MustInplace");
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsDifferentOpaqueNameAtSessionInitialization) {
+  AddSeed();
+  AddGenerate<TestPrng, OtherNamePrng>("s0", "v1", "s1", "GenerateMustOtherName");
+
+  ExpectInitializationFailure({"v1", "s1"}, "incompatible MustInplace input");
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsDifferentOpaqueDomainAtSessionInitialization) {
+  AddSeed();
+  AddGenerate<TestPrng, OtherDomainPrng>("s0", "v1", "s1", "GenerateMustOtherDomain");
+
+  ExpectInitializationFailure({"v1", "s1"}, "incompatible MustInplace input");
+}
+
+TEST_F(OpaqueReuseTest, MustInplaceRejectsParallelExecutionAtSessionInitialization) {
+  AddSeed();
+  AddGenerate("s0", "v1", "s1", "GenerateMust");
+
+  ExpectInitializationFailure({"v1", "s1"}, "not supported with parallel or multi-stream execution",
+                              ExecutionMode::ORT_PARALLEL);
 }
 
 TEST_F(OpaqueReuseTest, MatchingTypeWithoutMayInplaceDoesNotReuse) {

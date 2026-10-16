@@ -60,6 +60,10 @@ class KernelDef {
     return inplace_map_;
   }
 
+  const std::vector<std::pair<int, int>>& MustInplace() const {
+    return must_inplace_map_;
+  }
+
   const std::vector<std::pair<int, int>>& Alias() const {
     return alias_map_;
   }
@@ -127,6 +131,9 @@ class KernelDef {
 
   // An element <i, j> means that output j reuses the memory of input i.
   std::vector<std::pair<int, int>> inplace_map_;
+
+  // An element <i, j> means that output j must reuse and may mutate input i.
+  std::vector<std::pair<int, int>> must_inplace_map_;
 
   // An element <i, j> means that output j is an alias of input i.
   std::vector<std::pair<int, int>> alias_map_;
@@ -225,6 +232,17 @@ class KernelDefBuilder {
   */
   KernelDefBuilder& MayInplace(const std::vector<std::pair<int, int>>& inplaces);
   KernelDefBuilder& MayInplace(int input_index, int output_index);
+
+  /**
+     Required mutable mapping from inputs to outputs.
+     Session initialization fails if ORT cannot guarantee exclusive, compatible
+     opaque input/output reuse. Unlike Alias, the kernel may change the shared value.
+     A graph input is destructive: Run may mutate the caller's object even without
+     a preallocated output. A direct preallocated output must share that object.
+     Currently limited to sequential, single-stream execution outside subgraphs.
+  */
+  KernelDefBuilder& MustInplace(const std::vector<std::pair<int, int>>& inplaces);
+  KernelDefBuilder& MustInplace(int input_index, int output_index);
 
   /**
      Alias mapping from inputs to outputs. Different from Inplace that the
