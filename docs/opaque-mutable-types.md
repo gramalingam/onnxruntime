@@ -13,6 +13,8 @@ This document describes two supported cases:
 
 Both use `KernelDefBuilder::MayInplace`. It is permission to reuse, not a requirement,
 and every participating kernel must also implement the distinct-output path.
+Kernels without that fallback can instead declare `MustInplace`, which requires
+exclusive linear use and permits destructive model inputs as described below.
 
 ## Opaque state and functional graphs
 
@@ -165,6 +167,39 @@ cannot assign that private state into the bound output object without type-speci
 help. The current contract therefore accepts only a direct input-to-output kernel
 relationship and rejects broader alias requests before execution.
 
+## Required mutable reuse
+
+Some opaque classes cannot be cloned or evaluated into a distinct output. A kernel
+for such a class can declare:
+
+```cpp
+def.MustInplace(0, 1);
+```
+
+Unlike the content-preserving `Alias` declaration used for views, `MustInplace`
+permits mutation and requires output 1 to share input 0's object and ownership.
+It currently supports opaque values only. Session initialization rejects invalid
+or absent arguments, mismatched opaque types or locations, initializer inputs,
+observable input states, multiple consumers or conflicting mappings, and parallel
+or multi-stream execution. Subgraphs and allocations with other live aliases are
+also rejected. Do not combine a required pair with `MayInplace`, `Alias`, or
+`VariadicAlias` declarations for the same arguments.
+
+An accepted mapping reuses the input even when the output is a graph output.
+For a graph input, this is an explicit **destructive-input contract**: running the
+model advances the caller's object without requiring a preallocated output.
+The caller must not concurrently access that object, and a failed run may leave
+it partially updated. A preallocated output is accepted only for a direct
+graph-input relationship and must share that input's object and ownership;
+conflicting bindings are rejected before any kernel executes.
+Binding one destructive input object under multiple model input names is also
+rejected, including runs without preallocated outputs.
+
+Use `MayInplace` when the kernel has a correct distinct-output fallback.
+Use `MustInplace` when no fallback exists and unsupported graph usage must fail
+at session initialization rather than silently copying or modifying an observable
+earlier state.
+
 ## Tensor key-value cache precedent
 
 Tensor-backed state already uses the same API convention. The CPU
@@ -230,8 +265,10 @@ test-only opaque PRNG schemas and CPU kernels. It covers:
 - rejection of mismatched opaque domains and names;
 - distinct allocation in the optimizer execution frame;
 - same-object model input/output binding through preallocated outputs and I/O binding;
-- pre-run rejection of non-linear boundary aliases; and
-- the distinct-output fallback at the model boundary.
+- pre-run rejection of non-linear boundary aliases;
+- the distinct-output fallback at the model boundary; and
+- mandatory internal and model-input reuse, with rejection of unsafe graphs and
+  conflicting output bindings.
 
 The tests use counters for construction, destruction, copying, and actual address
 reuse. Value equality alone would not prove that the intended alias path executed.
@@ -243,7 +280,8 @@ This support is intentionally narrow:
 - Opaque types, schemas, and kernels still require in-tree registration.
 - No plugin registration, unload, or public custom factory API is added.
 - ORT does not clone, assign, serialize, or copy back arbitrary opaque state.
-- Planner reuse is not guaranteed; kernels must support distinct outputs.
+- `MayInplace` reuse is not guaranteed; those kernels must support distinct outputs.
+- `MustInplace` requires exclusive linear use and permits destructive graph inputs.
 - Caller-bound same-object mutation is limited to a direct linear kernel relation.
 - Branching, control-flow, cross-device, and longer-path identity guarantees are not
   provided by this contract.
