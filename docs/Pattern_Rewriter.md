@@ -15,6 +15,130 @@ the original text need not outlive the rule. Rules remain copyable and movable.
 The matcher establishes structural and deletion safety. **The rule author must establish
 semantic equivalence, supported types, and kernel compatibility.**
 
+## Quantized MatMul and MoE fusion examples
+
+`MakeQuantizedFusionRules()` illustrates how portable low-bit decompositions
+can be recognized without baking quantization formats into the rewriter.
+Like `MakeExampleRules()`, it is **opt-in**, not a default ORT optimizer:
+
+```cpp
+rewrite::PatternRewriter rewriter(rewrite::MakeQuantizedFusionRules());
+rewrite::Statistics statistics;
+ORT_THROW_IF_ERROR(rewriter.Run(graph, statistics));
+ORT_THROW_IF_ERROR(graph.Resolve());
+```
+
+The examples use standard ONNX opset 21 and two local ONNX function contracts:
+
+- `local.quant.Unpack(packed, count, bits=4)` specializes
+  [the proposed Unpack](https://github.com/onnx/onnx/pull/8576):
+  unsigned codes, least-significant nibble first, last-axis packing, and a
+  scalar int64 logical count. Its executable function body uses `BitwiseAnd`,
+  `BitShift`, interleaving, reshaping, and slicing. Count removes the spare
+  high nibble when unpacking an odd number of zero points.
+- `local.moe.GroupedMatMul(X, W, indices)` follows the indexed-expert use of
+  [the GroupedMatMul proposal](https://github.com/onnx/onnx/pull/8193).
+  For `X[M,K]`, `W[E,K,N]`, and `indices[M,T]`, it produces `[M,T,N]`,
+  with `Y[m,t,:] = X[m,:] @ W[indices[m,t],:,:]`. Its body is
+  `Gather` + `Unsqueeze` + `MatMul` + `Squeeze`.
+
+These domain names are explicit contracts for these examples, **not** new
+standard ONNX schemas. The model must supply the corresponding function bodies
+and import `com.microsoft` version 1 for the replacements. The rules trust the
+local function contracts, as an operator matcher trusts an operator's schema;
+do not apply them to unrelated functions reusing those qualified names.
+No ONNX pin/schema changes or custom kernels are required.
+
+### MatMulNBits decomposition
+
+For full blocks of size `L`, let `B = K/L`. Storage is `W[N,B,L/2]`
+(uint8); scales are `S[N,B]` (float32). The canonical graph is:
+
+```text
+codes = local.quant.Unpack(W, int64(L), bits=4)  # [N,B,L]
+q = Cast(codes, to=FLOAT)
+centered = Sub(q, 8.0)                          # implicit symmetric zero point
+blocks = Mul(centered, Unsqueeze(S, [-1]))
+rows = Reshape(blocks, [N,K], allowzero=0)
+weights = Transpose(rows, perm=[1,0])            # [K,N]
+Y = MatMul(A, weights)
+```
+
+The other two rules replace `8.0` with `Unsqueeze(Z, [-1])`, where `Z`
+is either float32 `[N,B]` or is obtained by unpacking uint8
+`[N,ceil(B/2)]` to exactly `B` codes and casting to float32.
+All three become `com.microsoft.MatMulNBits(A,W,S[,Z])`, binding `K`, `N`,
+and `block_size=L` after checking actual shapes and constant reshape/count
+values. Packed zero points stay packed in the fused input. The replacement
+sets `bits=4` and `accuracy_level=0`; activation ranks 1, 2, and higher are
+supported when the last dimension is statically `K`.
+
+### QMoE decomposition
+
+Each expert projection starts with raw weights `[E,N,K/2]` and scales
+`[E,N,K/L]`. Reshape the packed weights to `[E,N,K/L,L/2]`, apply the same
+Unpack/Cast/Sub(8)/Mul block dequantization, reshape to `[E,N,K]`, and
+transpose to `[E,K,N]`. Use three such projections:
+
+```text
+gate = GroupedMatMul(X, dequantized_gate, indices)
+up = GroupedMatMul(X, dequantized_up, indices)
+product = Mul(Mul(gate, Sigmoid(gate)), up)        # SwiGLU
+flat = Reshape(product, [-1,I], allowzero=0)
+flat_indices = Reshape(indices, [-1,1], allowzero=0)
+down = GroupedMatMul(flat, dequantized_down, flat_indices)
+slots = Reshape(down, [-1,T,H], allowzero=0)
+Y = ReduceSum(Mul(slots, Unsqueeze(mixing, [-1])), [1], keepdims=0)
+```
+
+The three routing rules recognize TopK(logits) then Softmax, Softmax(logits)
+then TopK, and the latter followed by normalization over the selected experts.
+The fused QMoE consumes raw integer weights with `weights_prepacked=0`,
+`expert_weight_bits=4`, `quant_type="int"`, `accuracy_level=0`, and
+`swiglu_fusion=1`. Gate/up **output rows** and their scale rows are interleaved
+as `[g0,u0,g1,u1,...]`; the down weights/scales are reused unchanged.
+
+The replacement retains the standard routing computation and scatters its
+indices into a 0/1 selection mask and its mixing weights into a dense
+`router_weights` tensor. QMoE selects the mask's `T` entries and uses the
+explicit weights (`normalize_routing_weights=0`). This is intentional:
+CPU QMoE's built-in top-k tie-break differs from ONNX TopK, and without
+`router_weights` it softmaxes the selected logits even when normalization is
+disabled. The mask preserves exactly the ONNX-selected set, including ties,
+and explicit weights preserve all three routing semantics.
+
+### Scope and reproduction
+
+These are float32/int4, bias-free, full-block examples, not a general
+quantization importer. `L` must be a power of two at least 16. QMoE requires
+static positive expert/feature dimensions, a common block size dividing both
+`H` and `I`, and constant top-k/reshape/count values.
+The token dimensions of `X` and logits must be equal static values or share
+the same nonempty symbolic dimension; anonymous unknown dimensions do not
+prove that the input and router token counts agree. Partial final blocks,
+other bit widths/types, asymmetric QMoE, alternate layouts, biases, and
+`g_idx` are not fused. Other opsets and unknown/noncanonical dimensions or
+reshape constants are conservatively rejected. Normal floating-point
+reassociation differences remain; QMoE also inherits the CPU kernel's
+negligible-route cutoff. Default EP eligibility remains CPU/unassigned.
+
+Regenerate the six small checked-in fixtures (only `onnx` and `numpy` needed):
+
+```powershell
+.\.venv\Scripts\python.exe onnxruntime\test\testdata\transform\fusion\generate_quantized_fusions.py
+```
+
+`QuantizedFusionRulesTests.*` exercises both indexed/reference matching,
+all zero-point/routing variants, multiple block sizes, rank-1 and batched
+MatMul, an odd packed-zero-point count, tied routing logits, symbolic token counts, numerical
+equivalence against the executable decomposition, idempotence, serialization
+round trips, and negative semantic/opset/EP/deletion-boundary cases. Run from
+the build output directory:
+
+```powershell
+.\onnxruntime_test_all.exe --gtest_filter="QuantizedFusionRulesTests.*"
+```
+
 ## Example: HardSigmoid followed by Mul
 
 This complete rule recognizes the HardSwish decomposition with the exact
