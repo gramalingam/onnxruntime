@@ -262,5 +262,8 @@ class PatternRewriter final : public GraphTransformer {
 // Float32 examples adapted from genuine ONNXScript rules; EP eligibility is controlled by Options.
 Rules MakeExampleRules();
 
+// Opt-in float32/int4 examples using the local.quant.Unpack and local.moe.GroupedMatMul contracts.
+Rules MakeQuantizedFusionRules();
+
 }  // namespace rewrite
 }  // namespace onnxruntime
