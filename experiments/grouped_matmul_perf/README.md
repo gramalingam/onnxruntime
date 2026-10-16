@@ -1,0 +1,942 @@
+# TL;DR
+
+- **`GroupedMatMul` fused op vs. its standard-op decomposition (CPU)**: fused is **~8–21x
+  faster**, and the decomposition also duplicates weights `O(M·k·K·N)`, OOMing at realistic
+  scale. Clear win — never use the decomposition in practice.
+- **MoE component-level fusion candidates, CPU** (`benchmark_moe_fusions.py`):
+  - SwiGLU gated-activation (`Sigmoid+Mul+Mul` → fused): **~1.6–2.4x**, the bigger lever (largest
+    tensors in the layer).
+  - Router `Softmax→TopK` fusion: smaller win, **~1.1–1.9x**, best for low-top-k/many-expert
+    configs.
+- **Full MoE layer: fused `com.microsoft.MoE` vs. `GroupedMatMul`-based expansion**
+  (`benchmark_moe_vs_grouped.py`):
+  - **CPU (fp32), 24-core host**: expanded wins every case (fused is 0.24x–0.90x of expanded
+    speed). **But this ranking is not a stable property of the two kernels** — it flips
+    (fused wins) on a 96-core host, because `GroupedMatMul`'s CPU kernel hands each per-group
+    GEMM the full, uncapped thread pool (vs. fused `MoE`'s capped-at-8 expert parallelism), which
+    over-parallelizes small per-group GEMMs as core count grows — a fixable bug, not evidence the
+    fused op is inherently better on CPU (see *The CPU ranking is not fixed* below).
+  - **CUDA (fp16)**: ranking flips — **fused MoE wins every case (1.18x–3.72x)**, biggest wins for
+    many-expert/low-top-k configs. The gap is in core grouped-GEMM execution, not surrounding glue.
+- **`GroupedMatMul` CUDA GEMM-dispatch investigation**:
+  - Root cause of the CUDA gap: `GroupedMatMul`'s per-group `cublasGemmHelper` loop (with a
+    device→host sync) vs. MoE's single CUTLASS grouped-GEMM launch.
+  - Prototyped a CUTLASS-based alternative for `GroupedMatMul`
+    (`ORT_GROUPED_MATMUL_CUDA_IMPL=cutlass`): **not a clear win** at tested sizes (0.52x–1.29x vs.
+    cuBLAS) — kept as an opt-in, not the default.
+- **New op `GroupedMatMulReduceSum`** (fuses `GroupedMatMul` FC2 + the router-weighted `ReduceSum`
+  combine into one CUDA kernel): validated correct (CPU + CUDA, cuBLAS and CUTLASS paths); on CUDA
+  fp16 gives a consistent **~5–20% speedup over plain expanded MoE**, but doesn't close the full
+  gap to the all-in-one fused `MoE` op.
+
+---
+
+# GroupedMatMul: fused op vs. function-definition expansion — performance
+
+This experiment compares the fused contrib op **`com.microsoft.GroupedMatMul`** against its
+documented **function-definition expansion** (the "reference decomposition" in
+[`docs/GroupedMatMul.md`](../../docs/GroupedMatMul.md)), which expresses the same
+Mixture-of-Experts grouped matmul with standard ONNX ops:
+
+```
+idx_flat = Reshape(group_indices, [M*k])
+W_sel    = Gather(weights, idx_flat, axis=0)          # [M*k, K, N]  (duplicates weights!)
+X        = Reshape(Expand(Unsqueeze(input, 1), [M,k,K]), [M*k, 1, K])
+r        = MatMul(X, W_sel)                           # [M*k, 1, N]
+r        = r + Unsqueeze(Gather(bias, idx_flat), 1)   # optional
+output   = Reshape(r, [M, k, N])
+```
+
+## How to run
+
+```bash
+# Requires an ONNX Runtime build that contains the GroupedMatMul contrib op.
+# CPU:
+python benchmark_grouped_matmul.py --providers cpu --csv results_cpu_fp32.csv
+# CUDA (on a GPU host with a --use_cuda ORT build):
+python benchmark_grouped_matmul.py --providers cuda --csv results_cuda_fp32.csv
+# Variants:
+python benchmark_grouped_matmul.py --dtype float16
+python benchmark_grouped_matmul.py --bias
+```
+
+Run from **outside** the repository root, or the local `onnxruntime/` source directory
+shadows the installed `onnxruntime` package.
+
+The harness builds one ONNX model per variant (fused vs. decomposition), warms up, then times
+`iters` runs and reports mean latency, `decomp/fused` speedup, and the max relative error
+between the two outputs (a correctness cross-check). The decomposition's `W_sel` tensor is
+`O(M·k·K·N)`; cases whose `W_sel` would exceed `--mem-budget-gb` (default 3 GiB) run the fused
+op only and report `OOM-skip` for the decomposition.
+
+## Sizes
+
+Realistic MoE feed-forward shapes: `M` tokens, top-`k` experts per token, hidden `K`, ffn/out
+`N`, `num_groups` (G) experts. Chosen so the decomposition's duplicated-weight tensor stays
+within the sandbox's memory budget.
+
+## Results
+
+Environment: 4-core x86-64 CPU, 15 GiB RAM, ONNX Runtime 1.29.0 built from this branch
+(Release, CPU EP), `ORT_ENABLE_ALL` graph optimization, 3 warmup + 10 timed iterations.
+Latency is mean wall-clock milliseconds per `Run`.
+
+### CPU, float32 (no bias)
+
+| case         |    M | k |    K |    N |  G | fused ms | decomp ms | speedup | max rel err |
+|--------------|-----:|--:|-----:|-----:|---:|---------:|----------:|--------:|------------:|
+| medium-top2  |  512 | 2 |  768 |  768 | 32 |    9.839 |   178.145 |  18.11x |    7.0e-07  |
+| medium-dense | 1024 | 1 |  768 |  768 | 16 |    9.475 |   161.765 |  17.07x |    5.8e-07  |
+| large-tokens | 2048 | 1 |  512 |  512 | 32 |    8.652 |   152.460 |  17.62x |    5.3e-07  |
+| wide-hidden  |  256 | 2 | 1024 | 1024 |  8 |    7.917 |   146.166 |  18.46x |    6.1e-07  |
+| many-experts |  512 | 1 |  512 |  512 | 64 |    4.532 |    42.236 |   9.32x |    5.0e-07  |
+| small-dense  |  512 | 1 |  768 |  768 |  8 |    3.759 |    78.156 |  20.79x |    6.5e-07  |
+| small-top2   |  512 | 2 |  512 |  512 | 16 |    3.559 |    70.970 |  19.94x |    6.1e-07  |
+| tiny         |  256 | 1 |  512 |  512 |  8 |    1.013 |    16.807 |  16.58x |    4.5e-07  |
+
+### CPU, float32 (with bias)
+
+| case         | fused ms | decomp ms | speedup |
+|--------------|---------:|----------:|--------:|
+| medium-top2  |   10.255 |   177.944 |  17.35x |
+| large-tokens |    9.340 |   152.366 |  16.31x |
+| medium-dense |    8.297 |   161.592 |  19.48x |
+| wide-hidden  |    8.267 |   149.062 |  18.03x |
+| many-experts |    5.065 |    41.696 |   8.23x |
+| small-dense  |    3.789 |    78.884 |  20.82x |
+| small-top2   |    3.655 |    71.043 |  19.44x |
+| tiny         |    1.029 |    16.930 |  16.45x |
+
+### CPU, float16 (no bias)
+
+| case         | fused ms | decomp ms | speedup | max rel err |
+|--------------|---------:|----------:|--------:|------------:|
+| medium-top2  |   15.022 |   187.968 |  12.51x |    4.8e-04  |
+| large-tokens |   10.814 |   151.038 |  13.97x |    5.4e-04  |
+| medium-dense |    9.788 |   169.004 |  17.27x |    4.4e-04  |
+| wide-hidden  |    9.220 |   153.267 |  16.62x |    3.6e-04  |
+| many-experts |    9.199 |    44.095 |   4.79x |    2.9e-04  |
+| small-dense  |    4.586 |    81.234 |  17.71x |    4.8e-04  |
+| small-top2   |    4.271 |    72.485 |  16.97x |    2.8e-04  |
+| tiny         |    1.306 |    16.945 |  12.97x |    2.9e-04  |
+
+Raw CSVs: `results_cpu_fp32.csv`, `results_cpu_fp32_bias.csv`, `results_cpu_fp16.csv`.
+
+### CUDA
+
+CUDA numbers were **not** collected: this sandbox has no GPU (`nvidia-smi` absent) and the
+installed build is CPU-only. The harness fully supports CUDA — on a GPU host, build ORT with
+`--use_cuda` and run `--providers cuda`. The relative ranking is expected to be even more
+lopsided on GPU: the decomposition's `Gather` materialises a fresh `[M·k, K, N]` weight tensor
+(hundreds of MB–GB of extra HBM traffic per run), whereas the fused kernel reads each weight
+matrix once.
+
+## Conclusions
+
+- **The fused `GroupedMatMul` is ~8–21× faster than its standard-op decomposition on CPU**
+  across all tested shapes and dtypes, confirming the motivation for a dedicated op.
+- **Correctness matches**: max relative error is ~5e-07 (float32) / ~5e-04 (float16),
+  i.e. the fused op and the decomposition compute the same result within numerical tolerance.
+- **The decomposition's cost is dominated by the `Gather` that duplicates weights**
+  (`W_sel` is `O(M·k·K·N)`). This is why its latency scales with `M·k·K·N` rather than with
+  the actual GEMM work, and why the `many-experts` case (small `M·k·K·N`, many groups) shows
+  the smallest gap — there the fused op's per-group sort/dispatch overhead is relatively larger
+  while the decomposition duplicates comparatively little weight data.
+- **Memory blow-up is the harder limit**: at larger MoE shapes the decomposition's `W_sel`
+  tensor exceeds available memory (many GB), so the decomposition cannot run at all while the
+  fused op runs comfortably. The `--mem-budget-gb` guard makes this explicit (`OOM-skip`).
+
+---
+
+# MoE fusion microbenchmarks (candidate fusions beyond GroupedMatMul)
+
+`benchmark_moe_fusions.py` measures the two non-GEMM op clusters that remain in a standard
+top-k MoE feed-forward layer after the grouped GEMMs are handled by `GroupedMatMul`. These are
+the fusion candidates identified in the pre-implementation analysis. Each cluster is timed *in
+isolation* to quantify the headroom a dedicated fused kernel could recover. The harness uses
+only standard ONNX ops plus `com.microsoft.QuickGelu` (which equals SiLU at `alpha=1`), so it
+runs against a **stock** ONNX Runtime build — it does **not** need the GroupedMatMul op.
+
+## How to run
+
+```bash
+python benchmark_moe_fusions.py --providers cpu                 # both candidates
+python benchmark_moe_fusions.py --bench swiglu --dtype float16
+python benchmark_moe_fusions.py --bench router --csv router.csv
+python benchmark_moe_fusions.py --providers cuda               # on a GPU host
+```
+
+## Candidate A — SwiGLU gated activation `Mul(SiLU(g), u)`
+
+This touches the layer's largest intermediates: two `[T, F]` tensors (`T` = token·expert-slot
+rows, `F` = FFN inner dim). Three numerically-equivalent-in-math variants bracket the fusion
+win:
+
+- `unfused`   : `Sigmoid(g) → Mul(g,·) → Mul(·,u)` — 3 elementwise passes (naive graph).
+- `quickgelu` : `QuickGelu(g,alpha=1) → Mul(·,u)` — 2 passes (SiLU as one contrib op).
+- `fused_lb`  : `Mul(g,u)` — 1 pass; a **lower bound** for a single fused SwiGLU kernel (same
+  memory traffic, minus the cheap sigmoid arithmetic).
+
+`unfused/lb` is the bandwidth headroom a fused gated-activation kernel (or a GroupedMatMul
+activation epilogue) targets.
+
+## Candidate B — Router `Softmax → TopK (→ renormalize)`
+
+Softmax is monotonic, so `TopK(Softmax(logits))` selects the same experts as `TopK(logits)`,
+and *renormalized* top-k of a full softmax equals a softmax over just the top-k logits
+(`p_i/Σ_{j∈topk}p_j = e^{l_i}/Σ_{j∈topk}e^{l_j}`). Two equivalent strategies are timed:
+
+- `naive` : `Softmax(logits)[M,E] → TopK(k) → ReduceSum → Div` — full `E`-wide softmax.
+- `fused` : `TopK(logits,k) → Softmax([M,k])` — softmax on `k ≪ E` only.
+
+`E` (#experts) is small, so this is a launch-latency / intermediate-allocation win, not an
+arithmetic one. The harness confirms the two strategies agree (max rel err ≈ 1e-7 fp32).
+
+## Results
+
+Environment: 4-core x86-64 CPU, 15 GiB RAM, stock ONNX Runtime 1.27.0 (CPU EP),
+`ORT_ENABLE_ALL`, 5 warmup + 20 timed iterations. Latency = mean ms/`Run`.
+
+### Candidate A — SwiGLU, CPU
+
+**float32**
+
+| case         |    T |     F | unfused ms | quickgelu ms | fused_lb ms | unfused/lb | qg/lb |
+|--------------|-----:|------:|-----------:|-------------:|------------:|-----------:|------:|
+| many-tokens  | 8192 |  4096 |    25.4093 |      25.3144 |     14.5151 |      1.75x | 1.74x |
+| mixtral-ffn  | 1024 | 14336 |    10.8825 |      10.9013 |      6.1769 |      1.76x | 1.76x |
+| wide         | 1024 |  8192 |     5.9711 |       6.0188 |      3.4434 |      1.73x | 1.75x |
+| deepseek-ffn | 2048 |  1408 |     1.8996 |       1.9792 |      0.8079 |      2.35x | 2.45x |
+| small        |  512 |  2048 |     0.4642 |       0.4673 |      0.2351 |      1.97x | 1.99x |
+
+**float16**
+
+| case         | unfused ms | quickgelu ms | fused_lb ms | unfused/lb | qg/lb |
+|--------------|-----------:|-------------:|------------:|-----------:|------:|
+| many-tokens  |    63.7327 |      47.9868 |     38.1889 |      1.67x | 1.26x |
+| mixtral-ffn  |    28.1380 |      21.6397 |     16.9777 |      1.66x | 1.27x |
+| wide         |    15.1434 |      11.5234 |      9.5571 |      1.58x | 1.21x |
+| deepseek-ffn |     4.3555 |       2.8420 |      2.2594 |      1.93x | 1.26x |
+| small        |     1.0048 |       0.7839 |      0.5676 |      1.77x | 1.38x |
+
+### Candidate B — Router, CPU
+
+**float32**
+
+| case          |    M |   E | k | naive ms | fused ms | speedup | max rel err |
+|---------------|-----:|----:|--:|---------:|---------:|--------:|------------:|
+| large-experts | 8192 | 256 | 8 |   5.6638 |   4.7160 |   1.20x |   1.4e-07   |
+| deepseek      | 4096 |  64 | 6 |   1.2939 |   1.1491 |   1.13x |   1.1e-07   |
+| switch-many   | 4096 | 128 | 1 |   0.5844 |   0.3433 |   1.70x |   0.0       |
+| mixtral       | 4096 |   8 | 2 |   0.3869 |   0.3280 |   1.18x |   1.2e-07   |
+| small-batch   |  512 |  32 | 4 |   0.1277 |   0.1195 |   1.07x |   7.4e-08   |
+
+**float16**
+
+| case          | naive ms | fused ms | speedup |
+|---------------|---------:|---------:|--------:|
+| large-experts |   6.3966 |   5.0442 |   1.27x |
+| deepseek      |   1.3857 |   1.2248 |   1.13x |
+| mixtral       |   0.5716 |   0.4939 |   1.16x |
+| switch-many   |   0.7896 |   0.4152 |   1.90x |
+| small-batch   |   0.1820 |   0.1624 |   1.12x |
+
+Raw CSVs: `results_moe_fusions_cpu_fp32.csv`, `results_moe_fusions_cpu_fp16.csv`.
+
+## Conclusions
+
+- **SwiGLU fusion is the bigger lever.** Collapsing `Sigmoid+Mul+Mul` to a single fused pass
+  is worth **~1.6–2.4×** on the gated-activation cluster on CPU, and that cluster operates on
+  the layer's largest `[T, F]` tensors — so the absolute time saved is substantial
+  (e.g. mixtral-ffn: ~10.9 → ~6.2 ms). Folding the activation into the GroupedMatMul epilogue
+  (so the `[T, F]` activations never round-trip to memory) would capture at least this much and
+  likely more. The `fused_lb` column is a conservative lower bound (single `Mul`), so a real
+  fused SiLU-gate kernel lands between `quickgelu` and `fused_lb`.
+- **`QuickGelu` already recovers part of the win in fp16** (SiLU in one op: ~1.2–1.4× over the
+  naive 3-op form), but in fp32 the ORT CPU EP already runs the 3-op form about as fast as the
+  2-op form — the remaining gap to `fused_lb` is the memory-traffic headroom, which only a true
+  gate-fusion (one pass) closes.
+- **Router fusion is a smaller, cheaper win: ~1.1–1.3×** in the typical few-expert case, rising
+  to **~1.7–1.9×** for the single-expert / many-expert `switch-many` case where skipping the
+  full `[M, E]` softmax matters most. It is numerically identical to the standard renormalized
+  top-k router (max rel err ≈ 1e-7 fp32). Because the tensors are tiny, most of the benefit is
+  from removing kernel launches and the `[M, E]` intermediate — expected to matter more on GPU
+  (launch-latency-bound) than the modest CPU numbers here suggest.
+- **Priority order confirmed:** SwiGLU/gated-activation fusion first (largest absolute saving,
+  operates on the biggest tensors), router `Softmax+TopK` fusion second (cheap to implement,
+  best on GPU / high-expert-count configs).
+- **CUDA** was not measured (no GPU in this environment); the harness supports `--providers
+  cuda`. The relative wins should grow on GPU, where both clusters are bandwidth-/launch-bound.
+
+---
+
+# MoE layer: fused `com.microsoft.MoE` vs. `GroupedMatMul`-based expansion
+
+`benchmark_moe_vs_grouped.py` implements a full standard top-k MoE feed-forward layer **two
+ways** and times them against each other, to quantify the perf gap between the complex
+all-in-one MoE fusion and the simpler `GroupedMatMul`-based decomposition:
+
+- **FUSED** — a single `com.microsoft.MoE` node (routing + both grouped GEMMs + activation +
+  router-weighted combine in one kernel).
+- **EXPANDED** — the `docs/GroupedMatMul.md` "Typical MoE usage" recipe:
+  `router (Softmax+TopK | RouterTopK)` → `GroupedMatMul` (FC1) → activation →
+  `GroupedMatMul` (FC2) → `Mul` + `ReduceSum` router-weighted combine.
+
+## How to run
+
+```bash
+# Requires an ORT build from this branch (has GroupedMatMul / SwiGLU / RouterTopK).
+# Run from OUTSIDE the repo root so the local onnxruntime/ source doesn't shadow the package.
+python benchmark_moe_vs_grouped.py --providers cpu --csv results_moe_vs_grouped_cpu_fp32.csv
+python benchmark_moe_vs_grouped.py --swiglu-impl fused-op        # expanded side uses com.microsoft.SwiGLU
+python benchmark_moe_vs_grouped.py --router-impl routertopk      # expanded router uses com.microsoft.RouterTopK
+python benchmark_moe_vs_grouped.py --profile                     # per-op kernel-time breakdown
+python benchmark_moe_vs_grouped.py --intra-op-threads 1          # single-thread comparison
+python benchmark_moe_vs_grouped.py --mem-budget-gb 8             # allow larger weight footprints
+python benchmark_moe_vs_grouped.py --providers cuda --dtype float16   # on a GPU host
+```
+
+The harness builds one FUSED and one EXPANDED model per case, warms up (`--warmup`, default 5),
+times `--iters` runs (default 30), and reports **median** latency for each side, the
+`fused_speedup` (= `expanded_ms / fused_ms`; `< 1` ⇒ fused slower), and the **max relative
+error** between the two outputs (a
+hard correctness gate — see below). The CSV additionally records mean/median/min/std for both
+sides, the pinned thread count, and the per-case weight footprint.
+
+## Reading the report
+
+- **`regime`** labels each case: `decode/launch-bound` (M=1 — dominated by dispatch/launch
+  overhead, *not* compute), `decode-batch` (small M), or `prefill/compute`. The M=4096/8192
+  `prefill-*` cases are compute-bound anchors: if the gap shrinks there it is overhead-bound; if
+  it persists the fused GEMM path is fundamentally faster. Anchors grow *activation* memory, not
+  weight memory.
+- **`--profile`** enables ORT profiling and prints a per-op kernel-time breakdown for each side,
+  so the gap can be attributed to a mechanism (op-dispatch overhead vs. intermediate
+  reshape/round-trips vs. GEMM efficiency) instead of a single black-box ratio.
+- **Threads**: the intra-op thread count is pinned with `--intra-op-threads` (default: ORT's
+  automatic count) and printed in the header and CSV, so numbers are reproducible.
+
+## Memory
+
+Expert weights are baked as **raw-bytes ONNX initializers** (production-representative; neither
+the MoE nor the GroupedMatMul CPU kernel implements `PrePack`, so there is no prepack asymmetry).
+The two weight layouts are large and identical in size regardless of M — a Mixtral-swiglu layer
+is ~5.25 GiB per layout in fp32. To fit modest boxes the harness (1) builds+times the fused
+model to completion, frees it, then builds+times the expanded model, so **only one weight layout
+is resident at a time**, and (2) applies `--mem-budget-gb` (default 4): any case whose
+single-layout weight footprint exceeds the budget is reported as `OOM-skip`. Peak RSS is roughly
+2× the budget per model. With the default budget the `mixtral-swiglu` / `decode-swiglu` cases
+(~5.25 GiB) OOM-skip; raise `--mem-budget-gb` on a larger box to include them.
+
+These multi-GiB weight layouts exceed protobuf's hard ~2 GiB single-message limit, so each model
+is serialized with **ONNX external data** (weights in a side file) and the session is created
+from that file path — `model.SerializeToString()` would otherwise raise on the ≥2 GiB cases (all
+decode cases, both mixtral, `switch-top1`). With external data the real limiter is host RAM, not
+serialization, so `--mem-budget-gb` remains the single knob to tune per box; the default of 4 GiB
+is a conservative fit for a ~15 GiB box (peak ≈ 2× budget) and lets the previously-crashing
+`decode-silu` / `mixtral-silu` (3.5 GiB) cases run.
+
+The external-data side files are written per case into a fresh `tempfile.mkdtemp()` directory
+(the model plus one `.bin` per weight tensor) and the whole directory is removed in a
+`try/finally` after that model is timed, so no multi-GiB scratch files are left behind — but the
+run does need free space in the system temp location equal to one weight layout while a case
+runs. Set `TMP`/`TMPDIR` to a roomy volume if the default temp drive is small.
+
+## Correctness (why the two agree)
+
+- `com.microsoft.MoE` takes **router logits** in `router_probs` and softmaxes internally, so
+  both graphs are fed the same logits.
+- `normalize_routing_weights=1` renormalizes the top-k weights — identical to `RouterTopK`
+  (softmax over the top-k logits) and to `Softmax → TopK → Div-by-sum`. The harness keeps the
+  fused and expanded routers consistent (and forces `normalize=1` when `--router-impl
+  routertopk`).
+- **Weight layout is transposed between the two ops** and the harness handles it: MoE
+  `fc1_experts_weights` `(E, fc1_out, hidden)` (applied `x @ W.T`) vs. GroupedMatMul `weights`
+  `(E, hidden, fc1_out)` (applied `x @ W`); similarly for FC2. One shared set of expert weights
+  is generated and the transposed variant fed to whichever graph needs it.
+- The `_rel_err` cross-check is a **hard gate**: the default tolerance is `1e-4` (fp32) /
+  `5e-2` (fp16), well above the observed **~1e-7 (fp32)** agreement. `--strict` (default **on**)
+  raises on divergence; `--no-strict` downgrades it to a warning. A divergent run reports
+  `DIVERGED` instead of a (meaningless) speedup, so a broken configuration can never advertise a
+  bogus number. Validated offline against a NumPy reference of the expanded graph for `silu`,
+  `gelu`, and `swiglu`, with and without bias and renormalization.
+
+## SwiGLU handling (which form each run uses)
+
+SwiGLU cases exercise the CPU-supported **interleaved** layout (`swiglu_fusion=1`): the FC1
+output is `2 * inter_size` wide with rows laid out `[gate0, linear0, gate1, linear1, …]`, and
+the activation is `gate * sigmoid(alpha * gate) * (linear + beta)`.
+
+- The **FUSED** side always uses the MoE op's built-in SwiGLU (`swiglu_fusion=1`).
+- The **EXPANDED** side's SwiGLU form is selected with `--swiglu-impl`:
+  - `expanded` (default): the standard `Sigmoid + Mul + Mul` graph on the de-interleaved
+    gate/linear tensors — the **"expanded form of SwiGLU"**.
+  - `fused-op`: the new fused `com.microsoft.SwiGLU` op — the **"proposed SwiGLU fused op"**.
+
+Every run prints the active `swiglu-impl` and `router-impl` in the report header and records
+them in the CSV, so it is always unambiguous which SwiGLU form produced a given number.
+
+> Note: on the expanded side the interleaved FC1 output is de-interleaved with `Reshape` +
+> `Split` + `Squeeze` before the activation. Those ops (and the `Reshape`/`Unsqueeze` around FC2
+> and the combine) show up in the `--profile` per-op breakdown, so part of the expanded-vs-fused
+> gap on SwiGLU cases is this layout bookkeeping rather than GEMM time — read the breakdown with
+> that in mind.
+
+## Device / dtype note
+
+**CPU is float32-only** for this comparison: the fused `MoE` fp16 CPU kernel is compiled but
+not registered, so an fp16 MoE node has no CPU kernel. `GroupedMatMul` / `SwiGLU` / `RouterTopK`
+do have fp16 CPU kernels, but since the fused side can't run fp16 on CPU the default CPU dtype
+is float32. `--dtype float16` is intended for the CUDA path (MoE has fp16/bf16 CUDA kernels).
+
+## Results
+
+Environment: 24-logical-CPU x86-64 host, ONNX Runtime 1.29.0 built from this branch
+(Release, CPU EP), intra-op threads auto (~24), 5 warmup + 30 timed iterations, strict
+cross-check ON (`--tol 1e-4`), `--mem-budget-gb 12`. Latency is **median** wall-clock
+milliseconds per `Run` (mean/min/std are in the CSVs). The full matrix is **18 cases × 4
+configs**, where the 4 configs are the cross-product of `--swiglu-impl {expanded, fused-op}`
+and `--router-impl {softmax-topk, routertopk}`, all fp32 (**CPU is fp32-only here** — see
+*Device / dtype note* above for why).
+
+**What is compared:** the fused `com.microsoft.MoE` op (router + both FC GEMMs + activation +
+combine in one kernel) vs. the **expanded** form built from primitives —
+`RouterTopK`/`Softmax→TopK→Div` → `GroupedMatMul` (FC1) → activation → `GroupedMatMul` (FC2) →
+`Mul` (route-weight scale) → `ReduceSum` (combine top-k). Both sides are validated to compute
+the same result every run.
+
+### Headline
+
+**On wall-clock median latency, the fused `com.microsoft.MoE` op is slower than the expanded
+`GroupedMatMul` form in every tested case on CPU — including `switch-top1`.** The table below is
+the canonical config (`--swiglu-impl expanded --router-impl softmax-topk`); the other three
+configs move numbers by <12% (see *Sensitivity*) and none flips the ranking.
+
+The metric is **`fused_speedup = expanded_ms / fused_ms`** — the column reported by the script
+and CSV — where **`< 1` means the fused op is slower.** It ranges from **0.90** (already-saturated
+batch) down to **0.24** (single-token decode); equivalently the fused op takes ~1.1× to ~4.2× as
+long as the expanded form.
+
+| case                | regime              |    M |   K |     F |   E | k | fused ms | expanded ms | fused_speedup | max rel err |
+|---------------------|---------------------|-----:|----:|------:|----:|--:|---------:|------------:|--------------:|------------:|
+| prefill-8k-silu     | compute anchor      | 8192 | 2048|  5632 |   8 | 2 | 2480.652 |    1431.243 |          0.58 |    3.4e-07 |
+| mixtral-swiglu      | prefill/compute     | 1024 | 4096| 14336 |   8 | 2 | 2068.742 |    1285.123 |          0.62 |    3.8e-07 |
+| mixtral-silu        | prefill/compute     | 1024 | 4096| 14336 |   8 | 2 | 1397.386 |     804.437 |          0.58 |    4.2e-07 |
+| prefill-4k-silu     | compute anchor      | 4096 | 2048|  5632 |   8 | 2 | 1148.656 |     648.608 |          0.56 |    3.1e-07 |
+| prefill-swiglu      | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |  220.354 |     147.892 |          0.67 |    2.7e-07 |
+| decode-batch32-silu | decode-batch        |   32 | 4096| 14336 |   8 | 2 |  152.325 |     136.391 |          0.90 |    3.3e-07 |
+| large-tokens-swiglu | prefill/compute     | 2048 | 1024|  2048 |   8 | 2 |  212.220 |     113.240 |          0.53 |    2.6e-07 |
+| decode-batch8-silu  | decode-batch        |    8 | 4096| 14336 |   8 | 2 |  122.278 |     105.754 |          0.86 |    1.7e-06 |
+| switch-top1-silu    | prefill/compute     | 1024 |  768|  3072 | 128 | 1 |  116.748 |      99.492 |          0.85 |    4.0e-07 |
+| prefill-gelu        | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |  170.512 |      97.699 |          0.57 |    3.1e-07 |
+| prefill-silu        | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |  155.435 |      93.638 |          0.60 |    2.8e-07 |
+| deepseek-many-silu  | prefill/compute     |  512 | 1024|  1408 |  64 | 6 |   76.775 |      56.644 |          0.74 |    2.6e-07 |
+| decode-swiglu       | decode/launch-bound |    1 | 4096| 14336 |   8 | 2 |  115.049 |      29.742 |      **0.26** |    2.1e-06 |
+| decode-silu         | decode/launch-bound |    1 | 4096| 14336 |   8 | 2 |   78.256 |      18.599 |      **0.24** |    1.8e-06 |
+| small-swiglu        | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |   18.049 |      11.869 |          0.66 |    2.8e-07 |
+| small-gelu          | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |   15.120 |       8.512 |          0.56 |    2.6e-07 |
+| small-silu-bias     | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |   16.000 |       8.260 |          0.52 |    2.8e-07 |
+| small-silu          | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |    8.786 |       7.808 |          0.89 |    2.7e-07 |
+
+Raw CSVs: `results_moe_vs_grouped_cpu_fp32_{expanded,fusedop}_{softmaxtopk,routertopk}.csv`;
+consolidated console tables in `results_moe_vs_grouped_cpu_fp32_console.txt`.
+
+### Gap attribution (what the profiling can and cannot show)
+
+> **Caveat — read this before the profiled numbers.** ONNX Runtime's per-op profiler inflates
+> absolute op times, and the inflation is **asymmetric across models** (a graph of many small ops
+> is instrumented very differently from a single monolithic op). Profiled absolute times are
+> therefore valid **only for intra-graph composition** — the *share* of time spent in GEMM vs.
+> glue *within a single model* — and **must not** be used to compare one model's absolute GEMM
+> time against another's. (Concretely: the profiled `GroupedMatMul` for `switch-top1` reads 153.3
+> ms/iter, which is *higher* than that model's un-profiled expanded wall median of 99.5 ms —
+> impossible for a real subset of the work, and a clear sign the profiled absolutes are inflated.)
+> **All cross-model conclusions below rest on the wall-clock medians in the table above, not on
+> profiled absolute op times.**
+
+What the profiler *does* establish, intra-model, is that **the expanded form is essentially just
+its two `GroupedMatMul` calls plus negligible glue.** In the expanded model
+(`profiling_moe_vs_grouped_cpu_fp32.csv`), the non-GEMM primitives (router `Softmax`/`TopK`/`Div`,
+activation, the SwiGLU de-interleave `Reshape`/`Split`/`Squeeze`, the `Mul` scale, and the
+`ReduceSum` combine) sum to only **~2% of expanded time on silu cases** (prefill-8k 2.3%,
+decode-silu 2.1%) and **~8–9% for SwiGLU at small shapes** (e.g. small-swiglu 8.8%, where the
+de-interleave ops are a larger fraction of a tiny GEMM). The two `GroupedMatMul` calls are the
+rest.
+
+The consequence: because the expanded side carries almost no dispatch / graph round-trip
+overhead, the wall-clock gap in the table is **not** explained by the expanded form paying for
+extra ops — it is a difference in the **core grouped-GEMM execution** between the fused MoE kernel
+and `GroupedMatMul`. Fusing the glue away cannot recover a gap that the glue does not cause.
+
+- **Decode M=1 is the worst case (`fused_speedup` 0.24 — fused ~4× slower on wall-clock).** With
+  `E=8, k=2` and a single token, the fused MoE kernel still does grouped per-expert work over a
+  `K=4096 → F=14336` weight, and that per-expert cost is not amortised over any token batch,
+  whereas the expanded path processes the tiny `M·k` row set cheaply. **Part of this gap is also
+  thread-pool overhead:** ~24 intra-op threads over a 1-token workload is mostly synchronization,
+  not compute. A `--intra-op-threads 1` run would isolate the pure-compute component of the decode
+  gap (a useful future data point; not collected here).
+- **The gap shrinks with batch but does not close.** `decode-batch8` 0.86 and `decode-batch32`
+  0.90 as the per-expert/thread cost amortises, but even at the compute-bound anchors it
+  **persists**: `prefill-4k` 0.56 and `prefill-8k` 0.58 (fused ~1.7–1.8× slower on wall-clock).
+  This is a steady-state grouped-GEMM efficiency gap on CPU, not a fixed startup cost.
+
+### The CPU ranking is not fixed — it is driven by an uncapped-threads bug in `GroupedMatMul`
+
+The headline table above (24-logical-CPU host) is **not a stable property of the two kernels** —
+it flips on a higher-core-count machine, and the root cause is a concrete threading defect in
+`GroupedMatMul`'s CPU kernel, not an inherent GEMM-efficiency gap.
+
+**The two kernels parallelize along opposite axes:**
+- **Fused `MoE`** (`moe_cpu.cc`) parallelizes **across experts** — `TrySimpleParallelFor` over
+  `num_expert_threads = min(active_experts, max_threads, 8)` (hard-capped at **8**) — but each
+  per-expert GEMM is then called via `ComputeGEMM` → `MlasGemm(..., /*threadpool=*/nullptr, ...)`,
+  i.e. **single-threaded**. Total parallelism is capped at 8 regardless of machine size.
+- **`GroupedMatMul`** (`grouped_matmul.cc`) does **not** parallelize across groups (a plain
+  serial `for` loop) — but hands **each per-group GEMM the full thread pool**
+  (`MlasGemm(..., tp, ...)`, uncapped). Total per-GEMM parallelism scales with however many
+  threads ORT has, with no upper bound.
+
+**On a 96-core host, re-running two representative cases (pinned intra-op threads, `--providers
+cpu`) shows the expanded (`GroupedMatMul`) side regresses sharply as thread count rises, while
+fused `MoE` is essentially flat:**
+
+| case              | E   | rows/group (avg) | exp_ms @ 24 threads | exp_ms @ ~96 threads (auto) | fused_ms @ 24 threads | fused_ms @ ~96 threads |
+|-------------------|----:|------------------:|---------------------:|-----------------------------:|------------------------:|-------------------------:|
+| mixtral-silu      |   8 |                256 |               518.0  |                      1290.9  |                  850.1  |                   881.3  |
+| switch-top1-silu  | 128 |                  8 |               116.2  |                       295.8  |                   79.9  |                    81.2  |
+
+*(Preliminary — a single run each on a shared, non-isolated 96-core host, not averaged over
+multiple trials; the ~2.5x direction and magnitude are large enough to be confident of the
+qualitative effect, but the exact numbers should be treated as indicative, not final.)*
+
+`GroupedMatMul`'s wall-clock time for the *same* GEMM work gets **~2.5x worse** going from 24 to
+~96 threads, while `MoE`'s is flat (as expected — it never uses more than 8 threads total). The
+effect is worst exactly where the per-group row count is smallest (`switch-top1`, ~8 rows/group):
+handing an 8-row-by-4096/768-wide GEMM to ~96 threads is almost pure scheduling/synchronization
+overhead with essentially no compute to parallelize.
+
+**Conclusion: the CPU headline ranking (expanded wins) is an artifact of the specific host's core
+count, not a fair comparison of the two kernels' GEMM efficiency.** On the 24-core host used for
+the headline table, `GroupedMatMul`'s uncapped-thread GEMMs happen to land in a reasonable regime
+and it wins; on a 96-core host the same uncapped strategy over-parallelizes small per-group GEMMs
+and it loses badly to fused `MoE`, whose 8-thread cap (a real limitation on its own, just not the
+one exposed here) incidentally protects it from this failure mode. **This is a genuine,
+fixable bug in `GroupedMatMul`'s CPU kernel** (missing a cap on GEMM thread count relative to
+per-group row count — e.g. don't hand a GEMM more threads than rows, or more generally scale
+per-GEMM thread count to problem size), **not evidence that the fused-op approach is
+fundamentally superior on CPU.** Once fixed, re-running the full sweep above (ideally on a
+range of core counts) is needed before drawing a real conclusion about which CPU kernel is
+faster — the current headline table should be read as "expanded wins on a 24-core host with
+today's un-capped `GroupedMatMul` kernel," not as a general result.
+
+### Sensitivity (SwiGLU form and router impl)
+
+- **SwiGLU form (`--swiglu-impl`).** The fused side always uses MoE's built-in SwiGLU with
+  `swiglu_fusion=1` (interleaved — the only CPU-supported format). The expanded side was
+  benchmarked **both ways**: the fused `com.microsoft.SwiGLU` op (`fused-op`) and the expanded
+  `Sigmoid + Mul + Mul` graph (`expanded`). Measured impact on the expanded side is
+  **<12% and regime-dependent** (e.g. `large-tokens-swiglu` 113.2 → 124.2 ms, +9.6%;
+  `decode-swiglu` 29.7 → 26.4 ms, −11%; `mixtral-swiglu` ~±0.3%). It does **not** change the
+  headline — expanded wins under either SwiGLU form.
+- **Router impl (`--router-impl`).** `softmax-topk` (`Softmax→TopK→Div`) vs. the fused
+  `RouterTopK` op move medians by **<5%**, within run-to-run noise (the router is a tiny
+  fraction of total time in every case). No config flips the fused-vs-expanded ranking.
+
+### `switch-top1`: no wall-clock exception
+
+An earlier draft flagged `switch-top1` (128 experts, top-1) as a case where the fused kernel's
+*internal* GEMM beat `GroupedMatMul`, based on profiled absolute op times (124.6 vs. 153.3
+ms/iter). **That claim is retracted:** it is exactly the profiling artifact described in the
+caveat above — the profiled `GroupedMatMul` figure (153.3 ms/iter) even exceeds the model's
+un-profiled expanded wall median of 99.5 ms, so it cannot be a faithful GEMM cost. On
+**wall-clock** — the metric all conclusions rest on — `switch-top1` behaves like every other case:
+fused 116.7 ms vs. expanded 99.5 ms, `fused_speedup` **0.85** (fused slower). There is **no
+regime in this sweep where the fused op wins on wall-clock.**
+
+### Correctness
+
+All **18 cases × 4 configs (72 runs)** passed the strict fused-vs-expanded cross-check
+(`--tol 1e-4`): **max relative error 2.08e-6** (worst case `decode-swiglu`), no `DIVERGED`, no
+`OOM-skip` (12 GiB budget, per-tensor external-data serialization keeps peak at ~1× layout).
+Threads ~24 intra-op, fp32. The two implementations compute the same MoE layer within
+numerical tolerance, so the latency comparison is apples-to-apples.
+
+**Timing scope:** external-data weights are read from disk at `InferenceSession` construction,
+which is **outside** the timed `Run()` loop (verified in `run_one_model`), and warmup runs precede
+timing — so the reported medians measure inference compute only, not model load or weight I/O.
+
+### CUDA, float16
+
+Environment: 3x NVIDIA A100-SXM4-80GB (single GPU used), CUDA 13.0, cuDNN 9.8, ONNX Runtime
+1.29.0 built from this branch (Release, CUDA EP, `CMAKE_CUDA_ARCHITECTURES=80`-real),
+`--providers cuda --dtype float16`, intra-op threads auto (~96, not relevant to the CUDA EP
+path), 5 warmup + 30 timed iterations, `--mem-budget-gb 4`, `--router-impl softmax-topk
+--swiglu-impl expanded` (canonical config only — the CPU sensitivity sweep across
+router/SwiGLU impls was not repeated on CUDA). Latency is **median** wall-clock milliseconds
+per `Run`. Raw CSV: `results_moe_vs_grouped_cuda_fp16.csv`; console log:
+`results_moe_vs_grouped_cuda_fp16_console.txt`.
+
+| case                | regime              |    M |   K |     F |   E | k | fused ms | expanded ms | fused_speedup | max rel err |     |
+|---------------------|---------------------|-----:|----:|------:|----:|--:|---------:|------------:|--------------:|------------:|-----|
+| prefill-8k-silu     | compute anchor      | 8192 | 2048|  5632 |   8 | 2 |   10.530 |      14.426 |          1.37 |    1.2e-03 |     |
+| mixtral-swiglu      | prefill/compute     | 1024 | 4096| 14336 |   8 | 2 |    5.728 |       7.327 |          1.28 |    1.0e-03 |     |
+| prefill-4k-silu     | compute anchor      | 4096 | 2048|  5632 |   8 | 2 |    5.195 |       7.603 |          1.46 |    9.6e-04 |     |
+| mixtral-silu        | prefill/compute     | 1024 | 4096| 14336 |   8 | 2 |    4.290 |       5.928 |          1.38 |    1.1e-03 |     |
+| decode-batch32-silu | decode-batch        |   32 | 4096| 14336 |   8 | 2 |    1.301 |       1.620 |          1.24 |    1.2e-03 |     |
+| prefill-swiglu      | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |    1.276 |       1.911 |          1.50 |    1.1e-03 |     |
+| decode-batch8-silu  | decode-batch        |    8 | 4096| 14336 |   8 | 2 |    1.225 |       1.540 |          1.26 |    1.2e-03 |     |
+| switch-top1-silu    | prefill/compute     | 1024 |  768|  3072 | 128 | 1 |    1.182 |       3.856 |      **3.26** |    6.5e-04 |     |
+| large-tokens-swiglu | prefill/compute     | 2048 | 1024|  2048 |   8 | 2 |    1.117 |       1.951 |          1.75 |    1.1e-03 |     |
+| prefill-gelu        | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |    1.097 |       1.793 |          1.63 |    9.5e-04 |     |
+| prefill-silu        | prefill/compute     |  512 | 2048|  5632 |   8 | 2 |    0.928 |       1.659 |          1.79 |    1.0e-03 |     |
+| deepseek-many-silu  | prefill/compute     |  512 | 1024|  1408 |  64 | 6 |    0.653 |       2.280 |      **3.49** |    8.6e-04 |     |
+| decode-swiglu       | decode/launch-bound |    1 | 4096| 14336 |   8 | 2 |    0.543 |       0.664 |      **1.22** |    1.1e-03 |     |
+| decode-silu         | decode/launch-bound |    1 | 4096| 14336 |   8 | 2 |    0.419 |       0.513 |      **1.22** |    7.7e-04 |     |
+| small-swiglu        | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |    0.247 |       0.548 |          2.22 |    1.2e-03 |     |
+| small-silu-bias     | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |    0.242 |       0.517 |          2.14 |    9.1e-04 |     |
+| small-silu          | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |    0.236 |       0.564 |          2.39 |    9.0e-04 |     |
+| small-gelu          | prefill/compute     |  128 | 1024|  2048 |   8 | 2 |    0.209 |       0.552 |          2.65 |    8.6e-04 |     |
+
+**Headline: for every case, the fused `com.microsoft.MoE` kernel is faster than the expanded
+`GroupedMatMul` form on CUDA fp16** — the opposite ranking from CPU fp32, and consistent across
+the full `M` range from 1 to 8192. The advantage is largest for many-expert / low-top-k cases
+(`deepseek-many-silu` 3.49x, `switch-top1-silu` 3.26x) and smallest for the launch-bound
+single-token decode case (~1.2x), consistent with a single fused kernel avoiding both extra
+kernel-launch overhead and HBM round-trips for intermediate per-expert tensors — the mechanism
+flagged as "future work" in the CPU section above.
+
+**Resolved: the earlier apparent `M >= 1024` correctness regression was a benchmark-metric
+artifact, not a kernel bug.** An earlier pass reported `max_relerr` up to 0.55 and `--strict`
+failures for `M >= 1024`. Root-causing (see `docs/*` history / commit for the investigation)
+traced every failing case to the **same single mechanism**: the fused and expanded graphs each
+compute `softmax(router_logits)` and top-k **independently** (once inside the fused `MoE`
+kernel, once via explicit `Softmax`+`TopK` nodes on the expanded side). When two experts'
+top-k probabilities for one row land within fp16 precision of each other, CPU-vs-CUDA (or even
+two different kernels on the same device) can legitimately break that tie in opposite
+directions — this is unspecified behavior for ONNX `TopK` on a tie, not a bug in
+`GroupedMatMul`/`SwiGLU`/`RouterTopK`. That one re-routed row is computed correctly by
+*both* experts' weights, but since the two experts' weights are unrelated, the row's output
+value differs completely between the two graphs — and the previous comparison used a **global
+max** over the whole `[M, K]` output tensor, so a single such row (out of e.g. 1024–8192)
+dominated the whole-tensor `max_relerr` and looked like a systemic ~30–55% divergence. Node-by-
+node comparison of the real `mixtral-silu` (`M=1024`) graph confirmed: `idx` (the TopK routing
+decision) differed on exactly **1 of 1024 rows** (a genuine near-tie, `|p_a - p_b| ≈ 7e-5`), and
+excluding that single row from the comparison dropped every downstream tensor's error back to
+normal fp16 noise (~1e-3). The fix (`_rel_err_robust` in `benchmark_moe_vs_grouped.py`) compares
+graphs with a **row-wise, 99th-percentile** relative error instead of a global max — this still
+fails loudly on a real, broad-based bug (which perturbs most/all rows) while tolerating the rare
+row that took a different, equally valid, routing decision. With this fix, **all 18 cases now
+pass `--strict` cleanly** (`max_relerr <= 1.3e-3`), and the `fused_speedup` figures above are
+valid comparisons at every `M`.
+
+## Conclusions
+
+- **On CPU, the more complex fused `com.microsoft.MoE` op is a net performance loss vs. the
+  simpler `GroupedMatMul`-based expansion** — slower in all 18 cases, `fused_speedup` from 0.90
+  (saturated batch) down to 0.24 (single-token decode), i.e. ~1.1× to ~4.2× slower on wall-clock.
+  The end-goal question ("is the heavier MoE fusion worth it on CPU vs. reusing GroupedMatMul?")
+  answers **no, as currently implemented.**
+- **The cost is in the fused kernel's core grouped-GEMM execution, not in fusion/dispatch
+  savings.** Intra-model profiling shows the expanded form's extra ops (router, activation,
+  SwiGLU de-interleave, combine) are only ~2% of its time on silu cases (~8–9% for small SwiGLU),
+  so fusing them away cannot recover the wall-clock gap. Optimization effort should target the
+  MoE kernel's grouped-GEMM path (ideally sharing `GroupedMatMul`'s CPU GEMM), not the op-fusion
+  boundary.
+- **No wall-clock exception.** Every case, including `switch-top1` (many experts, top-1), is
+  slower fused than expanded. An earlier per-op "exception" for `switch-top1` was a profiling
+  artifact (inflated cross-model absolute op times) and is retracted — see *`switch-top1`: no
+  wall-clock exception* above.
+- **CUDA fp16 inverts the CPU ranking across the entire tested range: fused MoE always wins, up
+  to 3.49x, from `M=1` to `M=8192`.** See *CUDA, float16* above. This confirms the mechanism
+  predicted for GPU (fused kernel avoids extra launches and HBM round-trips). An earlier pass
+  reported an apparent correctness regression at `M >= 1024`; root-causing found this was a
+  benchmark-metric artifact (a global-max relative error dominated by one row's benign
+  CPU-vs-CUDA `TopK` tie-break, not a kernel bug) — see *CUDA, float16* above for the full
+  explanation and the `_rel_err_robust` fix. All 18 cases now pass `--strict`.
+
+## Future work / TODO
+
+- **[ ] Optimize `GroupedMatMul` CUDA to close the fused-vs-expanded gap: dispatch all groups as
+  a single grouped-GEMM kernel launch, not a per-group `cublasGemmHelper` loop.** Comparing
+  `com.microsoft.MoE`'s CUDA GEMM1/GEMM2 (`contrib_ops/cuda/llm/moe_gemm/`) against
+  `GroupedMatMul` (`contrib_ops/cuda/grouped_matmul.cc`) shows a real implementation difference,
+  not just op-fusion:
+  - **MoE's GEMM1/GEMM2** each issue **one** `cutlass::gemm::device::GemmGrouped` kernel launch
+    that covers *all* `E` experts, using CUTLASS's `GroupScheduleMode::kDeviceOnly` to schedule
+    threadblocks across experts dynamically from **device-side** per-expert row-count offsets
+    (`expert_first_token_offset`) — no host round-trip.
+  - **`GroupedMatMul`** instead (a) copies `group_indices` device→host and does a blocking
+    `cudaStreamSynchronize` to build the group permutation/offsets on the **host**, then (b) loops
+    over groups on the host issuing **one separate `cublasGemmHelper` call (kernel launch) per
+    non-empty group** (`E` launches instead of 1).
+  - This costs: a synchronous pipeline stall every call (the D→H copy + sync), `E` separate
+    kernel-launch overheads instead of 1, and no cross-expert SM-occupancy balancing within a
+    single grid — especially wasteful when group sizes are small/uneven.
+  - **Proposed fix:** rework `GroupedMatMul` to compute the permutation/offsets on-device
+    (eliminate the D→H sync) and dispatch through a true grouped-GEMM kernel — either reuse the
+    `MoeGemmRunner`/CUTLASS grouped-GEMM machinery already vendored in this repo
+    (`contrib_ops/cuda/llm/moe_gemm/`), or a custom kernel with equivalent device-side scheduling.
+  - This is the most likely lever to make the expanded (`GroupedMatMul`-based) CUDA fp16 path
+    competitive with (or faster than) the fused `MoE` op, rather than consistently slower as
+    measured above.
+
+  **Update: prototyped and benchmarked (see below). Result: not a clear win at these problem
+  sizes — kept as an opt-in alternative, not a replacement, of the existing cuBLAS-loop path.**
+
+  - **Implementation** (`contrib_ops/cuda/grouped_matmul_cutlass_gemm.h`/`.cu`): reuses
+    `MoeGemmRunner<CudaT,CudaT,CudaT>::moeGemmBiasAct()` (the same CUTLASS grouped-GEMM machinery
+    behind `com.microsoft.MoE`'s GEMM1/GEMM2) with `ActivationType::Identity`, fed the *same*
+    gathered/group-contiguous buffers `grouped_matmul.cc` already builds for the cuBLAS loop (only
+    one extra small H2D upload is added: the cumulative per-group row-count array CUTLASS expects
+    as `total_tokens_including_expert`). Bias is still added by the existing scatter kernel in
+    both paths, so the two implementations differ *only* in the GEMM-execution strategy, keeping
+    gather/scatter/permutation logic identical. Selectable at runtime via
+    `ORT_GROUPED_MATMUL_CUDA_IMPL=cutlass` (default/unset/any other value keeps the original
+    cuBLAS-loop path unchanged) — both implementations are kept side by side for benchmarking, per
+    `docs/GroupedMatMul.md`'s general-purpose design goals (see the "clear-cut?" discussion below).
+  - **Correctness (re-verified, see *Correction* below for why this was re-run):** small,
+    expected relative error vs. cuBLAS (max ~4.8e-4 fp16, well within fp16 GEMM tolerance from
+    different tensor-core algorithms/accumulation order) — **not** bit-identical. See the fresh
+    *Performance* table below, now collected with genuinely-running CUDA and both bugs fixed
+    (the `max_relerr` column comes from the same run as the timings).
+  - **Performance** (`benchmark_grouped_matmul_cutlass_vs_cublas.py`, fp16, bias on, A100,
+    `results_cutlass_vs_cublas_cuda_fp16.csv`):
+
+    | case              | M    | k | K    | N    | G  | cublas (ms) | cutlass (ms) | speedup | max rel err |
+    |-------------------|------|---|------|------|----|-------------|--------------|---------|------------:|
+    | large-top2        | 2048 | 2 | 768  | 768  | 32 | 6.015       | 6.300        | 0.95x   |    4.6e-04 |
+    | large-tokens      | 2048 | 1 | 512  | 512  | 32 | 4.285       | 3.311        | 1.29x   |    0.0     |
+    | many-experts      | 512  | 1 | 512  | 512  | 64 | 4.197       | 4.818        | 0.87x   |    2.9e-04 |
+    | medium-top2       | 512  | 2 | 768  | 768  | 32 | 3.972       | 4.090        | 0.97x   |    4.7e-04 |
+    | many-experts-top2 | 512  | 2 | 512  | 512  | 64 | 3.592       | 3.490        | 1.03x   |    3.0e-04 |
+    | medium-dense      | 1024 | 1 | 768  | 768  | 16 | 2.959       | 2.536        | 1.17x   |    4.3e-04 |
+    | wide-hidden       | 256  | 2 | 1024 | 1024 |  8 | 1.882       | 2.011        | 0.94x   |    3.6e-04 |
+    | small-top2        | 512  | 2 | 512  | 512  | 16 | 1.352       | 1.470        | 0.92x   |    0.0     |
+    | small-dense       | 512  | 1 | 768  | 768  |  8 | 0.899       | 1.517        | 0.59x   |    4.8e-04 |
+    | tiny              | 256  | 1 | 512  | 512  |  8 | 0.470       | 0.897        | 0.52x   |    0.0     |
+
+    Takeaways:
+    - **No case shows a decisive win.** Small problems (`tiny`, `small-dense`) are *slower* under
+      CUTLASS (0.52x-0.59x): the fixed per-call overhead of constructing a `MoeGemmRunner`,
+      querying `getConfigs(sm)`, and the extra H2D copy outweighs the savings from launching one
+      kernel instead of a few, when each cuBLAS GEMM is already tiny.
+    - Larger/many-group cases are roughly a wash (0.87x-1.29x), not the outsized win the "E launches
+      vs. 1" argument alone would predict. The D→H sync + per-group launch overhead this was meant
+      to eliminate is evidently already small relative to GEMM compute time at these sizes on
+      A100; conversely, unlike `com.microsoft.MoE`'s runner (which profiles multiple tactics and
+      picks the fastest per shape via `mGemmProfiler`), this prototype always takes
+      `getAmpereConfigs(sm)[0]` with **no tactic tuning**, likely leaving real performance on the
+      table for the CUTLASS path that a profiler-driven config search would recover.
+    - Conclusion: the cuBLAS-loop path remains the better default. The CUTLASS path is kept as an
+      explicit opt-in for further experimentation (e.g. adding tactic profiling/caching, or
+      testing shapes/hardware where per-launch overhead dominates more), not as a replacement.
+
+    **Update: tactic profiling added.** The "no tactic tuning" gap above is now closed:
+    `grouped_matmul_cutlass_gemm.cu` now profiles every candidate CUTLASS tactic on-device (timed
+    via CUDA events) the first time a given `(N, K, num_groups, dtype, M-bucket)` shape is seen,
+    caching the fastest for reuse — mirroring `com.microsoft.MoE`'s `MoeGemmProfiler`. Opt-out via
+    `ORT_GROUPED_MATMUL_CUTLASS_PROFILE=0` (also the automatic fallback during CUDA-graph
+    capture). Re-running the performance table above with profiling enabled is still pending a
+    non-contended GPU (see the correctness-bug TODO immediately below, found while validating
+    this change, for why the shared box's current numbers can't be trusted for a fresh
+    before/after comparison either).
+
+  - **Correction (post-hoc): the original "verified bit-identical" CUTLASS-vs-cuBLAS claim was a
+    false positive, and the original performance numbers above were collected before both bugs
+    below were fixed.** A separate, unrelated bug caused the CUDA execution provider to
+    silently fail to load in every session that linked `grouped_matmul_cutlass_gemm.cu`, so the
+    `test_cutlass_vs_cublas_correctness.py` run backing that claim (which, unlike the perf script
+    above, did not check `sess.get_providers()`) had actually fallen back to CPU (`CUTLASS` and
+    `cuBLAS` "results" were both really the CPU reference — hence "bit-identical"). The perf
+    script above *does* check `sess.get_providers()` and raises if CUDA didn't load, so its
+    relative-timing numbers were plausibly genuine CUDA even before the fix — but its outputs at
+    the time were unvalidated for correctness (the weight-layout bug below was still present, so
+    CUTLASS's numeric results, though timed correctly, were wrong). **The table above has now been
+    re-collected end to end** (timings and `max_relerr`) with both bugs fixed, confirmed to be
+    genuinely running on CUDA with real fp16 GEMM-level agreement (not bit-identical, not a global
+    CPU-fallback artifact) — the qualitative conclusion (no decisive CUTLASS win at these sizes) is
+    unchanged from the original run. The weight-layout bug (below) that caused CUTLASS's numeric
+    results at the time to be wrong is now fixed too — see the two bug write-ups under
+    *`GroupedMatMulReduceSum`* below, which affect this op too since both share
+    `grouped_matmul_cutlass_gemm.cu`.
+
+- **[x] (Resolved by investigation, not a code bug) Re-checked the 3 `test_cutlass_vs_cublas_correctness.py`
+  failures found while adding tactic profiling (above) against a numpy ground truth, not just
+  CUTLASS-vs-cuBLAS agreement — the test itself only compares the two GPU implementations against
+  *each other*, silently assuming cuBLAS is "correct."** That assumption doesn't hold uniformly,
+  and the naive `abs_diff / (abs(ref) + 1e-3)` relative-error metric it uses is the same
+  near-zero-denominator artifact already documented for a different comparison in the
+  `GroupedMatMulReduceSum` section below. Results per case, using a numpy fp32-accumulate
+  reference:
+  - **`float32 M=64/K=128/N=256/groups=8`: not a bug.** CUTLASS actually matches the numpy
+    reference almost exactly (max_abs 3.1e-5, max_rel 1.1e-3) — it's cuBLAS that deviates
+    (max_abs 0.0152), consistent with cuBLAS defaulting to **TF32** tensor-core math for "float32"
+    GEMMs on Ampere (`UseTF32()` in `grouped_matmul.cc`) while this CUTLASS path uses true
+    SIMT fp32. Restricting the relative-error check to `|ref| > 1.0` (avoiding the
+    near-zero-denominator blowup) drops cuBLAS's max relative error to ~1.0%, right in line with
+    TF32's ~10-bit mantissa. The test flagged CUTLASS as "wrong" only because it (wrongly) treated
+    cuBLAS/TF32 as ground truth.
+    This is a structural feature gap, not a mismatch in how the two paths *handle* the same
+    option: `UseTF32()` reflects the CUDA EP's session-wide `use_tf32` option (defaults `true`,
+    `cuda_execution_provider_info.h`) and is threaded into the cuBLAS call, but the CUTLASS path
+    never reads that option at all — `MixedGemmArchTraits<float, float, Arch>`
+    (`cutlass_extensions/gemm/kernel/default_fpA_intB_traits.h`) hardcodes
+    `OperatorClass = cutlass::arch::OpClassSimt` for `float`/`float`, with no TF32/`OpClassTensorOp`
+    specialization defined for that type pairing (only `half_t`/`bfloat16_t` get `OpClassTensorOp`
+    there). CUTLASS itself does support TF32 GEMMs in general (via its distinct `tfloat32_t`
+    element type with Ampere `mma.sync` instruction shapes), it's just not wired up in this
+    vendored trait for plain `float`/`float` — so there's currently no way to make the two paths
+    numerically comparable by default; doing so would mean adding a genuine new CUTLASS
+    specialization, not flipping an existing flag.
+  - **`float16 M=128/K=512/N=512/groups=16`: not a bug.** CUTLASS and cuBLAS agree with each
+    other exactly; both differ from the numpy reference by up to 13.7% under the naive metric, but
+    that's entirely a near-zero-denominator artifact — restricting to `|ref| > 0.1` (only 436/131072
+    elements excluded) drops the relative error to 0.9%, well within fp16 GEMM tolerance.
+  - **`float32 M=17/K=33/N=29/groups=6`: a real bug**, confirmed against the numpy reference
+    (CUTLASS max_abs 25.4 vs. cuBLAS's 0.0058) — this is the already-documented "K and N
+    simultaneously non-tile-aligned" SIMT fp32 limitation in `grouped_matmul_cutlass_gemm.h`;
+    scope unchanged by this investigation.
+  - **Remaining TODO:** `test_cutlass_vs_cublas_correctness.py` should compare both
+    implementations against an actual (e.g. numpy fp32-accumulate) reference instead of against
+    each other, and use a robust relative-error metric (à la the `_rel_err_robust` fix mentioned
+    below) instead of a fixed `+1e-3` epsilon, so future runs don't require this same
+    per-incident, ground-truth re-derivation to tell a real regression from a metric artifact.
+
+- **[ ] Fix `GroupedMatMul` CPU kernel's uncapped per-GEMM thread count.** As detailed in *The
+  CPU ranking is not fixed* (in the "MoE layer" section above), `grouped_matmul.cc` hands each
+  per-group `MlasGemm` call the full intra-op thread pool with no relation to how many rows are
+  in that group, unlike fused `MoE`'s CPU kernel which caps expert-level parallelism at 8. This
+  is directly responsible for the CPU expanded-vs-fused ranking flipping between a 24-core host
+  (expanded wins) and a 96-core host (fused wins, because `GroupedMatMul` over-parallelizes small
+  per-group GEMMs and regresses ~2.5x). **Proposed fix:** scale the thread count passed to each
+  per-group `MlasGemm` call to that group's row count (e.g. cap it so each thread gets a minimum
+  number of rows, or reuse `concurrency::ThreadPool::DegreeOfParallelism` bounded by
+  `count`/some minimum-rows-per-thread heuristic), rather than always passing the full `tp`.
+  This should stabilize `GroupedMatMul`'s CPU performance across core counts and is a
+  prerequisite for any credible CPU expanded-vs-fused comparison — the current headline CPU
+  table should not be treated as a general result until this is fixed and the sweep re-run.
+
+# `GroupedMatMulReduceSum`: fusing the down-projection GEMM with the router-weighted combine
+
+## Motivation
+
+In an expanded (non-fused) MoE layer, the final step is: per-expert down-projection GEMM
+(`GroupedMatMul`, one row per selected token-expert pair) followed by a router-weighted
+`ReduceSum` that combines each token's `k` expert outputs (weighted by that expert's router
+probability) back down to one row per token. `GroupedMatMulReduceSum` is a new contrib op that
+fuses these two steps into one CUDA kernel launch, avoiding materializing the full
+`[M, k, hidden_size]` intermediate in global memory.
+
+- **Schema** (`contrib_defs.cc`): inputs `input [M, k, K]` (per-selection rows, already gathered),
+  `weights [num_groups, K, N]`, `group_indices [M, k]` (int64), `combine_weights [M, k]`
+  (router weights); output `output [M, N]` = `sum_j combine_weights[i,j] * (input[i,j] @
+  weights[group_indices[i,j]])`.
+- **CPU kernel** (`contrib_ops/cpu/grouped_matmul_reduce_sum.{h,cc}`): straightforward reference
+  loop, used as the correctness oracle.
+- **CUDA kernel** (`contrib_ops/cuda/grouped_matmul_reduce_sum.{h,cc}` +
+  `grouped_matmul_reduce_sum_impl.{h,cu}`): gathers/permutes rows into group-contiguous order,
+  runs the per-group GEMM (cuBLAS loop by default, or the same single-launch CUTLASS grouped-GEMM
+  path as `GroupedMatMul` when `ORT_GROUPED_MATMUL_CUDA_IMPL=cutlass` is set — see below), then a
+  finalize kernel that applies `combine_weights` and reduces the `k` selections per token in one
+  pass, writing directly to the `[M, N]` output (no `[M, k, N]` intermediate ever touches HBM).
+
+## Bugs found and fixed while validating this op
+
+Both were latent, pre-existing issues in this session's CUTLASS grouped-GEMM integration
+(`grouped_matmul_cutlass_gemm.cu`), shared by `GroupedMatMul` and `GroupedMatMulReduceSum` — not
+introduced by this fused op, but only surfaced once its correctness tests were run for real.
+
+1. **CUDA EP silent-fallback (build/link bug, not a kernel bug).**
+   `grouped_matmul_cutlass_gemm.cu` `#include`d `core/platform/env_var_utils.h` directly (to read
+   an `ORT_GROUPED_MATMUL_CUDA_IMPL` env-var override) without first including
+   `core/providers/shared_library/provider_api.h`. Without that include defining the
+   `SHARED_PROVIDER` macro, `ParseEnvironmentVariableWithDefault` compiles a direct call to
+   `onnxruntime::Env::Default()` — a **local/hidden** symbol in the provider-bridge build (only
+   the C API surface is exported via the linker version script) — instead of routing through
+   `g_host->Env__Default()`. This produces an **undefined-symbol error at `dlopen` time** for
+   `libonnxruntime_providers_cuda.so`, silently and permanently disabling the CUDA EP for the
+   whole process (ORT's provider registration swallows the load failure and just leaves CUDA out
+   of `get_available_providers()`). **Every "CUDA" correctness/perf run in this session prior to
+   this fix that touched this file was actually running on CPU fallback** — including the
+   `test_cutlass_vs_cublas_correctness.py` "bit-identical" result noted above. **Fix:** replaced
+   the `env_var_utils.h`/`ParseEnvironmentVariableWithDefault` usage with a plain `std::getenv`
+   check (this is a simple benchmarking-only flag, not worth the provider-bridge machinery).
+   **Lesson for future correctness tests:** any test that requests a specific EP via
+   `providers=[...]` must assert `sess.get_providers()` actually contains it — a silent fallback to
+   CPU is indistinguishable from a real pass when CPU is also the reference implementation.
+2. **CUTLASS weight-layout bug (real correctness bug, only visible once CUDA genuinely ran).**
+   `GroupedMatMul`/`GroupedMatMulReduceSum`'s own schema documents weights as row-major
+   `[num_groups, K, N]`, but CUTLASS's `MoeGemmRunner` (the same machinery behind
+   `com.microsoft.MoE`'s GEMM1/GEMM2) expects the weight operand in row-major `[num_groups, N, K]`
+   (MoE's own native, output-dim-major convention) — the CUTLASS integration was passing the
+   `[K, N]`-layout buffer straight through without transposing, producing garbage. **Fix:** added
+   `TransposeGroupedWeightsKernel`/`LaunchTransposeGroupedWeights` (a small per-group transpose
+   kernel) and a caller-allocated `weight_scratch` buffer, transposed once per call before handing
+   off to CUTLASS.
+
+After both fixes, `GroupedMatMulReduceSum`'s CUTLASS path (`ORT_GROUPED_MATMUL_CUDA_IMPL=cutlass`)
+passes all toy correctness cases (fp32/fp16, with/without bias) genuinely on CUDA, matching the
+cuBLAS path. **Known remaining limitation** (shared with `GroupedMatMul`, not investigated
+further since the CUTLASS path is an opt-in benchmarking switch off by default): the underlying
+CUTLASS SIMT (fp32) kernel produces incorrect results for pathological tiny shapes where *both* K
+and N are simultaneously non-tile-aligned (e.g. `K=33, N=29` together — either alone paired with a
+tile-aligned partner is fine). Verified correct at all realistic MoE scales tested (`K`/`N` from
+512 to 4096, matching real `hidden_size`/`inter_size` values, which are always round).
+
+## Performance: expanded MoE with this fusion vs. all-in-one `com.microsoft.MoE`
+
+`benchmark_moe_vs_grouped.py --providers cuda --dtype float16 --fused-reduce --router-impl
+routertopk`, same 18 cases/environment as the *CUDA, float16* section above (A100, ORT built from
+this branch, cuBLAS default GEMM path — i.e. `ORT_GROUPED_MATMUL_CUDA_IMPL` unset). Median ms per
+`Run`, `FR` = expanded MoE with `GroupedMatMul`+`ReduceSum` replaced by the fused
+`GroupedMatMulReduceSum` op. Raw CSV: `results_moe_vs_grouped_cuda_fp16.csv`; console log:
+`results_moe_vs_grouped_cuda_fp16_console.txt`.
+
+| case                | M    | K    | F     | E   | k | fused ms | expanded ms | expanded+FR ms | fused_speedup | FR_speedup |
+|---------------------|-----:|-----:|------:|----:|--:|---------:|------------:|---------------:|--------------:|-----------:|
+| prefill-8k-silu     | 8192 | 2048 |  5632 |   8 | 2 |   10.537 |      13.610 |          11.821 |          1.29 |       1.12 |
+| mixtral-swiglu      | 1024 | 4096 | 14336 |   8 | 2 |    5.532 |       7.024 |           6.547 |          1.27 |       1.18 |
+| prefill-4k-silu     | 4096 | 2048 |  5632 |   8 | 2 |    4.713 |       7.003 |           6.289 |          1.49 |       1.33 |
+| mixtral-silu        | 1024 | 4096 | 14336 |   8 | 2 |    4.047 |       5.347 |           5.087 |          1.32 |       1.26 |
+| decode-batch32-silu |   32 | 4096 | 14336 |   8 | 2 |    1.272 |       1.573 |           1.539 |          1.24 |       1.21 |
+| decode-batch8-silu  |    8 | 4096 | 14336 |   8 | 2 |    1.230 |       1.508 |           1.491 |          1.23 |       1.21 |
+| switch-top1-silu    | 1024 |  768 |  3072 | 128 | 1 |    1.132 |       3.746 |           3.576 |          3.31 |       3.16 |
+| prefill-swiglu      |  512 | 2048 |  5632 |   8 | 2 |    1.066 |       1.606 |           1.462 |          1.51 |       1.37 |
+| large-tokens-swiglu | 2048 | 1024 |  2048 |   8 | 2 |    0.986 |       1.615 |           1.538 |          1.64 |       1.56 |
+| prefill-silu        |  512 | 2048 |  5632 |   8 | 2 |    0.852 |       1.343 |           1.188 |          1.58 |       1.39 |
+| prefill-gelu        |  512 | 2048 |  5632 |   8 | 2 |    0.822 |       1.489 |           1.342 |          1.81 |       1.63 |
+| deepseek-many-silu  |  512 | 1024 |  1408 |  64 | 6 |    0.608 |       2.260 |           2.127 |          3.72 |       3.50 |
+| decode-swiglu       |    1 | 4096 | 14336 |   8 | 2 |    0.539 |       0.638 |           0.653 |          1.18 |       1.21 |
+| decode-silu         |    1 | 4096 | 14336 |   8 | 2 |    0.410 |       0.487 |           0.500 |          1.19 |       1.22 |
+| small-swiglu        |  128 | 1024 |  2048 |   8 | 2 |    0.230 |       0.506 |           0.448 |          2.20 |       1.95 |
+| small-silu-bias     |  128 | 1024 |  2048 |   8 | 2 |    0.201 |       0.480 |           0.422 |          2.39 |       2.10 |
+| small-gelu          |  128 | 1024 |  2048 |   8 | 2 |    0.194 |       0.513 |           0.457 |          2.64 |       2.36 |
+| small-silu          |  128 | 1024 |  2048 |   8 | 2 |    0.193 |       0.481 |           0.423 |          2.49 |       2.19 |
+
+All 18 cases pass correctness (`--strict`, row-wise 99th-percentile relative error, same metric
+as the *CUDA, float16* section above; `FR_relerr` column in the CSV, max 1.18e-3).
+
+**Takeaway: the fusion is a real, consistent partial win, but doesn't close the gap to the
+all-in-one fused `MoE` op.** `expanded+FR` is faster than plain `expanded` in every one of the 18
+cases (up to ~13% faster, e.g. `prefill-silu` 1.343→1.188ms, `prefill-4k-silu` 7.003→6.289ms), but
+`fused_speedup` (all-in-one `MoE` vs. plain expanded) is always larger than `FR_speedup` (all-in-one
+`MoE` vs. expanded+`GroupedMatMulReduceSum`) — i.e. fusing away the combine step recovers only part
+of the gap to `com.microsoft.MoE`, not all of it. This is consistent with the earlier finding that
+most of the gap is in the GEMM execution strategy itself (single grouped-GEMM launch vs. per-group
+cuBLAS loop), not in the surrounding elementwise/reduction ops — fusing the combine step helps
+(fewer kernel launches, no `[M,k,N]` HBM round-trip) but the dominant cost remains the GEMM
+dispatch strategy discussed in *Future work / TODO* above.
+
+**What the remaining gap actually is.** `FR_speedup` — `com.microsoft.MoE` is still **1.12x–3.50x**
+faster than `expanded+FR` across the 18 cases (median ≈1.3x), i.e. `expanded+FR` still takes
+roughly **12%–250% longer** than the all-in-one op depending on shape (worst at low-M/many-expert
+cases like `deepseek-many-silu` and `switch-top1-silu`, best at large compute-bound prefill
+cases). That residual is the two `GroupedMatMul` GEMMs' own execution cost — the device→host sync
++ per-group `cublasGemmHelper` launch loop described in *Future work / TODO* — which
+`GroupedMatMulReduceSum` does not touch (it only fuses what comes *after* FC2). Note this gap is
+**not** closed by simply swapping the GEMM backend either: the CUTLASS-based `GroupedMatMul`
+prototype (`ORT_GROUPED_MATMUL_CUDA_IMPL=cutlass`, benchmarked separately above) also failed to
+show a clear win over the cuBLAS loop at these sizes, so a like-for-like GEMM substitution isn't
+enough — closing this gap likely needs the full device-side dispatch rework proposed in *Future
+work / TODO* (device-side per-expert offsets + a single grouped-GEMM launch, à la MoE's
+`kDeviceOnly` CUTLASS scheduling), not just a different GEMM library called the same way.

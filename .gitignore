@@ -161,6 +161,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-ortbuild/
 env/
 venv/
 ENV/

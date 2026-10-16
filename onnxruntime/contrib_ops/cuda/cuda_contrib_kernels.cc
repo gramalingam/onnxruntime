@@ -100,6 +100,18 @@ class CUDA_ONNX_OP_TYPED_CLASS_NAME(1, MLFloat16, Crop);
 class CUDA_MS_OP_TYPED_CLASS_NAME(1, float, MoE);
 class CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, MoE);
 class CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, MoE);
+class CUDA_MS_OP_TYPED_CLASS_NAME(1, float, GroupedMatMul);
+class CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, GroupedMatMul);
+class CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, GroupedMatMul);
+class CUDA_MS_OP_TYPED_CLASS_NAME(1, float, GroupedMatMulReduceSum);
+class CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, GroupedMatMulReduceSum);
+class CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, GroupedMatMulReduceSum);
+class CUDA_MS_OP_TYPED_CLASS_NAME(1, float, SwiGLU);
+class CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, SwiGLU);
+class CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, SwiGLU);
+class CUDA_MS_OP_TYPED_CLASS_NAME(1, float, RouterTopK);
+class CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, RouterTopK);
+class CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, RouterTopK);
 class CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, QMoE);
 class CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, QMoE);
 class CUDA_MS_OP_TYPED_CLASS_NAME(1, float_float, MultiHeadAttention);
@@ -463,6 +475,18 @@ Status RegisterCudaContribKernels(KernelRegistry& kernel_registry) {
       BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, float, MoE)>,
       BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, MoE)>,
       BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, MoE)>,
+      BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, float, GroupedMatMul)>,
+      BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, GroupedMatMul)>,
+      BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, GroupedMatMul)>,
+      BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, float, GroupedMatMulReduceSum)>,
+      BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, GroupedMatMulReduceSum)>,
+      BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, GroupedMatMulReduceSum)>,
+      BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, float, SwiGLU)>,
+      BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, SwiGLU)>,
+      BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, SwiGLU)>,
+      BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, float, RouterTopK)>,
+      BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, RouterTopK)>,
+      BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, RouterTopK)>,
       BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, BFloat16, QMoE)>,
       BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, MLFloat16, QMoE)>,
       BuildKernelCreateInfo<CUDA_MS_OP_TYPED_CLASS_NAME(1, float_float, MultiHeadAttention)>,

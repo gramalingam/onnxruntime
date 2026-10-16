@@ -1762,6 +1762,270 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
         .TypeConstraint("T4", {"tensor(float)"}, "Constrain FP4 global scale type to float32 tensors.")
         .TypeAndShapeInferenceFunction(ONNX_NAMESPACE::propagateShapeAndTypeFromFirstInput));
 
+constexpr const char* GroupedMatMul_ver1_doc = R"DOC(
+Grouped matrix multiplication. Each token (a row of `input`) is multiplied by one or more
+weight matrices selected, per token, from a stack of `num_groups` matrices via
+`group_indices`. This is the core computation of Mixture-of-Experts (MoE) feed-forward
+layers and corresponds to torch.nn.functional.grouped_mm.
+
+`input` has shape (M, K) where M is the number of tokens (callers with batched inputs of
+shape (..., K) Reshape the leading dimensions into M first; Reshape is free in ONNX Runtime).
+`group_indices` has shape (M, k): each token selects k experts. The dense (non-MoE) case is
+k == 1.
+
+Semantics:
+
+    for i in range(M):
+        for j in range(k):
+            g = group_indices[i, j]                 # 0 <= g < num_groups
+            r[i, j] = input[i] @ weights[g]         # [K] @ [K, N] -> [N]
+            if bias is not None:
+                r[i, j] += bias[g]
+
+    output[i, j] = r[i, j]                          # output shape (M, k, N)
+
+`weights` and `bias` are shared across all tokens. Empty groups (no token assigned to a
+group) are valid; the corresponding weight matrix is simply unused. Any weighted combination
+of the per-expert results (for example the top-k router-weighted sum in an MoE layer) is
+expressed with standard Mul / ReduceSum ops in the surrounding graph.
+)DOC";
+
+ONNX_MS_OPERATOR_SET_SCHEMA(
+    GroupedMatMul, 1,
+    OpSchema()
+        .SetDoc(GroupedMatMul_ver1_doc)
+        .Input(0,
+               "input",
+               "Input tensor of shape (M, K). M is the number of tokens and K is the hidden "
+               "(contraction) dimension.",
+               "T")
+        .Input(1,
+               "weights",
+               "Weight tensor of shape (num_groups, K, N). One K x N weight matrix per group.",
+               "T")
+        .Input(2,
+               "group_indices",
+               "Group assignment per token of shape (M, k): each of the M tokens selects k "
+               "experts. Use k = 1 for the dense case. Each value must be in the range "
+               "[0, num_groups).",
+               "I")
+        .Input(3,
+               "bias",
+               "Optional per-group bias of shape (num_groups, N), added to each selected "
+               "expert result.",
+               "T",
+               OpSchema::Optional)
+        .Output(0,
+                "output",
+                "Per-expert output tensor of shape (M, k, N).",
+                "T")
+        .TypeConstraint("T",
+                        {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"},
+                        "Constrain input and output types to float tensors.")
+        .TypeConstraint("I", {"tensor(int64)"}, "Constrain group index type to int64 tensors.")
+        .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
+          propagateElemTypeFromInputToOutput(ctx, 0, 0);
+          if (!hasInputShape(ctx, 0) || !hasInputShape(ctx, 1)) {
+            return;
+          }
+          const auto& input_shape = getInputShape(ctx, 0);
+          const auto& weights_shape = getInputShape(ctx, 1);
+          if (input_shape.dim_size() != 2) {
+            fail_shape_inference("GroupedMatMul input must have rank 2 (M, K).");
+          }
+          if (weights_shape.dim_size() != 3) {
+            fail_shape_inference("GroupedMatMul weights must have rank 3 (num_groups, K, N).");
+          }
+          if (!hasInputShape(ctx, 2)) {
+            return;  // Cannot infer k without a group_indices shape.
+          }
+          const auto& indices_shape = getInputShape(ctx, 2);
+          if (indices_shape.dim_size() != 2) {
+            return;  // Cannot infer without a well-formed group_indices shape.
+          }
+          ONNX_NAMESPACE::TensorShapeProto output_shape;
+          *output_shape.add_dim() = input_shape.dim(0);    // M
+          *output_shape.add_dim() = indices_shape.dim(1);  // k
+          *output_shape.add_dim() = weights_shape.dim(2);  // N
+          updateOutputShape(ctx, 0, output_shape);
+        }));
+
+constexpr const char* GroupedMatMulReduceSum_ver1_doc = R"DOC(
+Grouped matrix multiplication fused with a per-token weighted combine (Mul + ReduceSum) over
+the expert-selection axis. This fuses GroupedMatMul with the router-weighted-sum pattern used
+for an MoE down-projection (see the "Typical MoE usage" section of docs/GroupedMatMul.md):
+
+    d   = GroupedMatMul(input_flat, weights, group_indices_flat, bias)  # [M*k, 1, N]
+    d   = Reshape(d, [M, k, N])
+    out = ReduceSum(d * Unsqueeze(combine_weights, -1), axis=1)         # [M, N]
+
+Unlike GroupedMatMul's own row-reuse semantics (a single up-projection input row shared across
+its k selected experts), the down-projection's per-slot inputs already differ across the k
+experts of a token (each is the activation of a *different* expert's up-projection). `input`
+therefore has shape (M, k, K): one distinct row per (token, expert-slot) pair, exactly the
+already-reshaped tensor a real MoE down-projection feeds into GroupedMatMul. Semantics:
+
+    for i in range(M):
+        acc = zeros(N)
+        for j in range(k):
+            g = group_indices[i, j]                 # 0 <= g < num_groups
+            r = input[i, j] @ weights[g]             # [K] @ [K, N] -> [N]
+            if bias is not None:
+                r += bias[g]
+            acc += combine_weights[i, j] * r
+        output[i] = acc                              # output shape (M, N)
+
+`weights` and `bias` are shared across all tokens. Empty groups (no selection assigned to a
+group) are valid; the corresponding weight matrix is simply unused.
+)DOC";
+
+ONNX_MS_OPERATOR_SET_SCHEMA(
+    GroupedMatMulReduceSum, 1,
+    OpSchema()
+        .SetDoc(GroupedMatMulReduceSum_ver1_doc)
+        .Input(0,
+               "input",
+               "Input tensor of shape (M, k, K): a distinct row per (token, expert-slot) pair. "
+               "M is the number of tokens, k is the number of experts selected per token, and K "
+               "is the hidden (contraction) dimension.",
+               "T")
+        .Input(1,
+               "weights",
+               "Weight tensor of shape (num_groups, K, N). One K x N weight matrix per group.",
+               "T")
+        .Input(2,
+               "group_indices",
+               "Group assignment per (token, expert-slot) pair, of shape (M, k). Each value "
+               "must be in the range [0, num_groups).",
+               "I")
+        .Input(3,
+               "combine_weights",
+               "Per-selection weight applied before the reduce-sum combine, of shape (M, k), "
+               "e.g. the (optionally renormalized) top-k router probabilities.",
+               "T")
+        .Input(4,
+               "bias",
+               "Optional per-group bias of shape (num_groups, N), added to each selected "
+               "expert result before combining.",
+               "T",
+               OpSchema::Optional)
+        .Output(0,
+                "output",
+                "Combined output tensor of shape (M, N).",
+                "T")
+        .TypeConstraint("T",
+                        {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"},
+                        "Constrain input and output types to float tensors.")
+        .TypeConstraint("I", {"tensor(int64)"}, "Constrain group index type to int64 tensors.")
+        .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
+          propagateElemTypeFromInputToOutput(ctx, 0, 0);
+          if (!hasInputShape(ctx, 0) || !hasInputShape(ctx, 1)) {
+            return;
+          }
+          const auto& input_shape = getInputShape(ctx, 0);
+          const auto& weights_shape = getInputShape(ctx, 1);
+          if (input_shape.dim_size() != 3) {
+            fail_shape_inference("GroupedMatMulReduceSum input must have rank 3 (M, k, K).");
+          }
+          if (weights_shape.dim_size() != 3) {
+            fail_shape_inference("GroupedMatMulReduceSum weights must have rank 3 (num_groups, K, N).");
+          }
+          ONNX_NAMESPACE::TensorShapeProto output_shape;
+          *output_shape.add_dim() = input_shape.dim(0);    // M
+          *output_shape.add_dim() = weights_shape.dim(2);  // N
+          updateOutputShape(ctx, 0, output_shape);
+        }));
+
+constexpr const char* SwiGLU_ver1_doc = R"DOC(
+SwiGLU (Swish-Gated Linear Unit) gated activation, fused into a single elementwise op.
+
+Given two tensors of the same shape, `gate` (G) and `linear` (L), computes:
+
+    output = G * sigmoid(alpha * G) * L
+
+i.e. a SiLU/Swish activation applied to `gate` (when alpha == 1 the gate activation is
+SiLU(G) = G * sigmoid(G)) multiplied elementwise by `linear`. This is the gated-activation
+cluster of a SwiGLU MLP / MoE feed-forward layer; fusing the sigmoid and the two multiplies
+into one kernel removes two full passes over the (typically large) intermediate tensors.
+
+`gate` and `linear` must have identical shapes; the output has the same shape.
+)DOC";
+
+ONNX_MS_OPERATOR_SET_SCHEMA(
+    SwiGLU, 1,
+    OpSchema()
+        .SetDoc(SwiGLU_ver1_doc)
+        .Attr("alpha",
+              "Scaling factor inside the sigmoid of the Swish gate. Default is 1.0 (SiLU gate).",
+              AttributeProto::FLOAT,
+              1.0f)
+        .Input(0, "gate", "The gated input tensor G.", "T")
+        .Input(1, "linear", "The linear input tensor L, same shape as `gate`.", "T")
+        .Output(0, "output", "Result tensor, same shape as the inputs.", "T")
+        .TypeConstraint("T",
+                        {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"},
+                        "Constrain input and output types to float tensors.")
+        .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
+          propagateElemTypeFromInputToOutput(ctx, 0, 0);
+          if (hasInputShape(ctx, 0)) {
+            propagateShapeFromInputToOutput(ctx, 0, 0);
+          }
+        }));
+
+constexpr const char* RouterTopK_ver1_doc = R"DOC(
+Fused Mixture-of-Experts router top-k selection with renormalization.
+
+Given router `logits` of shape (..., num_experts), selects the top `k` experts per row and
+returns their (renormalized) softmax weights and indices:
+
+    values, indices = TopK(logits, k)          # k largest logits per row, sorted descending
+    weights = Softmax(values)                  # softmax over the k selected logits
+
+Because softmax is monotonic, this is numerically equivalent to renormalizing the top-k of a
+full softmax (`TopK(Softmax(logits))` followed by divide-by-sum), but the softmax runs over
+only k << num_experts elements, avoiding the full-width softmax and its intermediate tensor.
+
+`indices` are int64 and, for ties in logit value, the smaller expert index is selected first
+(matching ONNX TopK with largest=1, sorted=1). Outputs have shape (..., k).
+)DOC";
+
+ONNX_MS_OPERATOR_SET_SCHEMA(
+    RouterTopK, 1,
+    OpSchema()
+        .SetDoc(RouterTopK_ver1_doc)
+        .Attr("k", "Number of experts to select per row. Must satisfy 1 <= k <= num_experts.",
+              AttributeProto::INT)
+        .Input(0, "logits", "Router logits of shape (..., num_experts).", "T")
+        .Output(0, "weights", "Renormalized top-k softmax weights of shape (..., k).", "T")
+        .Output(1, "indices", "Indices of the selected experts of shape (..., k).", "I")
+        .TypeConstraint("T",
+                        {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"},
+                        "Constrain logits and weights types to float tensors.")
+        .TypeConstraint("I", {"tensor(int64)"}, "Constrain index output type to int64 tensors.")
+        .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
+          propagateElemTypeFromInputToOutput(ctx, 0, 0);
+          updateOutputElemType(ctx, 1, ONNX_NAMESPACE::TensorProto::INT64);
+          int64_t k = getAttribute(ctx, "k", -1);
+          if (k < 1) {
+            fail_shape_inference("RouterTopK requires attribute k >= 1.");
+          }
+          if (!hasInputShape(ctx, 0)) {
+            return;
+          }
+          const auto& logits_shape = getInputShape(ctx, 0);
+          if (logits_shape.dim_size() < 1) {
+            fail_shape_inference("RouterTopK logits must have rank >= 1.");
+          }
+          ONNX_NAMESPACE::TensorShapeProto out_shape;
+          for (int i = 0; i < logits_shape.dim_size() - 1; ++i) {
+            *out_shape.add_dim() = logits_shape.dim(i);
+          }
+          out_shape.add_dim()->set_dim_value(k);
+          updateOutputShape(ctx, 0, out_shape);
+          updateOutputShape(ctx, 1, out_shape);
+        }));
+
+
 ONNX_MS_OPERATOR_SET_SCHEMA(SampleOp, 1,
                             OpSchema()
                                 .Input(0, "X", "input", "T")

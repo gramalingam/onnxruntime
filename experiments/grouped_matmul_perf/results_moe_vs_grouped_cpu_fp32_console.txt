@@ -1,0 +1,453 @@
+MoE (fused com.microsoft.MoE) vs expanded GroupedMatMul - CPU fp32 - ONNX Runtime 1.29.0
+Host: 24 logical CPUs (intra-op auto ~24). strict=ON, mem-budget=12 GiB, iters=30, median ms.
+All 18 cases x 4 configs PASSED strict cross-check (no DIVERGED, no OOM-skip).
+
+
+============================================================
+CONFIG 1: expanded SwiGLU / softmax-topk router (sub-2GiB cases)
+============================================================
+onnxruntime 1.29.0; providers available: ['CPUExecutionProvider']
+dtype=float32 bias=False normalize=1 router-impl=softmax-topk swiglu-impl=expanded intra-op-threads=auto(~24)
+warmup=5 iters=30 strict=True mem-budget=12.0 GiB profile=False
+SwiGLU: fused MoE uses swiglu_fusion=1 (interleaved); expanded uses 'expanded' (Sigmoid+Mul+Mul). Reported ms are MEDIAN over timed iters.
+
+case                act     regime              prov       M     K      F    E  k   fused_ms     exp_ms  fused_x  max_relerr  ok
+--------------------------------------------------------------------------------------------------------------------------------
+small-silu          silu    prefill/compute     cpu      128  1024   2048    8  2      8.786      7.808    0.89x    2.73e-07 yes
+small-silu-bias     silu    prefill/compute     cpu      128  1024   2048    8  2     16.000      8.260    0.52x    2.77e-07 yes
+small-swiglu        swiglu  prefill/compute     cpu      128  1024   2048    8  2     18.049     11.869    0.66x    2.85e-07 yes
+small-gelu          gelu    prefill/compute     cpu      128  1024   2048    8  2     15.120      8.512    0.56x    2.62e-07 yes
+prefill-silu        silu    prefill/compute     cpu      512  2048   5632    8  2    155.435     93.638    0.60x    2.84e-07 yes
+prefill-swiglu      swiglu  prefill/compute     cpu      512  2048   5632    8  2    220.354    147.892    0.67x    2.67e-07 yes
+prefill-gelu        gelu    prefill/compute     cpu      512  2048   5632    8  2    170.512     97.699    0.57x    3.09e-07 yes
+deepseek-many-silu  silu    prefill/compute     cpu      512  1024   1408   64  6     76.775     56.644    0.74x    2.64e-07 yes
+large-tokens-swiglu swiglu  prefill/compute     cpu     2048  1024   2048    8  2    212.220    113.240    0.53x    2.57e-07 yes
+prefill-4k-silu     silu    prefill/compute     cpu     4096  2048   5632    8  2   1148.656    648.608    0.56x    3.13e-07 yes
+prefill-8k-silu     silu    prefill/compute     cpu     8192  2048   5632    8  2   2480.652   1431.243    0.58x    3.37e-07 yes
+
+Wrote results_moe_vs_grouped_cpu_fp32_expanded_softmaxtopk.csv
+
+============================================================
+CONFIG 1: expanded SwiGLU / softmax-topk router (>2GiB large cases, fixed harness)
+============================================================
+[qa] running 7 previously-failing >2GiB cases: ['decode-silu', 'decode-swiglu', 'decode-batch8-silu', 'decode-batch32-silu', 'mixtral-silu', 'mixtral-swiglu', 'switch-top1-silu']
+onnxruntime 1.29.0; providers available: ['CPUExecutionProvider']
+dtype=float32 bias=False normalize=1 router-impl=softmax-topk swiglu-impl=expanded intra-op-threads=auto(~24)
+warmup=5 iters=30 strict=True mem-budget=12.0 GiB profile=False
+SwiGLU: fused MoE uses swiglu_fusion=1 (interleaved); expanded uses 'expanded' (Sigmoid+Mul+Mul). Reported ms are MEDIAN over timed iters.
+
+case                act     regime              prov       M     K      F    E  k   fused_ms     exp_ms  fused_x  max_relerr  ok
+--------------------------------------------------------------------------------------------------------------------------------
+decode-silu         silu    decode/launch-bound cpu        1  4096  14336    8  2     78.256     18.599    0.24x    1.84e-06 yes
+decode-swiglu       swiglu  decode/launch-bound cpu        1  4096  14336    8  2    115.049     29.742    0.26x    2.08e-06 yes
+decode-batch8-silu  silu    decode-batch        cpu        8  4096  14336    8  2    122.278    105.754    0.86x    1.68e-06 yes
+decode-batch32-silu silu    decode-batch        cpu       32  4096  14336    8  2    152.325    136.391    0.90x    3.32e-07 yes
+mixtral-silu        silu    prefill/compute     cpu     1024  4096  14336    8  2   1397.386    804.437    0.58x    4.18e-07 yes
+mixtral-swiglu      swiglu  prefill/compute     cpu     1024  4096  14336    8  2   2068.742   1285.123    0.62x    3.77e-07 yes
+switch-top1-silu    silu    prefill/compute     cpu     1024   768   3072  128  1    116.748     99.492    0.85x    3.96e-07 yes
+
+Wrote C:\Users\grama\.flightdeck\artifacts\eval-moe-vs-groupedmatmul-a5c6f1\sessions\9bdaa84f-9b52-4707-b35a-a57a2ef6dc3a\qa-tester-5ded23b5\large_expanded_softmaxtopk.csv
+
+============================================================
+CONFIG 2: fused-op SwiGLU / softmax-topk router (sub-2GiB cases)
+============================================================
+onnxruntime 1.29.0; providers available: ['CPUExecutionProvider']
+dtype=float32 bias=False normalize=1 router-impl=softmax-topk swiglu-impl=fused-op intra-op-threads=auto(~24)
+warmup=5 iters=30 strict=True mem-budget=12.0 GiB profile=False
+SwiGLU: fused MoE uses swiglu_fusion=1 (interleaved); expanded uses 'fused-op' (com.microsoft.SwiGLU op). Reported ms are MEDIAN over timed iters.
+
+case                act     regime              prov       M     K      F    E  k   fused_ms     exp_ms  fused_x  max_relerr  ok
+--------------------------------------------------------------------------------------------------------------------------------
+small-silu          silu    prefill/compute     cpu      128  1024   2048    8  2      9.131      8.342    0.91x    2.73e-07 yes
+small-silu-bias     silu    prefill/compute     cpu      128  1024   2048    8  2     13.809      8.817    0.64x    2.77e-07 yes
+small-swiglu        swiglu  prefill/compute     cpu      128  1024   2048    8  2     19.040     12.833    0.67x    2.85e-07 yes
+small-gelu          gelu    prefill/compute     cpu      128  1024   2048    8  2     16.299      9.096    0.56x    2.62e-07 yes
+prefill-silu        silu    prefill/compute     cpu      512  2048   5632    8  2    157.598     94.448    0.60x    2.84e-07 yes
+prefill-swiglu      swiglu  prefill/compute     cpu      512  2048   5632    8  2    240.809    152.081    0.63x    2.67e-07 yes
+prefill-gelu        gelu    prefill/compute     cpu      512  2048   5632    8  2    177.051     98.370    0.56x    3.09e-07 yes
+deepseek-many-silu  silu    prefill/compute     cpu      512  1024   1408   64  6     87.967     57.882    0.66x    2.64e-07 yes
+large-tokens-swiglu swiglu  prefill/compute     cpu     2048  1024   2048    8  2    229.925    124.156    0.54x    2.57e-07 yes
+prefill-4k-silu     silu    prefill/compute     cpu     4096  2048   5632    8  2   1268.945    641.592    0.51x    3.13e-07 yes
+prefill-8k-silu     silu    prefill/compute     cpu     8192  2048   5632    8  2   2370.414   1332.639    0.56x    3.37e-07 yes
+
+Wrote C:\repos\myort\experiments\grouped_matmul_perf\results_moe_vs_grouped_cpu_fp32_fusedop_softmaxtopk.csv
+
+============================================================
+CONFIG 2: fused-op SwiGLU / softmax-topk router (>2GiB large cases)
+============================================================
+[qa] running 7 previously-failing >2GiB cases: ['decode-silu', 'decode-swiglu', 'decode-batch8-silu', 'decode-batch32-silu', 'mixtral-silu', 'mixtral-swiglu', 'switch-top1-silu']
+onnxruntime 1.29.0; providers available: ['CPUExecutionProvider']
+dtype=float32 bias=False normalize=1 router-impl=softmax-topk swiglu-impl=fused-op intra-op-threads=auto(~24)
+warmup=5 iters=30 strict=True mem-budget=12.0 GiB profile=False
+SwiGLU: fused MoE uses swiglu_fusion=1 (interleaved); expanded uses 'fused-op' (com.microsoft.SwiGLU op). Reported ms are MEDIAN over timed iters.
+
+case                act     regime              prov       M     K      F    E  k   fused_ms     exp_ms  fused_x  max_relerr  ok
+--------------------------------------------------------------------------------------------------------------------------------
+decode-silu         silu    decode/launch-bound cpu        1  4096  14336    8  2     76.108     18.620    0.24x    1.84e-06 yes
+decode-swiglu       swiglu  decode/launch-bound cpu        1  4096  14336    8  2    116.941     26.418    0.23x    2.08e-06 yes
+decode-batch8-silu  silu    decode-batch        cpu        8  4096  14336    8  2    126.003    108.041    0.86x    1.68e-06 yes
+decode-batch32-silu silu    decode-batch        cpu       32  4096  14336    8  2    152.219    153.350    1.01x    3.32e-07 yes
+mixtral-silu        silu    prefill/compute     cpu     1024  4096  14336    8  2   1391.372    930.364    0.67x    4.18e-07 yes
+mixtral-swiglu      swiglu  prefill/compute     cpu     1024  4096  14336    8  2   2045.093   1281.272    0.63x    3.77e-07 yes
+switch-top1-silu    silu    prefill/compute     cpu     1024   768   3072  128  1    116.170     98.720    0.85x    3.96e-07 yes
+
+Wrote C:\Users\grama\.flightdeck\artifacts\eval-moe-vs-groupedmatmul-a5c6f1\sessions\9bdaa84f-9b52-4707-b35a-a57a2ef6dc3a\qa-tester-5ded23b5\large_fusedop_softmaxtopk.csv
+
+============================================================
+CONFIG 3: expanded SwiGLU / routertopk router (sub-2GiB cases)
+============================================================
+onnxruntime 1.29.0; providers available: ['CPUExecutionProvider']
+dtype=float32 bias=False normalize=1 router-impl=routertopk swiglu-impl=expanded intra-op-threads=auto(~24)
+warmup=5 iters=30 strict=True mem-budget=12.0 GiB profile=False
+SwiGLU: fused MoE uses swiglu_fusion=1 (interleaved); expanded uses 'expanded' (Sigmoid+Mul+Mul). Reported ms are MEDIAN over timed iters.
+
+case                act     regime              prov       M     K      F    E  k   fused_ms     exp_ms  fused_x  max_relerr  ok
+--------------------------------------------------------------------------------------------------------------------------------
+small-silu          silu    prefill/compute     cpu      128  1024   2048    8  2      9.398      8.277    0.88x    2.73e-07 yes
+small-silu-bias     silu    prefill/compute     cpu      128  1024   2048    8  2     14.072      8.272    0.59x    2.77e-07 yes
+small-swiglu        swiglu  prefill/compute     cpu      128  1024   2048    8  2     18.877     11.737    0.62x    2.85e-07 yes
+small-gelu          gelu    prefill/compute     cpu      128  1024   2048    8  2     15.078      8.455    0.56x    2.62e-07 yes
+prefill-silu        silu    prefill/compute     cpu      512  2048   5632    8  2    155.512     89.462    0.58x    3.66e-07 yes
+prefill-swiglu      swiglu  prefill/compute     cpu      512  2048   5632    8  2    227.210    149.347    0.66x    2.67e-07 yes
+prefill-gelu        gelu    prefill/compute     cpu      512  2048   5632    8  2    168.706    100.582    0.60x    3.09e-07 yes
+deepseek-many-silu  silu    prefill/compute     cpu      512  1024   1408   64  6     77.885     57.926    0.74x    2.64e-07 yes
+large-tokens-swiglu swiglu  prefill/compute     cpu     2048  1024   2048    8  2    207.683    115.130    0.55x    3.86e-07 yes
+prefill-4k-silu     silu    prefill/compute     cpu     4096  2048   5632    8  2   1146.197    629.190    0.55x    3.92e-07 yes
+prefill-8k-silu     silu    prefill/compute     cpu     8192  2048   5632    8  2   2398.380   1327.473    0.55x    3.75e-07 yes
+
+Wrote C:\repos\myort\experiments\grouped_matmul_perf\results_moe_vs_grouped_cpu_fp32_expanded_routertopk.csv
+
+============================================================
+CONFIG 3: expanded SwiGLU / routertopk router (>2GiB large cases)
+============================================================
+[qa] running 7 previously-failing >2GiB cases: ['decode-silu', 'decode-swiglu', 'decode-batch8-silu', 'decode-batch32-silu', 'mixtral-silu', 'mixtral-swiglu', 'switch-top1-silu']
+onnxruntime 1.29.0; providers available: ['CPUExecutionProvider']
+dtype=float32 bias=False normalize=1 router-impl=routertopk swiglu-impl=expanded intra-op-threads=auto(~24)
+warmup=5 iters=30 strict=True mem-budget=12.0 GiB profile=False
+SwiGLU: fused MoE uses swiglu_fusion=1 (interleaved); expanded uses 'expanded' (Sigmoid+Mul+Mul). Reported ms are MEDIAN over timed iters.
+
+case                act     regime              prov       M     K      F    E  k   fused_ms     exp_ms  fused_x  max_relerr  ok
+--------------------------------------------------------------------------------------------------------------------------------
+decode-silu         silu    decode/launch-bound cpu        1  4096  14336    8  2     74.615     18.701    0.25x    1.84e-06 yes
+decode-swiglu       swiglu  decode/launch-bound cpu        1  4096  14336    8  2    117.971     26.018    0.22x    2.08e-06 yes
+decode-batch8-silu  silu    decode-batch        cpu        8  4096  14336    8  2    123.086    108.189    0.88x    1.68e-06 yes
+decode-batch32-silu silu    decode-batch        cpu       32  4096  14336    8  2    148.031    135.590    0.92x    3.32e-07 yes
+mixtral-silu        silu    prefill/compute     cpu     1024  4096  14336    8  2   1378.794    843.724    0.61x    4.18e-07 yes
+mixtral-swiglu      swiglu  prefill/compute     cpu     1024  4096  14336    8  2   2038.295   1272.386    0.62x    3.36e-07 yes
+switch-top1-silu    silu    prefill/compute     cpu     1024   768   3072  128  1    117.606     99.507    0.85x    3.96e-07 yes
+
+Wrote C:\Users\grama\.flightdeck\artifacts\eval-moe-vs-groupedmatmul-a5c6f1\sessions\9bdaa84f-9b52-4707-b35a-a57a2ef6dc3a\qa-tester-5ded23b5\large_expanded_routertopk.csv
+
+============================================================
+CONFIG 4: fused-op SwiGLU / routertopk router (sub-2GiB cases)
+============================================================
+onnxruntime 1.29.0; providers available: ['CPUExecutionProvider']
+dtype=float32 bias=False normalize=1 router-impl=routertopk swiglu-impl=fused-op intra-op-threads=auto(~24)
+warmup=5 iters=30 strict=True mem-budget=12.0 GiB profile=False
+SwiGLU: fused MoE uses swiglu_fusion=1 (interleaved); expanded uses 'fused-op' (com.microsoft.SwiGLU op). Reported ms are MEDIAN over timed iters.
+
+case                act     regime              prov       M     K      F    E  k   fused_ms     exp_ms  fused_x  max_relerr  ok
+--------------------------------------------------------------------------------------------------------------------------------
+small-silu          silu    prefill/compute     cpu      128  1024   2048    8  2      8.733      8.017    0.92x    2.73e-07 yes
+small-silu-bias     silu    prefill/compute     cpu      128  1024   2048    8  2     14.915      8.569    0.57x    2.77e-07 yes
+small-swiglu        swiglu  prefill/compute     cpu      128  1024   2048    8  2     18.457     12.495    0.68x    2.85e-07 yes
+small-gelu          gelu    prefill/compute     cpu      128  1024   2048    8  2     14.825      8.380    0.57x    2.62e-07 yes
+prefill-silu        silu    prefill/compute     cpu      512  2048   5632    8  2    157.781     93.433    0.59x    3.66e-07 yes
+prefill-swiglu      swiglu  prefill/compute     cpu      512  2048   5632    8  2    224.976    155.014    0.69x    2.67e-07 yes
+prefill-gelu        gelu    prefill/compute     cpu      512  2048   5632    8  2    172.172    102.292    0.59x    3.09e-07 yes
+deepseek-many-silu  silu    prefill/compute     cpu      512  1024   1408   64  6     77.664     58.223    0.75x    2.64e-07 yes
+large-tokens-swiglu swiglu  prefill/compute     cpu     2048  1024   2048    8  2    211.910    120.758    0.57x    3.86e-07 yes
+prefill-4k-silu     silu    prefill/compute     cpu     4096  2048   5632    8  2   1145.744    641.467    0.56x    3.92e-07 yes
+prefill-8k-silu     silu    prefill/compute     cpu     8192  2048   5632    8  2   2387.048   1319.741    0.55x    3.75e-07 yes
+
+Wrote C:\repos\myort\experiments\grouped_matmul_perf\results_moe_vs_grouped_cpu_fp32_fusedop_routertopk.csv
+
+============================================================
+CONFIG 4: fused-op SwiGLU / routertopk router (>2GiB large cases)
+============================================================
+[qa] running 7 previously-failing >2GiB cases: ['decode-silu', 'decode-swiglu', 'decode-batch8-silu', 'decode-batch32-silu', 'mixtral-silu', 'mixtral-swiglu', 'switch-top1-silu']
+onnxruntime 1.29.0; providers available: ['CPUExecutionProvider']
+dtype=float32 bias=False normalize=1 router-impl=routertopk swiglu-impl=fused-op intra-op-threads=auto(~24)
+warmup=5 iters=30 strict=True mem-budget=12.0 GiB profile=False
+SwiGLU: fused MoE uses swiglu_fusion=1 (interleaved); expanded uses 'fused-op' (com.microsoft.SwiGLU op). Reported ms are MEDIAN over timed iters.
+
+case                act     regime              prov       M     K      F    E  k   fused_ms     exp_ms  fused_x  max_relerr  ok
+--------------------------------------------------------------------------------------------------------------------------------
+decode-silu         silu    decode/launch-bound cpu        1  4096  14336    8  2     79.778     19.555    0.25x    1.84e-06 yes
+decode-swiglu       swiglu  decode/launch-bound cpu        1  4096  14336    8  2    114.794     26.034    0.23x    2.08e-06 yes
+decode-batch8-silu  silu    decode-batch        cpu        8  4096  14336    8  2    122.245    106.760    0.87x    1.68e-06 yes
+decode-batch32-silu silu    decode-batch        cpu       32  4096  14336    8  2    148.985    136.586    0.92x    3.32e-07 yes
+mixtral-silu        silu    prefill/compute     cpu     1024  4096  14336    8  2   1372.970    853.412    0.62x    4.18e-07 yes
+mixtral-swiglu      swiglu  prefill/compute     cpu     1024  4096  14336    8  2   2047.792   1281.323    0.63x    3.36e-07 yes
+switch-top1-silu    silu    prefill/compute     cpu     1024   768   3072  128  1    116.062     99.215    0.85x    3.96e-07 yes
+
+Wrote C:\Users\grama\.flightdeck\artifacts\eval-moe-vs-groupedmatmul-a5c6f1\sessions\9bdaa84f-9b52-4707-b35a-a57a2ef6dc3a\qa-tester-5ded23b5\large_fusedop_routertopk.csv
+
+============================================================
+PROFILING: expanded / softmax-topk (sub-2GiB cases) per-op breakdown
+============================================================
+onnxruntime 1.29.0; providers available: ['CPUExecutionProvider']
+dtype=float32 bias=False normalize=1 router-impl=softmax-topk swiglu-impl=expanded intra-op-threads=auto(~24)
+warmup=5 iters=30 strict=True mem-budget=12.0 GiB profile=True
+SwiGLU: fused MoE uses swiglu_fusion=1 (interleaved); expanded uses 'expanded' (Sigmoid+Mul+Mul). Reported ms are MEDIAN over timed iters.
+
+case                act     regime              prov       M     K      F    E  k   fused_ms     exp_ms  fused_x  max_relerr  ok
+--------------------------------------------------------------------------------------------------------------------------------
+small-silu          silu    prefill/compute     cpu      128  1024   2048    8  2      8.666      8.378    0.97x    2.73e-07 yes
+    [profile] fused per-op kernel time (of 8.771 ms mean):
+        MoE                     35 calls     364.024 ms
+    [profile] expanded per-op kernel time (of 8.766 ms mean):
+        GroupedMatMul           70 calls     319.737 ms
+        Reshape                105 calls       5.957 ms
+        ReduceSum               70 calls       5.736 ms
+        QuickGelu               35 calls       5.485 ms
+        Mul                     35 calls       3.420 ms
+        TopK                    35 calls       2.845 ms
+        Softmax                 35 calls       2.430 ms
+        Div                     35 calls       2.309 ms
+        Unsqueeze               35 calls       1.788 ms
+small-silu-bias     silu    prefill/compute     cpu      128  1024   2048    8  2     14.034      8.084    0.58x    2.77e-07 yes
+    [profile] fused per-op kernel time (of 14.934 ms mean):
+        MoE                     35 calls     522.006 ms
+    [profile] expanded per-op kernel time (of 8.405 ms mean):
+        GroupedMatMul           70 calls     298.841 ms
+        QuickGelu               35 calls       5.229 ms
+        Reshape                105 calls       4.603 ms
+        ReduceSum               70 calls       4.555 ms
+        Mul                     35 calls       2.809 ms
+        TopK                    35 calls       2.224 ms
+        Softmax                 35 calls       1.941 ms
+        Div                     35 calls       1.824 ms
+        Unsqueeze               35 calls       1.427 ms
+small-swiglu        swiglu  prefill/compute     cpu      128  1024   2048    8  2     18.214     12.297    0.68x    2.85e-07 yes
+    [profile] fused per-op kernel time (of 19.706 ms mean):
+        MoE                     35 calls     704.272 ms
+    [profile] expanded per-op kernel time (of 12.468 ms mean):
+        GroupedMatMul           70 calls     414.233 ms
+        Split                   35 calls       9.202 ms
+        Mul                     70 calls       6.212 ms
+        Reshape                140 calls       6.049 ms
+        ReduceSum               70 calls       4.386 ms
+        QuickGelu               35 calls       3.951 ms
+        Squeeze                 70 calls       3.132 ms
+        TopK                    35 calls       2.229 ms
+        Softmax                 35 calls       1.832 ms
+        Div                     35 calls       1.750 ms
+        Unsqueeze               35 calls       1.393 ms
+small-gelu          gelu    prefill/compute     cpu      128  1024   2048    8  2     15.818      8.087    0.51x    2.62e-07 yes
+    [profile] fused per-op kernel time (of 17.760 ms mean):
+        MoE                     35 calls     594.993 ms
+    [profile] expanded per-op kernel time (of 8.478 ms mean):
+        GroupedMatMul           70 calls     309.384 ms
+        Mul                    245 calls      26.347 ms
+        Add                     70 calls       5.838 ms
+        Tanh                    35 calls       4.562 ms
+        ReduceSum               70 calls       4.552 ms
+        Reshape                105 calls       4.345 ms
+        TopK                    35 calls       2.167 ms
+        Softmax                 35 calls       1.881 ms
+        Div                     35 calls       1.776 ms
+        Unsqueeze               35 calls       1.366 ms
+prefill-silu        silu    prefill/compute     cpu      512  2048   5632    8  2    157.821     93.661    0.59x    2.84e-07 yes
+    [profile] fused per-op kernel time (of 157.920 ms mean):
+        MoE                     35 calls    5535.370 ms
+    [profile] expanded per-op kernel time (of 94.431 ms mean):
+        GroupedMatMul           70 calls    3268.126 ms
+        QuickGelu               35 calls      36.727 ms
+        Mul                     35 calls      13.535 ms
+        ReduceSum               70 calls      11.095 ms
+        Reshape                105 calls       5.032 ms
+        TopK                    35 calls       3.686 ms
+        Softmax                 35 calls       3.056 ms
+        Div                     35 calls       2.396 ms
+        Unsqueeze               35 calls       1.415 ms
+prefill-swiglu      swiglu  prefill/compute     cpu      512  2048   5632    8  2    225.148    146.156    0.65x    2.67e-07 yes
+    [profile] fused per-op kernel time (of 225.267 ms mean):
+        MoE                     35 calls    7817.744 ms
+    [profile] expanded per-op kernel time (of 147.566 ms mean):
+        GroupedMatMul           70 calls    5219.781 ms
+        Split                   35 calls      98.792 ms
+        Mul                     70 calls      62.002 ms
+        QuickGelu               35 calls      36.433 ms
+        ReduceSum               70 calls      11.373 ms
+        Reshape                140 calls       6.722 ms
+        TopK                    35 calls       3.934 ms
+        Squeeze                 70 calls       3.294 ms
+        Softmax                 35 calls       3.192 ms
+        Div                     35 calls       2.571 ms
+        Unsqueeze               35 calls       1.472 ms
+prefill-gelu        gelu    prefill/compute     cpu      512  2048   5632    8  2    171.783    101.923    0.59x    3.09e-07 yes
+    [profile] fused per-op kernel time (of 170.904 ms mean):
+        MoE                     35 calls    6020.718 ms
+    [profile] expanded per-op kernel time (of 102.623 ms mean):
+        GroupedMatMul           70 calls    3120.035 ms
+        Mul                    245 calls     245.722 ms
+        Add                     70 calls      78.909 ms
+        Tanh                    35 calls      21.366 ms
+        ReduceSum               70 calls      10.832 ms
+        Reshape                105 calls       4.550 ms
+        TopK                    35 calls       3.615 ms
+        Softmax                 35 calls       2.961 ms
+        Div                     35 calls       2.422 ms
+        Unsqueeze               35 calls       1.382 ms
+deepseek-many-silu  silu    prefill/compute     cpu      512  1024   1408   64  6     76.546     56.846    0.74x    2.64e-07 yes
+    [profile] fused per-op kernel time (of 77.970 ms mean):
+        MoE                     35 calls    2787.032 ms
+    [profile] expanded per-op kernel time (of 57.920 ms mean):
+        GroupedMatMul           70 calls    1986.915 ms
+        QuickGelu               35 calls      27.271 ms
+        Mul                     35 calls      19.052 ms
+        TopK                    35 calls      16.382 ms
+        ReduceSum               70 calls      13.307 ms
+        Reshape                105 calls       5.160 ms
+        Softmax                 35 calls       3.373 ms
+        Div                     35 calls       2.602 ms
+        Unsqueeze               35 calls       1.489 ms
+large-tokens-swiglu swiglu  prefill/compute     cpu     2048  1024   2048    8  2    209.598    113.218    0.54x    2.57e-07 yes
+    [profile] fused per-op kernel time (of 207.775 ms mean):
+        MoE                     35 calls    7349.833 ms
+    [profile] expanded per-op kernel time (of 112.839 ms mean):
+        GroupedMatMul           70 calls    3748.310 ms
+        Split                   35 calls     141.929 ms
+        Mul                     70 calls      95.430 ms
+        QuickGelu               35 calls      53.374 ms
+        ReduceSum               70 calls      17.852 ms
+        TopK                    35 calls      10.067 ms
+        Reshape                140 calls       6.949 ms
+        Div                     35 calls       5.501 ms
+        Softmax                 35 calls       4.162 ms
+        Squeeze                 70 calls       3.381 ms
+        Unsqueeze               35 calls       1.472 ms
+prefill-4k-silu     silu    prefill/compute     cpu     4096  2048   5632    8  2   1118.002    632.618    0.57x    3.13e-07 yes
+    [profile] fused per-op kernel time (of 1118.799 ms mean):
+        MoE                     35 calls   39642.372 ms
+    [profile] expanded per-op kernel time (of 631.683 ms mean):
+        GroupedMatMul           70 calls   21529.929 ms
+        QuickGelu               35 calls     303.762 ms
+        Mul                     35 calls     106.486 ms
+        ReduceSum               70 calls      73.299 ms
+        TopK                    35 calls      19.232 ms
+        Div                     35 calls       8.599 ms
+        Softmax                 35 calls       5.726 ms
+        Reshape                105 calls       4.931 ms
+        Unsqueeze               35 calls       1.329 ms
+prefill-8k-silu     silu    prefill/compute     cpu     8192  2048   5632    8  2   2342.715   1308.225    0.56x    3.37e-07 yes
+    [profile] fused per-op kernel time (of 2378.251 ms mean):
+        MoE                     35 calls   83413.058 ms
+    [profile] expanded per-op kernel time (of 1312.951 ms mean):
+        GroupedMatMul           70 calls   44960.936 ms
+        QuickGelu               35 calls     632.966 ms
+        Mul                     35 calls     209.648 ms
+        ReduceSum               70 calls     141.387 ms
+        TopK                    35 calls      33.581 ms
+        Div                     35 calls      14.786 ms
+        Softmax                 35 calls       6.543 ms
+        Reshape                105 calls       4.619 ms
+        Unsqueeze               35 calls       1.241 ms
+
+============================================================
+PROFILING: expanded / softmax-topk (>2GiB large cases) per-op breakdown
+============================================================
+[qa] running 7 previously-failing >2GiB cases: ['decode-silu', 'decode-swiglu', 'decode-batch8-silu', 'decode-batch32-silu', 'mixtral-silu', 'mixtral-swiglu', 'switch-top1-silu']
+onnxruntime 1.29.0; providers available: ['CPUExecutionProvider']
+dtype=float32 bias=False normalize=1 router-impl=softmax-topk swiglu-impl=expanded intra-op-threads=auto(~24)
+warmup=5 iters=30 strict=True mem-budget=12.0 GiB profile=True
+SwiGLU: fused MoE uses swiglu_fusion=1 (interleaved); expanded uses 'expanded' (Sigmoid+Mul+Mul). Reported ms are MEDIAN over timed iters.
+
+case                act     regime              prov       M     K      F    E  k   fused_ms     exp_ms  fused_x  max_relerr  ok
+--------------------------------------------------------------------------------------------------------------------------------
+decode-silu         silu    decode/launch-bound cpu        1  4096  14336    8  2     74.630     18.502    0.25x    1.84e-06 yes
+    [profile] fused per-op kernel time (of 75.501 ms mean):
+        MoE                     35 calls    3059.507 ms
+    [profile] expanded per-op kernel time (of 18.678 ms mean):
+        GroupedMatMul           70 calls     884.735 ms
+        Reshape                105 calls       4.524 ms
+        ReduceSum               70 calls       4.251 ms
+        QuickGelu               35 calls       2.475 ms
+        Softmax                 35 calls       1.742 ms
+        Mul                     35 calls       1.698 ms
+        TopK                    35 calls       1.583 ms
+        Div                     35 calls       1.420 ms
+        Unsqueeze               35 calls       1.357 ms
+decode-swiglu       swiglu  decode/launch-bound cpu        1  4096  14336    8  2    120.697     28.180    0.23x    2.08e-06 yes
+    [profile] fused per-op kernel time (of 121.213 ms mean):
+        MoE                     35 calls    4753.310 ms
+    [profile] expanded per-op kernel time (of 28.455 ms mean):
+        GroupedMatMul           70 calls    1201.113 ms
+        Reshape                140 calls       6.471 ms
+        ReduceSum               70 calls       4.497 ms
+        Mul                     70 calls       3.839 ms
+        Split                   35 calls       3.266 ms
+        Squeeze                 70 calls       2.853 ms
+        QuickGelu               35 calls       2.314 ms
+        Softmax                 35 calls       1.961 ms
+        TopK                    35 calls       1.827 ms
+        Unsqueeze               35 calls       1.645 ms
+        Div                     35 calls       1.616 ms
+decode-batch8-silu  silu    decode-batch        cpu        8  4096  14336    8  2    131.674    113.313    0.86x    1.68e-06 yes
+    [profile] fused per-op kernel time (of 134.485 ms mean):
+        MoE                     35 calls    4672.074 ms
+    [profile] expanded per-op kernel time (of 113.481 ms mean):
+        GroupedMatMul           70 calls    4624.219 ms
+        Reshape                105 calls       4.905 ms
+        ReduceSum               70 calls       4.687 ms
+        QuickGelu               35 calls       4.103 ms
+        Mul                     35 calls       3.095 ms
+        Softmax                 35 calls       1.819 ms
+        TopK                    35 calls       1.742 ms
+        Div                     35 calls       1.575 ms
+        Unsqueeze               35 calls       1.358 ms
+decode-batch32-silu silu    decode-batch        cpu       32  4096  14336    8  2    171.516    150.445    0.88x    3.32e-07 yes
+    [profile] fused per-op kernel time (of 170.705 ms mean):
+        MoE                     35 calls    5596.052 ms
+    [profile] expanded per-op kernel time (of 150.236 ms mean):
+        GroupedMatMul           70 calls    5560.938 ms
+        QuickGelu               35 calls       7.979 ms
+        Reshape                105 calls       5.304 ms
+        ReduceSum               70 calls       5.086 ms
+        Mul                     35 calls       3.258 ms
+        Softmax                 35 calls       2.174 ms
+        TopK                    35 calls       2.087 ms
+        Div                     35 calls       1.742 ms
+        Unsqueeze               35 calls       1.678 ms
+mixtral-silu        silu    prefill/compute     cpu     1024  4096  14336    8  2   1416.884    868.665    0.61x    4.18e-07 yes
+    [profile] fused per-op kernel time (of 1419.149 ms mean):
+        MoE                     35 calls   48702.332 ms
+    [profile] expanded per-op kernel time (of 865.493 ms mean):
+        GroupedMatMul           70 calls   29823.334 ms
+        QuickGelu               35 calls     190.888 ms
+        Mul                     35 calls      51.940 ms
+        ReduceSum               70 calls      35.108 ms
+        TopK                    35 calls       6.473 ms
+        Reshape                105 calls       5.014 ms
+        Softmax                 35 calls       4.323 ms
+        Div                     35 calls       3.810 ms
+        Unsqueeze               35 calls       1.596 ms
+mixtral-swiglu      swiglu  prefill/compute     cpu     1024  4096  14336    8  2   2064.377   1268.253    0.61x    3.77e-07 yes
+    [profile] fused per-op kernel time (of 2064.550 ms mean):
+        MoE                     35 calls   72821.999 ms
+    [profile] expanded per-op kernel time (of 1268.818 ms mean):
+        GroupedMatMul           70 calls   44501.936 ms
+        Split                   35 calls     494.709 ms
+        Mul                     70 calls     304.112 ms
+        QuickGelu               35 calls     184.412 ms
+        ReduceSum               70 calls      35.628 ms
+        Reshape                140 calls       6.414 ms
+        TopK                    35 calls       5.781 ms
+        Softmax                 35 calls       3.862 ms
+        Div                     35 calls       3.386 ms
+        Squeeze                 70 calls       3.247 ms
+        Unsqueeze               35 calls       1.393 ms
+switch-top1-silu    silu    prefill/compute     cpu     1024   768   3072  128  1    116.803    100.067    0.86x    3.96e-07 yes
+    [profile] fused per-op kernel time (of 117.226 ms mean):
+        MoE                     35 calls    4360.832 ms
+    [profile] expanded per-op kernel time (of 99.981 ms mean):
+        GroupedMatMul           70 calls    5365.206 ms
+        QuickGelu               35 calls      20.441 ms
+        TopK                    35 calls       7.981 ms
+        ReduceSum               70 calls       7.407 ms
+        Mul                     35 calls       5.805 ms
+        Reshape                105 calls       5.153 ms
+        Softmax                 35 calls       3.900 ms
+        Div                     35 calls       1.690 ms
+        Unsqueeze               35 calls       1.415 ms
