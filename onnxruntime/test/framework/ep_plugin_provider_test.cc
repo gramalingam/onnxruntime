@@ -11,14 +11,18 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <string>
+
 #include "gsl/gsl"
 #include "gtest/gtest.h"
 
 #include "core/common/logging/sinks/file_sink.h"
 #include "core/common/path_string.h"
 #include "core/framework/config_options.h"
+#include "core/framework/data_types.h"
 #include "core/framework/kernel_def_builder.h"
 #include "core/framework/op_kernel.h"
+#include "core/framework/op_kernel_context.h"
 #include "core/framework/plugin_data_transfer.h"
 #include "core/framework/resource_accountant.h"
 #include "core/framework/stream_handles.h"
@@ -36,6 +40,50 @@
 #include "test/util/include/test_environment.h"
 
 namespace onnxruntime::test {
+
+namespace {
+
+struct OpaqueValueCallbackState {
+  int created = 0;
+  int released = 0;
+};
+
+void* ORT_API_CALL CreateOpaqueValue(void* user_data) {
+  auto& state = *static_cast<OpaqueValueCallbackState*>(user_data);
+  ++state.created;
+  return new int(42);
+}
+
+void ORT_API_CALL ReleaseOpaqueValue(void* user_data, void* value) {
+  auto& state = *static_cast<OpaqueValueCallbackState*>(user_data);
+  ++state.released;
+  delete static_cast<int*>(value);
+}
+
+class TestOpaqueKernelContext final : public OpKernelContext {
+ public:
+  TestOpaqueKernelContext(const NonTensorTypeBase* type, const logging::Logger& logger)
+      : OpKernelContext(nullptr, logger, nullptr), type_(type) {
+    type_->CreateOrtValue(input_);
+    type_->CreateOrtValue(output_);
+  }
+
+  int InputCount() const override { return 1; }
+  int OutputCount() const override { return 1; }
+  MLDataType InputType(int /*index*/) const override { return type_; }
+  MLDataType OutputType(int /*index*/) const override { return type_; }
+
+ protected:
+  const OrtValue* GetInputMLValue(int /*index*/) const override { return &input_; }
+  OrtValue* GetOrCreateOutputMLValue(int /*index*/) override { return &output_; }
+
+ private:
+  const NonTensorTypeBase* type_;
+  OrtValue input_;
+  OrtValue output_;
+};
+
+}  // namespace
 
 // Helper class to access public ORT APIs.
 struct ApiPtrs {
@@ -1094,6 +1142,70 @@ TEST(PluginExecutionProviderTest, IsConcurrentRunSupported) {
     ASSERT_THROW(ep->ConcurrentRunSupported(), OnnxRuntimeException);
   }
 #endif  // !defined(ORT_NO_EXCEPTIONS)
+}
+
+TEST(PluginExecutionProviderTest, RegisterOpaqueDataType) {
+  const auto& ep_api = Ort::GetEpApi();
+  OpaqueValueCallbackState callback_state;
+  const OrtDataType* type = nullptr;
+  constexpr char domain[] = "com.microsoft.onnxruntime.test.plugin";
+  constexpr char name[] = "OpaqueValue";
+  const std::string type_string = "opaque(" + std::string(domain) + "," + name + ")";
+
+  ASSERT_ORTSTATUS_OK(ep_api.RegisterOpaqueDataType(domain, name, sizeof(int), CreateOpaqueValue,
+                                                    ReleaseOpaqueValue, &callback_state, &type));
+  ASSERT_NE(type, nullptr);
+  EXPECT_EQ(DataTypeImpl::GetDataType(type_string), reinterpret_cast<MLDataType>(type));
+
+  {
+    TestOpaqueKernelContext context(reinterpret_cast<const NonTensorTypeBase*>(type),
+                                    DefaultLoggingManager().DefaultLogger());
+    EXPECT_EQ(callback_state.created, 2);
+
+    const void* input_value = nullptr;
+    ASSERT_ORTSTATUS_OK(ep_api.KernelContext_GetOpaqueInput(
+        reinterpret_cast<const OrtKernelContext*>(&context), 0, type, &input_value));
+    ASSERT_NE(input_value, nullptr);
+    EXPECT_EQ(*static_cast<const int*>(input_value), 42);
+
+    void* output_value = nullptr;
+    ASSERT_ORTSTATUS_OK(ep_api.KernelContext_GetOpaqueOutput(
+        reinterpret_cast<OrtKernelContext*>(&context), 0, type, &output_value));
+    ASSERT_NE(output_value, nullptr);
+    EXPECT_EQ(*static_cast<const int*>(output_value), 42);
+
+    const auto* expected_type = reinterpret_cast<MLDataType>(type);
+    const auto* input = context.GetInputOrtValue(0);
+    auto* output = context.GetOrCreateOutputOrtValue(0);
+    EXPECT_EQ(input->GetOpaqueData(expected_type), input_value);
+    EXPECT_EQ(output->GetMutableOpaqueData(expected_type), output_value);
+    *static_cast<int*>(output->GetMutableOpaqueData(expected_type)) = 43;
+    EXPECT_EQ(*static_cast<const int*>(output->GetOpaqueData(expected_type)), 43);
+
+#if !defined(ORT_NO_EXCEPTIONS)
+    EXPECT_THROW(input->GetOpaqueData(nullptr), OnnxRuntimeException);
+    EXPECT_THROW(output->GetMutableOpaqueData(nullptr), OnnxRuntimeException);
+    const auto tensor_type = DataTypeImpl::GetType<Tensor>();
+    EXPECT_THROW(input->GetOpaqueData(tensor_type), OnnxRuntimeException);
+    EXPECT_THROW(output->GetMutableOpaqueData(tensor_type), OnnxRuntimeException);
+
+    OrtValue empty;
+    EXPECT_THROW(empty.GetOpaqueData(expected_type), OnnxRuntimeException);
+    EXPECT_THROW(empty.GetMutableOpaqueData(expected_type), OnnxRuntimeException);
+    empty.Init(nullptr, expected_type, static_cast<DeleteFunc>([](void*) {}));
+    EXPECT_THROW(empty.GetOpaqueData(expected_type), OnnxRuntimeException);
+    EXPECT_THROW(empty.GetMutableOpaqueData(expected_type), OnnxRuntimeException);
+
+    OrtValue tensor;
+    tensor.Init(nullptr, tensor_type, static_cast<DeleteFunc>([](void*) {}));
+    EXPECT_THROW(tensor.GetOpaqueData(tensor_type), OnnxRuntimeException);
+    EXPECT_THROW(tensor.GetMutableOpaqueData(tensor_type), OnnxRuntimeException);
+#endif
+  }
+  EXPECT_EQ(callback_state.released, 2);
+
+  ASSERT_ORTSTATUS_OK(ep_api.UnregisterOpaqueDataType(type));
+  EXPECT_EQ(DataTypeImpl::GetDataType(type_string), nullptr);
 }
 
 // Tests for the Ort::OpSchema C++ wrapper API and Ort::GetOpSchema free function.
