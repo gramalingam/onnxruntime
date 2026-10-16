@@ -262,5 +262,9 @@ class PatternRewriter final : public GraphTransformer {
 // Float32 examples adapted from genuine ONNXScript rules; EP eligibility is controlled by Options.
 Rules MakeExampleRules();
 
+// Proof-of-concept float32 fusions using local.moe.GroupedMatMul (RFC onnx/onnx#8193).
+// Apply to a resolved graph before function inlining or generic MLP/MatMul fusions.
+Rules MakeMoEFusionRules();
+
 }  // namespace rewrite
 }  // namespace onnxruntime
