@@ -301,6 +301,74 @@ TEST(MobiusStatefulFusionTests, SiblingMatchingIsExplicitAndReferenceAgrees) {
   }
 }
 
+TEST(MobiusStatefulFusionTests, SiblingEligibilityAfterConsumerRemovalWithinOneRun) {
+  const PatternLibrary library(R"(
+    pattern Siblings(x) {
+      a=Identity(x)
+      n=Neg(x)
+      return a,n
+    }
+  )");
+  for (bool indexed : {false, true}) {
+    for (bool reverse_branches : {false, true}) {
+      for (bool initializer : {false, true}) {
+        for (size_t limit : {size_t{1}, size_t{10}}) {
+          SCOPED_TRACE(MakeString("indexed=", indexed, " reverse=", reverse_branches,
+                                  " initializer=", initializer, " limit=", limit));
+          TestGraph test;
+          auto& b = test.builder;
+          auto* x = initializer ? b.MakeInitializer<float>({4}, -1.0f, 1.0f)
+                                : b.MakeInput<float>({4}, -1.0f, 1.0f);
+          b.AddNode("Identity", {x}, {b.MakeOutput()});
+          auto add_duplicate_branch = [&]() {
+            auto* duplicate = b.MakeIntermediate();
+            b.AddNode("Identity", {x}, {duplicate});
+            b.AddNode("Abs", {duplicate}, {b.MakeOutput()});
+          };
+          if (!reverse_branches) add_duplicate_branch();
+          b.AddNode("Neg", {x}, {b.MakeOutput()});
+          if (reverse_branches) add_duplicate_branch();
+          ASSERT_STATUS_OK(test.graph.Resolve());
+          size_t eligible_calls = 0;
+          Rules rules;
+          rules.emplace_back(
+              "siblings", library.GetPattern("Siblings", true),
+              "(x)=>{a=Identity(x);n=Neg(x);sink=Add(a,n);return a,n;}",
+              [&](const Graph&, Match&) {
+                ++eligible_calls;
+                return false;
+              },
+              InlinedVector<OpsetRequirement, 1>{{kOnnxDomain, 17, 24}});
+          rules.emplace_back(
+              "remove_identity", "(x)=>{a=Identity(x);out=Abs(a);return out;}",
+              "(x)=>Abs(x)", Rule::CheckAndBind{},
+              InlinedVector<OpsetRequirement, 1>{{kOnnxDomain, 17, 24}});
+          Options options;
+          options.indexed = indexed;
+          options.max_iterations = limit;
+          PatternRewriter rewriter(std::move(rules), options);
+          Statistics stats;
+          ASSERT_STATUS_OK(rewriter.Run(test.graph, stats));
+          EXPECT_EQ(stats.rewrites, 1u);
+          EXPECT_EQ(Count(test.graph, "Identity"), 1u);
+          EXPECT_EQ(stats.iteration_limit_reached, limit == 1);
+          EXPECT_LE(stats.iterations, limit);
+          if (limit > 1) {
+            EXPECT_EQ(stats.iterations, 2u);
+            EXPECT_LE(stats.visited, 8u);
+            EXPECT_GT(eligible_calls, 0u);
+            const auto first_calls = eligible_calls;
+            ASSERT_STATUS_OK(test.graph.Resolve());
+            ASSERT_STATUS_OK(rewriter.Run(test.graph, stats));
+            EXPECT_EQ(stats.rewrites, 0u);
+            EXPECT_GT(eligible_calls, first_calls);
+          }
+        }
+      }
+    }
+  }
+}
+
 TEST(MobiusStatefulFusionTests, ScanBodyRemainsIneligibleBeforeCallback) {
   TestGraph test;
   auto& b = test.builder;

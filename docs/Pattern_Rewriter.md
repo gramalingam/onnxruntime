@@ -508,6 +508,11 @@ All ordinary dtype, constant, deletion-boundary, provider and cycle checks still
 apply. Subgraph owners and implicit inputs remain forbidden. Replacement recipes
 still require a single sink, which may expose multiple outputs. This bounded
 facility does not provide general multi-root search or nested-graph matching.
+After a batch that performs rewrites, applicable sibling roots are requeued once
+in the deduplicated next-batch worklist: changing consumers of a graph input or
+initializer can remove ambiguity without changing a producer. The existing
+iteration limit still applies. Single-root-only runs retain their original
+invalidation behavior.
 
 ### Types in the supplied examples
 

@@ -2094,6 +2094,14 @@ Status PatternRewriter::Run(Graph& graph, Statistics& statistics) const {
       report(id, std::numeric_limits<NodeIndex>::max(), FailureStage::Opset, "Missing or unsupported domain import.");
   }
   if (applicable_rules.empty()) return Status::OK();
+  InlinedHashSet<std::string> sibling_roots;
+  for (size_t id : applicable_rules) {
+    const auto& pattern = rules_[id].pattern;
+    if (pattern.AllowsSiblingOutputs()) {
+      const auto& root = pattern.Nodes().back().op;
+      sibling_roots.insert(Key(root.name, root.domain));
+    }
+  }
   InlinedVector<InlinedVector<size_t>, 1> applicable_groups;
   for (const auto& group : groups_) {
     InlinedVector<size_t> ids;
@@ -2237,6 +2245,14 @@ Status PatternRewriter::Run(Graph& graph, Statistics& statistics) const {
       }
     }
     if (options_.match_only || statistics.rewrites == rewrites_before) break;
+    // Sibling eligibility depends on consumer sets, including producerless inputs.
+    // Revisit these roots once per changed batch, not once per rewrite.
+    if (!sibling_roots.empty()) {
+      for (const auto& node : graph.Nodes()) {
+        if (sibling_roots.count(Key(node.OpType(), node.Domain())) && queued.insert(node.Index()).second)
+          next_worklist.push_back(node.Index());
+      }
+    }
     worklist = std::move(next_worklist);
     if (iteration + 1 == options_.max_iterations && !worklist.empty())
       statistics.iteration_limit_reached = true;
