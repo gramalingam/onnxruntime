@@ -7,8 +7,11 @@
 
 #include "gtest/gtest.h"
 #include "core/graph/model.h"
+#include "core/optimizer/constant_folding.h"
+#include "core/optimizer/initializer.h"
 #include "test/test_environment.h"
 #include "test/util/include/asserts.h"
+#include "test/util/include/default_providers.h"
 
 namespace onnxruntime::test {
 #ifndef DISABLE_CONTRIB_OPS
@@ -76,6 +79,81 @@ TEST(MoEFusionRulesTests, GroupedSoftmaxTopKNormalized) {
 TEST(MoEFusionRulesTests, GroupedSoftmaxTopKDifferentExpertCount) {
   for (bool indexed : {true, false})
     CheckGroupedModel(ORT_TSTR("testdata/transform/fusion/mobius_moe_softmax_topk.onnx"), indexed, 1, 0);
+}
+
+TEST(MoEFusionRulesTests, PacksInterleavedCPUWeights) {
+  constexpr int64_t experts = 3, hidden = 8, intermediate = 12;
+  for (bool indexed : {true, false}) {
+    SCOPED_TRACE(indexed);
+    std::shared_ptr<Model> model;
+    const auto& logger = DefaultLoggingManager().DefaultLogger();
+    ASSERT_STATUS_OK(Model::Load(ORT_TSTR("testdata/transform/fusion/mobius_moe_topk.onnx"),
+                                 model, nullptr, logger));
+    auto& graph = model->MainGraph();
+    auto replace_weights = [&](const char* name, const std::array<int64_t, 3>& dims, float base) {
+      ONNX_NAMESPACE::TensorProto tensor;
+      tensor.set_name(name);
+      tensor.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+      for (auto dim : dims) tensor.add_dims(dim);
+      for (int64_t i = 0; i < experts * hidden * intermediate; ++i)
+        tensor.add_float_data(base + static_cast<float>(i));
+      graph.RemoveInitializedTensor(name);
+      graph.AddInitializedTensor(tensor);
+    };
+    replace_weights("expert_gate", {experts, hidden, intermediate}, 1000.0f);
+    replace_weights("expert_up", {experts, hidden, intermediate}, 2000.0f);
+    replace_weights("expert_down", {experts, intermediate, hidden}, 3000.0f);
+    ASSERT_STATUS_OK(graph.Resolve());
+    rewrite::Statistics stats;
+    ASSERT_STATUS_OK(rewrite::PatternRewriter(rewrite::MakeMoEFusionRules(), {.indexed = indexed}).Run(graph, stats));
+    ASSERT_EQ(stats.rewrites, 1u);
+    ASSERT_STATUS_OK(graph.Resolve());
+
+    auto cpu = DefaultCpuExecutionProvider();
+    const ConfigOptions config;
+    ConstantFolding folding(*cpu, false, config);
+    bool modified = false;
+    ASSERT_STATUS_OK(folding.Apply(graph, modified, logger));
+    ASSERT_TRUE(modified);
+    ASSERT_STATUS_OK(graph.Resolve());
+    ASSERT_EQ(Count(graph, "MoE", kMSDomain), 1u);
+    for (const auto& node : graph.Nodes()) {
+      if (node.OpType() != "MoE" || node.Domain() != kMSDomain) continue;
+      const auto* fc1 = node.InputDefs()[2];
+      const auto* fc2 = node.InputDefs()[4];
+      ASSERT_NE(fc1->Shape(), nullptr);
+      ASSERT_NE(fc2->Shape(), nullptr);
+      ASSERT_EQ(fc1->Shape()->dim_size(), 3);
+      ASSERT_EQ(fc2->Shape()->dim_size(), 3);
+      EXPECT_EQ(fc1->Shape()->dim(0).dim_value(), experts);
+      EXPECT_EQ(fc1->Shape()->dim(1).dim_value(), 2 * intermediate);
+      EXPECT_EQ(fc1->Shape()->dim(2).dim_value(), hidden);
+      EXPECT_EQ(fc2->Shape()->dim(0).dim_value(), experts);
+      EXPECT_EQ(fc2->Shape()->dim(1).dim_value(), hidden);
+      EXPECT_EQ(fc2->Shape()->dim(2).dim_value(), intermediate);
+      const auto* fc1_tensor = graph.GetInitializer(fc1->Name(), false);
+      const auto* fc2_tensor = graph.GetInitializer(fc2->Name(), false);
+      ASSERT_NE(fc1_tensor, nullptr);
+      ASSERT_NE(fc2_tensor, nullptr);
+      Initializer fc1_data(graph, *fc1_tensor, graph.ModelPath());
+      Initializer fc2_data(graph, *fc2_tensor, graph.ModelPath());
+      ASSERT_EQ(fc1_data.size(), experts * 2 * intermediate * hidden);
+      ASSERT_EQ(fc2_data.size(), experts * hidden * intermediate);
+      const auto* packed = fc1_data.data<float>();
+      const auto* projected = fc2_data.data<float>();
+      for (int64_t e = 0; e < experts; ++e) {
+        for (int64_t i = 0; i < intermediate; ++i) {
+          for (int64_t h = 0; h < hidden; ++h) {
+            const auto source = static_cast<float>((e * hidden + h) * intermediate + i);
+            EXPECT_EQ(packed[(e * 2 * intermediate + 2 * i) * hidden + h], 1000.0f + source);
+            EXPECT_EQ(packed[(e * 2 * intermediate + 2 * i + 1) * hidden + h], 2000.0f + source);
+            EXPECT_EQ(projected[(e * hidden + h) * intermediate + i],
+                      3000.0f + static_cast<float>((e * intermediate + i) * hidden + h));
+          }
+        }
+      }
+    }
+  }
 }
 
 TEST(MoEFusionRulesTests, RejectsUnsupportedVariantsAndBoundaries) {
@@ -202,6 +280,8 @@ TEST(MoEFusionRulesTests, ComposedRoutingViews) {
           if (node.OpType() == "TopK") EXPECT_EQ(node.InputDefs()[1], route.valueOf("top_k"));
         }
         EXPECT_EQ(route.valueOf("indices"), match.instance("experts").valueOf("indices"));
+        for (const auto* port : {"gate", "up", "down", "flat_shape", "output_shape"})
+          EXPECT_EQ(match.instance("experts").valueOf(port), match.valueOf(port));
         const auto activation = match.instance("experts").instance("activation");
         EXPECT_EQ(activation.definition(), "SwiGLU");
         EXPECT_NE(activation.valueOf("product"), nullptr);

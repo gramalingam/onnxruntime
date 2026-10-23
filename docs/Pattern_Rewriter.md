@@ -46,14 +46,17 @@ different pattern strings for each routing choice:
   `Softmax(TopK(logits))`, `TopK(Softmax(logits))`, and the latter divided by the
   sum of selected probabilities. `NormalizedSoftmaxTopK` calls `SoftmaxTopK`
   directly, passing the same immutable `top_k` interface input explicitly.
-- `Experts` is implemented by `GroupedExperts`, which discovers gate/up/down
-  weights and reshape constants. It calls the ordinary `SwiGLU` body for the
+- `Experts` is implemented by `GroupedExperts`, with explicit inputs for
+  gate/up/down weights and reshape constants. It calls the ordinary `SwiGLU` body for the
   gated `Swish(alpha=1)` activation. `MoEPattern` calls the routing and expert bodies,
   weights the expert outputs, and reduces over selected slots.
 
 This library uses PascalCase for all interface and pattern definitions
 (bodies and alternatives alike), and snake_case for tensor and instance names.
 Capitalization is a local naming convention, not a distinction in DSL semantics.
+`route.indices` selects the named `indices` output of the `route` pattern
+instance; it is a tensor argument, not an attribute or an implicit parameter.
+`GroupedExperts` receives every interface input explicitly at its call site.
 
 Handwritten `RoutingView` and `ExpertsView` use scoped `BindingView` lookups;
 the routing view reads common ports directly, while the scoped-view tests also
@@ -96,6 +99,9 @@ expert body, embeds the local function, and downloads no checkpoints.
 raw-logit and attribute preservation, resolve/reload/idempotence, scoped nested
 views, and rejection/error cases in indexed and reference modes. These remain
 structural tests; end-to-end numerical comparison is deferred.
+The CPU packing regression separately constant-folds the generated weight
+subgraph with distinct gate/up/down entries and checks every interleaved FC1
+and transposed FC2 element in both matcher modes.
 
 ## Example: HardSigmoid followed by Mul
 

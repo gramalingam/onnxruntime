@@ -39,11 +39,11 @@ constexpr const char* kMoELibrary = R"(
     return product
   }
 
-  interface Experts(x:float[M,H], indices:int64[M,K]) -> (output:float[M,K,H])
+  interface Experts(x:float[M,H], indices:int64[M,K],
+      gate:float[E,H,I], up:float[E,H,I], down:float[E,I,H],
+      flat_shape:const int64[2], output_shape:const int64[3]) -> (output:float[M,K,H])
 
-  pattern GroupedExperts implements Experts:
-      (gate:float[E,H,I], up:float[E,H,I], down:float[E,I,H],
-       flat_shape:const int64[2], output_shape:const int64[3]) -> {
+  pattern GroupedExperts implements Experts {
     g = local.moe.GroupedMatMul(x, gate, indices)
     u = local.moe.GroupedMatMul(x, up, indices)
     activation = SwiGLU(g,u)
@@ -54,9 +54,11 @@ constexpr const char* kMoELibrary = R"(
     return output
   }
 
-  pattern MoEPattern(x:float[M,H], logits:float[M,E], top_k:const int64[1]) {
+  pattern MoEPattern(x:float[M,H], logits:float[M,E], top_k:const int64[1],
+      gate:float[E,H,I], up:float[E,H,I], down:float[E,I,H],
+      flat_shape:const int64[2], output_shape:const int64[3]) {
     route = RoutingForms(logits, top_k)
-    experts = GroupedExperts(x,route.indices)
+    experts = GroupedExperts(x, route.indices, gate, up, down, flat_shape, output_shape)
     expanded = Unsqueeze(route.weights, [-1])
     weighted = Mul(experts.output, expanded)
     return ReduceSum(weighted, [1], keepdims=0, noop_with_empty_axes=0)
@@ -129,7 +131,6 @@ bool CheckMoE(const Graph& graph, Match& match) {
   const RoutingView route(match.instance("route"));
   const ExpertsView experts(match.instance("experts"));
   const auto* gate = experts.gate->Shape();
-  if (!gate || gate->dim_size() != 3) return match.Reject("MoE requires rank-3 expert weights.");
   std::array<int64_t, 3> dims;
   for (int i = 0; i < 3; ++i) {
     if (!gate->dim(i).has_dim_value() || gate->dim(i).dim_value() <= 0)
