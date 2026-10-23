@@ -4689,6 +4689,55 @@ TEST(PatternRewriterTests, ExplicitOutputBindingsPreserveAliasesAndCallBudget) {
   }
 }
 
+TEST(PatternRewriterTests, ExplicitOutputAliasAnnotationsConjoin) {
+  const PatternLibrary library(R"(
+    pattern InputPair(x) { return (a=x,b=x) }
+    pattern OutputPair(x) { y=Identity(x); return (a=y,b=y) }
+    pattern InputConflict(x:float[2]) { a:float[3],b=InputPair(x); return Add(a,b) }
+    pattern InputCompatible(x:float[2]) { a:float[2],b=InputPair(x); return Add(a,b) }
+    pattern OutputConflict(x) { a:float[2],b:float[3]=OutputPair(x); return Add(a,b) }
+    pattern OutputCompatible(x) { a:float[2],b:float[2]=OutputPair(x); return Add(a,b) }
+    pattern RepeatedConflict(x:float[]) { a:float[2],b:float[3]=InputPair(x); return Add(a,b) }
+    pattern RepeatedCompatible(x:float[]) { a:float[2],b:float[2]=InputPair(x); return Add(a,b) }
+  )");
+  for (const char* name : {"InputConflict", "InputCompatible", "OutputConflict", "OutputCompatible",
+                           "RepeatedConflict", "RepeatedCompatible"}) {
+    for (bool indexed : {true, false}) {
+      for (int64_t size : {2, 3}) {
+        SCOPED_TRACE(name);
+        SCOPED_TRACE(indexed);
+        SCOPED_TRACE(size);
+        const bool produced = std::string_view(name).find("Output") == 0;
+        const bool accepted = std::string_view(name).find("Compatible") != std::string_view::npos && size == 2;
+        TestGraph test;
+        auto& b = test.builder;
+        auto* x = b.MakeInput<float>({size}, 0.0f, 1.0f);
+        auto* alias = x;
+        if (produced) {
+          alias = b.MakeIntermediate();
+          b.AddNode("Identity", {x}, {alias});
+        }
+        b.AddNode("Add", {alias, alias}, {b.MakeOutput()});
+        b.SetGraphOutputs();
+        ASSERT_STATUS_OK(test.graph.Resolve());
+        size_t callbacks = 0;
+        auto check = [&](const Graph&, Match& match) {
+          ++callbacks;
+          EXPECT_EQ(match.valueOf("a"), alias);
+          EXPECT_EQ(match.valueOf("b"), alias);
+          return true;
+        };
+        Rule rule{"AliasConstraints", library.GetPattern(name), "(x)=>Neg(x)", check, {{kOnnxDomain, 17, 17}}};
+        Statistics stats;
+        ASSERT_STATUS_OK(PatternRewriter({rule}, {.indexed = indexed}).Run(test.graph, stats));
+        EXPECT_EQ(stats.rewrites, accepted ? 1u : 0u);
+        EXPECT_EQ(callbacks, accepted ? 1u : 0u);
+        ASSERT_STATUS_OK(test.graph.Resolve());
+      }
+    }
+  }
+}
+
 TEST(PatternRewriterTests, InterfacePortsCannotBecomeAttributes) {
   for (const char* text : {
            "interface I(x,alpha:float)->(y) pattern P implements I {y=LeakyRelu(x,alpha=alpha);return y}",

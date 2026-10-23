@@ -1058,7 +1058,9 @@ weights, indices = RoutingForms(logits, top_k)
 Names bind directly to the corresponding output `NodeArg`s in declared output
 order, just as for multi-output ONNX operators. The number of names must match
 the number of outputs; duplicate or already-defined names are rejected.
-Annotations on these names constrain the bound output tensors. Nested calls and
+Annotations on these names constrain the bound output tensors conjunctively,
+including when multiple outputs alias each other or a previously annotated input.
+Nested calls and
 alternatives retain occurrence-local internal bindings without exposing an
 instance under any of the output names. Checkers use `match.valueOf("weights")`,
 not `match.instance("weights")`. Internal generated scopes are private.
