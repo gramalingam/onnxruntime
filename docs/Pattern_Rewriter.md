@@ -54,14 +54,16 @@ different pattern strings for each routing choice:
 This library uses PascalCase for all interface and pattern definitions
 (bodies and alternatives alike), and snake_case for tensor and instance names.
 Capitalization is a local naming convention, not a distinction in DSL semantics.
-`route.indices` selects the named `indices` output of the `route` pattern
-instance; it is a tensor argument, not an attribute or an implicit parameter.
+`weights, indices = RoutingForms(logits, top_k)` binds the two output tensors
+directly to local names, in interface output order. The checker reads them with
+`match.valueOf("weights")` and `match.valueOf("indices")`, without a routing
+instance view.
 `GroupedExperts` receives every interface input explicitly at its call site.
 
 Handwritten `RoutingView` and `ExpertsView` use scoped `BindingView` lookups;
-the routing view reads common ports directly, while the scoped-view tests also
-inspect selected alternatives and the normalized form's nested `selected`
-instance. Shared C++ checks decode immutable
+the routing view reads directly bound tensors, and the expert view reads the
+named expert instance. The matched weights producer distinguishes unnormalized
+TopK weights from the two normalized forms. Shared C++ checks decode immutable
 int64 tensors with `ReadConstantTensor`, propagating malformed-payload errors.
 They require opset 24 float32, rank-2 token inputs, positive static expert,
 hidden and intermediate dimensions, matching token dimensions proven by equal
@@ -96,8 +98,8 @@ generator records Mobius revision `b1e9c8e9dec1dfa206183f957e77d07cfb734df2`,
 uses real Mobius routing with deterministic synthetic weights and a grouped
 expert body, embeds the local function, and downloads no checkpoints.
 `MoEFusionRulesTests.*` checks all routing forms and different expert counts,
-raw-logit and attribute preservation, resolve/reload/idempotence, scoped nested
-views, and rejection/error cases in indexed and reference modes. These remain
+raw-logit and attribute preservation, resolve/reload/idempotence, explicit routing
+output bindings, scoped expert views, and rejection/error cases in indexed and reference modes. These remain
 structural tests; end-to-end numerical comparison is deferred.
 The CPU packing regression separately constant-folds the generated weight
 subgraph with distinct gate/up/down entries and checks every interleaved FC1
@@ -945,8 +947,23 @@ Inline operator or
 subgraph alternative spellings are not supported; existing `|` type
 annotations are unchanged.
 
-Calls require one assigned instance name. Use `act.product` for common outputs
-and C++ views for concrete internals. A single-output instance additionally
+Multi-output calls can bind output tensors explicitly:
+
+```text
+weights, indices = RoutingForms(logits, top_k)
+```
+
+Names bind directly to the corresponding output `NodeArg`s in declared output
+order, just as for multi-output ONNX operators. The number of names must match
+the number of outputs; duplicate or already-defined names are rejected.
+Annotations on these names constrain the bound output tensors. Nested calls and
+alternatives retain occurrence-local internal bindings without exposing an
+instance under any of the output names. Checkers use `match.valueOf("weights")`,
+not `match.instance("weights")`. Internal generated scopes are private.
+
+The existing named-instance form remains supported for inspecting concrete
+internals: use `act=Forms(g,u)`, `act.product` for common outputs, and C++ views.
+A single-output instance additionally
 allows `act` as shorthand for its output. Tensor handles, attribute captures,
 dimensions and element-type variables are remapped into the call occurrence.
 Two instances do not share a capture just because its local spelling is the

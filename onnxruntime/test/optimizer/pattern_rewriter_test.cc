@@ -3778,6 +3778,80 @@ TEST(PatternRewriterTests, PatternCompositionHygienicDimensionsAttributesAndComm
   ASSERT_STATUS_OK(test.graph.Resolve());
 }
 
+TEST(PatternRewriterTests, PatternCompositionExplicitOutputBindings) {
+  const PatternLibrary library(R"(
+    interface Pair(x:float[N]) -> (first:float[N], second:float[N])
+    pattern Positive implements Pair {
+      a = Identity(x)
+      b = Neg(x)
+      return (second=b, first=a)
+    }
+    pattern Negative implements Pair {
+      a = Neg(x)
+      b = Identity(x)
+      return a, b
+    }
+    pattern Forms = Positive | Negative
+    pattern Nested implements Pair {
+      a, b = Forms(x)
+      return a, b
+    }
+    pattern P(x,z) {
+      a:float[2], b = Nested(x)
+      c, d = Nested(z)
+      left = Add(a,b)
+      right = Add(c,d)
+      return Add(left,right)
+    }
+  )");
+  for (bool indexed : {true, false}) {
+    TestGraph test;
+    auto& b = test.builder;
+    auto* x = b.MakeInput<float>({2}, 0.0f, 1.0f);
+    auto* z = b.MakeInput<float>({2}, 0.0f, 1.0f);
+    auto* a = b.MakeIntermediate();
+    auto* second = b.MakeIntermediate();
+    auto* c = b.MakeIntermediate();
+    auto* d = b.MakeIntermediate();
+    auto* left = b.MakeIntermediate();
+    auto* right = b.MakeIntermediate();
+    b.AddNode("Identity", {x}, {a});
+    b.AddNode("Neg", {x}, {second});
+    b.AddNode("Neg", {z}, {c});
+    b.AddNode("Identity", {z}, {d});
+    b.AddNode("Add", {a, second}, {left});
+    b.AddNode("Add", {c, d}, {right});
+    b.AddNode("Add", {left, right}, {b.MakeOutput()});
+    b.SetGraphOutputs();
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    size_t callbacks = 0;
+    auto check = [&](const Graph&, Match& match) {
+      ++callbacks;
+      EXPECT_EQ(match.valueOf("a"), a);
+      EXPECT_EQ(match.valueOf("b"), second);
+      EXPECT_EQ(match.valueOf("c"), c);
+      EXPECT_EQ(match.valueOf("d"), d);
+      EXPECT_THROW(match.instance("a"), OnnxRuntimeException);
+      EXPECT_THROW(match.update("a", {}), OnnxRuntimeException);
+      return true;
+    };
+    Statistics stats;
+    Rule rule{"Explicit", library.GetPattern("P"), "(x,z)=>Add(x,z)", check, {{kOnnxDomain, 17, 17}}};
+    ASSERT_STATUS_OK(PatternRewriter({rule}, {.match_only = true, .indexed = indexed}).Run(test.graph, stats));
+    EXPECT_EQ(stats.matches, 1u);
+    EXPECT_EQ(callbacks, 1u);
+  }
+  for (const auto* body : {
+           "a,b,c=PairBody(x);return Add(a,b)",
+           "a,a=PairBody(x);return Identity(a)",
+           "x,b=PairBody(x);return Add(x,b)",
+           "a,b=PairBody(x);a=Identity(b);return Add(a,b)"}) {
+    const std::string text =
+        "pattern PairBody(x){a=Identity(x);b=Neg(x);return a,b} pattern P(x){" + std::string(body) + "}";
+    EXPECT_THROW(PatternLibrary{text}, OnnxRuntimeException);
+  }
+}
+
 TEST(PatternRewriterTests, PatternCompositionIdentityPortsRemapAndInterfaceConstraintsConjoin) {
   PatternLibrary library(R"(
     interface Pass(x:float[N]) -> (y:float[N])

@@ -245,12 +245,12 @@ TEST(MoEFusionRulesTests, RejectsUnsupportedVariantsAndBoundaries) {
   }
 }
 
-TEST(MoEFusionRulesTests, ComposedRoutingViews) {
+TEST(MoEFusionRulesTests, ExplicitRoutingOutputBindings) {
   const std::array<PathString, 3> paths{
       ORT_TSTR("testdata/transform/fusion/mobius_moe_topk.onnx"),
       ORT_TSTR("testdata/transform/fusion/mobius_moe_softmax_topk.onnx"),
       ORT_TSTR("testdata/transform/fusion/mobius_moe_softmax_topk_normalized.onnx")};
-  const std::array<std::string_view, 3> members{"TopKSoftmax", "SoftmaxTopK", "NormalizedSoftmaxTopK"};
+  const std::array<std::string_view, 3> producers{"Softmax", "TopK", "Div"};
   for (size_t i = 0; i < paths.size(); ++i) {
     for (bool indexed : {true, false}) {
       std::shared_ptr<Model> model;
@@ -262,24 +262,17 @@ TEST(MoEFusionRulesTests, ComposedRoutingViews) {
       rules[0].check_and_bind = [&](const Graph& graph, rewrite::Match& match) {
         ++callbacks;
         EXPECT_EQ(match.bindings().definition(), "MoEPattern");
-        const auto route = match.instance("route");
-        EXPECT_EQ(route.definition(), "RoutingForms");
-        EXPECT_EQ(route.interfaceName(), "Routing");
-        EXPECT_EQ(route.alternative(), members[i]);
-        auto body = route.alternativeView();
-        EXPECT_EQ(body.definition(), members[i]);
-        EXPECT_EQ(route.valueOf("top_k"), match.valueOf("top_k"));
-        EXPECT_EQ(body.valueOf("top_k"), match.valueOf("top_k"));
-        if (i == 2) {
-          body = body.instance("selected");
-          EXPECT_EQ(body.definition(), "SoftmaxTopK");
-          EXPECT_EQ(body.interfaceName(), "Routing");
-        }
-        EXPECT_EQ(body.valueOf("top_k"), match.valueOf("top_k"));
+        const auto* weights = match.valueOf("weights");
+        const auto* indices = match.valueOf("indices");
+        EXPECT_EQ(graph.GetProducerNode(weights->Name())->OpType(), producers[i]);
         for (const auto& node : graph.Nodes()) {
-          if (node.OpType() == "TopK") EXPECT_EQ(node.InputDefs()[1], route.valueOf("top_k"));
+          if (node.OpType() == "TopK") {
+            EXPECT_EQ(node.InputDefs()[1], match.valueOf("top_k"));
+            EXPECT_EQ(node.OutputDefs()[1], indices);
+            if (i == 1) EXPECT_EQ(node.OutputDefs()[0], weights);
+          }
         }
-        EXPECT_EQ(route.valueOf("indices"), match.instance("experts").valueOf("indices"));
+        EXPECT_EQ(indices, match.instance("experts").valueOf("indices"));
         for (const auto* port : {"gate", "up", "down", "flat_shape", "output_shape"})
           EXPECT_EQ(match.instance("experts").valueOf(port), match.valueOf(port));
         const auto activation = match.instance("experts").instance("activation");

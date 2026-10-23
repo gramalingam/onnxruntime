@@ -25,10 +25,10 @@ constexpr const char* kMoELibrary = R"(
   }
 
   pattern NormalizedSoftmaxTopK implements Routing {
-    selected = SoftmaxTopK(logits, top_k)
-    sum = ReduceSum(selected.weights, [-1], keepdims=1, noop_with_empty_axes=0)
-    weights = Div(selected.weights, sum)
-    return (weights=weights, indices=selected.indices)
+    selected, indices = SoftmaxTopK(logits, top_k)
+    sum = ReduceSum(selected, [-1], keepdims=1, noop_with_empty_axes=0)
+    weights = Div(selected, sum)
+    return weights, indices
   }
 
   pattern RoutingForms = TopKSoftmax | SoftmaxTopK | NormalizedSoftmaxTopK
@@ -57,9 +57,9 @@ constexpr const char* kMoELibrary = R"(
   pattern MoEPattern(x:float[M,H], logits:float[M,E], top_k:const int64[1],
       gate:float[E,H,I], up:float[E,H,I], down:float[E,I,H],
       flat_shape:const int64[2], output_shape:const int64[3]) {
-    route = RoutingForms(logits, top_k)
-    experts = GroupedExperts(x, route.indices, gate, up, down, flat_shape, output_shape)
-    expanded = Unsqueeze(route.weights, [-1])
+    weights, indices = RoutingForms(logits, top_k)
+    experts = GroupedExperts(x, indices, gate, up, down, flat_shape, output_shape)
+    expanded = Unsqueeze(weights, [-1])
     weighted = Mul(experts.output, expanded)
     return ReduceSum(weighted, [1], keepdims=0, noop_with_empty_axes=0)
   }
@@ -71,11 +71,13 @@ struct RoutingView {
   const NodeArg* top_k;
   bool normalize;
 
-  explicit RoutingView(BindingView view)
-      : logits(view.valueOf("logits")), indices(view.valueOf("indices")), top_k(view.valueOf("top_k")), normalize(view.alternative() != "SoftmaxTopK") {
-    ORT_ENFORCE(view.interfaceName() == "Routing");
-    const auto member = view.alternative();
-    ORT_ENFORCE(member == "TopKSoftmax" || member == "SoftmaxTopK" || member == "NormalizedSoftmaxTopK");
+  explicit RoutingView(const Graph& graph, const Match& match)
+      : logits(match.valueOf("logits")), indices(match.valueOf("indices")), top_k(match.valueOf("top_k")) {
+    const auto* producer = graph.GetProducerNode(match.valueOf("weights")->Name());
+    ORT_ENFORCE(producer && producer->Domain() == kOnnxDomain &&
+                    (producer->OpType() == "TopK" || producer->OpType() == "Softmax" || producer->OpType() == "Div"),
+                "Unexpected matched routing weights producer.");
+    normalize = producer->OpType() != "TopK";
   }
 };
 
@@ -128,7 +130,7 @@ void BindInteger(Match& match, const char* name, int64_t value) {
 }
 
 bool CheckMoE(const Graph& graph, Match& match) {
-  const RoutingView route(match.instance("route"));
+  const RoutingView route(graph, match);
   const ExpertsView experts(match.instance("experts"));
   const auto* gate = experts.gate->Shape();
   std::array<int64_t, 3> dims;

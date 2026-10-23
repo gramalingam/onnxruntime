@@ -1434,8 +1434,10 @@ Status PatternParser::Declarations(InlinedVector<Definition, 1>& definitions) {
 
 Status PatternParser::PatternCall(const InlinedVector<std::string>& names, const Definition& definition) {
   ORT_RETURN_IF(definition.kind == Definition::Kind::Interface, Error("interfaces are not callable"));
-  ORT_RETURN_IF(names.size() != 1, Error("pattern calls require one named instance"));
-  const std::string& path = names.front();
+  const bool destructured = names.size() > 1;
+  ORT_RETURN_IF(names.empty() || (destructured && names.size() != definition.outputs.size()),
+                Error("pattern output count mismatch"));
+  const std::string path = destructured ? "$call" + std::to_string(radices_.size()) : names.front();
   ORT_RETURN_IF(pattern_.instances_.count(path), Error("duplicate pattern instance"));
   ORT_RETURN_IF_ERROR(Expect("("));
   InlinedVector<Value> inputs;
@@ -1542,7 +1544,12 @@ Status PatternParser::PatternCall(const InlinedVector<std::string>& names, const
     symbols_.insert_or_assign(output_name, output);
     last_outputs_.push_back(output);
   }
-  if (last_outputs_.size() == 1) {
+  if (destructured) {
+    for (size_t i = 0; i < names.size(); ++i) {
+      symbols_.emplace(names[i], last_outputs_[i]);
+      pattern_.aliases_.emplace(names[i], last_outputs_[i]);
+    }
+  } else if (last_outputs_.size() == 1) {
     symbols_.emplace(path, last_outputs_.front());
     pattern_.aliases_.emplace(path, last_outputs_.front());
   }
