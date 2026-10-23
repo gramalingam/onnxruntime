@@ -326,5 +326,10 @@ class PatternRewriter final : public GraphTransformer {
 // Float32 examples adapted from genuine ONNXScript rules; EP eligibility is controlled by Options.
 Rules MakeExampleRules();
 
+// Opt-in FP32 inverse of the opset-24 Mobius INT4 body, blocks 16/32/64/128/256. Not a default optimizer.
+Rules MakeMobiusMatMulNBitsRules();
+// CUDA FP16 W4A16 only; callers must accept the target kernel's accumulation/rounding policy.
+Rules MakeMobiusNvFp4Rules();
+
 }  // namespace rewrite
 }  // namespace onnxruntime
