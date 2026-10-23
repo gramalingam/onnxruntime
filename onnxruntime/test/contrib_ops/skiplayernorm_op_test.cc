@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <cmath>
+
 #include "gtest/gtest.h"
 #include "core/session/onnxruntime_cxx_api.h"
 #include "test/common/tensor_op_test_utils.h"
@@ -475,6 +477,137 @@ TEST(SkipLayerNormTest, SkipSimplifiedLayerNormStatistics) {
   std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
   execution_providers.push_back(DefaultCpuExecutionProvider());
   test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+}
+
+TEST(SkipLayerNormTest, CpuFloat32DispatchResidualBiasAndStatistics) {
+  for (bool simplified : {false, true}) {
+    for (int64_t width : {4, 8, 16, 33}) {
+      for (bool beta : {false, true}) {
+        if (simplified && beta) continue;
+        for (bool bias : {false, true}) {
+          for (bool sum_output : {false, true}) {
+            SCOPED_TRACE(simplified);
+            SCOPED_TRACE(width);
+            SCOPED_TRACE(beta);
+            SCOPED_TRACE(bias);
+            SCOPED_TRACE(sum_output);
+            const size_t n = static_cast<size_t>(width);
+            const std::vector<int64_t> dims{2, 2, width};
+            const std::vector<int64_t> skip_dims{1, 2, width};
+            std::vector<float> input(4 * n), skip(2 * n), gamma(n), beta_data(n), bias_data(n);
+            for (size_t i = 0; i < input.size(); ++i) input[i] = static_cast<float>(i % 7) - 3.0f;
+            for (size_t i = 0; i < skip.size(); ++i) skip[i] = static_cast<float>(i % 3) - 1.0f;
+            for (size_t i = 0; i < n; ++i) {
+              gamma[i] = 0.5f + 0.25f * static_cast<float>(i % 3);
+              beta_data[i] = 0.25f * static_cast<float>(i % 5);
+              bias_data[i] = static_cast<float>(i % 3) - 1.0f;
+            }
+            std::vector<float> sum(input.size()), output(input.size()), mean(4), inv(4);
+            constexpr float epsilon = 3e-4f;
+            for (size_t row = 0; row < 4; ++row) {
+              double total = 0.0;
+              for (size_t i = 0; i < n; ++i) {
+                const size_t offset = row * n + i;
+                float value = input[offset] + skip[offset % skip.size()];
+                if (bias) value += bias_data[i];
+                sum[offset] = value;
+                total += value;
+              }
+              const double center = simplified ? 0.0 : total / static_cast<double>(n);
+              double variance = 0.0;
+              for (size_t i = 0; i < n; ++i) {
+                const double difference = sum[row * n + i] - center;
+                variance += difference * difference;
+              }
+              const double inverse = 1.0 / std::sqrt(variance / static_cast<double>(n) + epsilon);
+              mean[row] = static_cast<float>(center);
+              inv[row] = static_cast<float>(inverse);
+              for (size_t i = 0; i < n; ++i) {
+                output[row * n + i] = static_cast<float>(
+                    (sum[row * n + i] - center) * inverse * gamma[i] + (beta ? beta_data[i] : 0.0f));
+              }
+            }
+            OpTester test(simplified ? "SkipSimplifiedLayerNormalization" : "SkipLayerNormalization", 1, kMSDomain);
+            test.AddAttribute("epsilon", epsilon);
+            test.AddInput<float>("input", dims, input);
+            test.AddInput<float>("skip", skip_dims, skip);
+            test.AddInput<float>("gamma", {width}, gamma);
+            if (!simplified) {
+              if (beta)
+                test.AddInput<float>("beta", {width}, beta_data);
+              else
+                test.AddOptionalInputEdge<float>();
+            }
+            if (bias) test.AddInput<float>("bias", {width}, bias_data);
+            test.AddOutput<float>("output", dims, output);
+            test.AddOutput<float>("mean", {2, 2, 1}, mean);
+            test.AddOutput<float>("inv_std_var", {2, 2, 1}, inv);
+            if (sum_output) test.AddOutput<float>("sum", dims, sum);
+            test.SetOutputTolerance(2e-5f, 2e-5f);
+            if (sum_output) {
+              test.SetOutputAbsErr("sum", 0.0f);
+              test.SetOutputRelErr("sum", 0.0f);
+            }
+            std::vector<std::unique_ptr<IExecutionProvider>> providers;
+            providers.push_back(DefaultCpuExecutionProvider());
+            test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &providers);
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(SkipLayerNormTest, CpuHighOffsetStatisticsMatchStandardLayerNorm) {
+  for (int64_t width : {4, 8, 16, 33}) {
+    SCOPED_TRACE(width);
+    const std::vector<int64_t> dims{2, width}, stat_dims{2, 1};
+    const size_t n = static_cast<size_t>(width);
+    std::vector<float> input(2 * n), ones(n, 1.0f), zeros(n, 0.0f);
+    for (size_t i = 0; i < input.size(); ++i) input[i] = 100000000.0f + 8.0f * static_cast<float>(i % n);
+    auto run_cpu = [](OpTester& test) {
+      std::vector<std::unique_ptr<IExecutionProvider>> providers;
+      providers.push_back(DefaultCpuExecutionProvider());
+      test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &providers);
+    };
+    OpTester reference("LayerNormalization", 17);
+    reference.AddAttribute("epsilon", 3e-4f);
+    reference.AddInput<float>("input", dims, input);
+    reference.AddInput<float>("scale", {width}, ones);
+    reference.AddInput<float>("beta", {width}, zeros);
+    reference.AddOutput<float>("output", dims, std::vector<float>(2 * n));
+    reference.AddOutput<float>("mean", stat_dims, {0.0f, 0.0f});
+    reference.AddOutput<float>("inv", stat_dims, {0.0f, 0.0f});
+    // Use the standard CPU kernel, including its platform-specific scalar
+    // fallback, as the reference rather than imposing a new numerical policy.
+    reference.SetCustomOutputVerifier([](const std::vector<OrtValue>&, const std::string&) {});
+    run_cpu(reference);
+    const auto expected = reference.GetFetches();
+    ASSERT_EQ(expected.size(), 3u);
+    for (bool sum_output : {false, true}) {
+      SCOPED_TRACE(sum_output);
+      OpTester test("SkipLayerNormalization", 1, kMSDomain);
+      test.AddAttribute("epsilon", 3e-4f);
+      test.AddInput<float>("input", dims, input);
+      test.AddInput<float>("skip", dims, std::vector<float>(2 * n, 0.0f));
+      test.AddInput<float>("scale", {width}, ones);
+      test.AddInput<float>("beta", {width}, zeros);
+      for (size_t i = 0; i < expected.size(); ++i) {
+        const auto& tensor = expected[i].Get<Tensor>();
+        test.AddOutput<float>(i == 0 ? "output" : i == 1 ? "mean"
+                                                         : "inv",
+                              i == 0 ? dims : stat_dims,
+                              std::vector<float>(tensor.Data<float>(), tensor.Data<float>() + tensor.Shape().Size()));
+      }
+      if (sum_output) test.AddOutput<float>("sum", dims, input);
+      test.SetOutputTolerance(2e-5f, 2e-5f);
+      if (sum_output) {
+        test.SetOutputAbsErr("sum", 0.0f);
+        test.SetOutputRelErr("sum", 0.0f);
+      }
+      run_cpu(test);
+    }
+  }
 }
 
 TEST(SkipLayerNormTest, SkipLayerNormBatch1_Float16) {

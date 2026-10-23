@@ -44,7 +44,8 @@ REGISTER_KERNEL_TYPED(BFloat16)
 
 namespace {
 
-template <typename T, typename = std::enable_if_t<std::is_same_v<T, float> || std::is_same_v<T, double>, void>>
+template <typename T, bool UseMlas = false,
+          typename = std::enable_if_t<std::is_same_v<T, float> || std::is_same_v<T, double>, void>>
 void ComputeJob(
     const T* input_data,
     const T* skip_data,
@@ -66,10 +67,6 @@ void ComputeJob(
   T* p_output = output_data + offset;
   T* p_skip_input_bias_add_output = skip_input_bias_add_output_data == nullptr ? nullptr : skip_input_bias_add_output_data + offset;
 
-  T mean(0.0f);
-  T M2(0.0f);
-  T sum_sq(0.0f);
-
   for (decltype(hidden_size) h = 0; h < hidden_size; h++) {
     T val = p_input[h] + p_skip[h];
 
@@ -82,6 +79,25 @@ void ComputeJob(
     }
 
     p_output[h] = val;
+  }
+
+  if constexpr (UseMlas) {
+    // Use the same dispatcher as standard FP32 normalization. The rounded
+    // residual buffer is separate from output; no MLAS alias guarantee is needed.
+    if (MlasLayerNormF32(p_skip_input_bias_add_output, gamma_data, simplified ? nullptr : beta_data, p_output,
+                         !simplified && mean_data ? mean_data + task_idx : nullptr,
+                         inv_std_var_data ? inv_std_var_data + task_idx : nullptr,
+                         static_cast<size_t>(hidden_size), epsilon, simplified)) {
+      if (simplified && mean_data) mean_data[task_idx] = 0.0f;
+      return;
+    }
+  }
+
+  T mean(0.0f);
+  T M2(0.0f);
+  T sum_sq(0.0f);
+  for (decltype(hidden_size) h = 0; h < hidden_size; h++) {
+    const T val = p_output[h];
     if (simplified) {
       sum_sq += val * val;
     } else {
@@ -284,11 +300,23 @@ Status SkipLayerNorm<T, simplified>::Compute(OpKernelContext* p_ctx) const {
     if (skip_input_bias_add_output_data != nullptr)
       FloatToNarrow<T>(skip_input_bias_add_output_data_f, skip_input_bias_add_output_data, total_data_size);
   } else {
+    IAllocatorUniquePtr<float> residual;
+    T* residual_data = skip_input_bias_add_output_data;
+    if constexpr (std::is_same_v<T, float>) {
+      // Reuse output 3 when requested; otherwise keep a disjoint input for MLAS.
+      if (!residual_data && task_count > 0) {
+        AllocatorPtr alloc;
+        ORT_RETURN_IF_ERROR(p_ctx->GetTempSpaceAllocator(&alloc));
+        residual = IAllocator::MakeUniquePtr<float>(alloc, static_cast<size_t>(input->Shape().Size()));
+        residual_data = residual.get();
+      }
+    }
     concurrency::ThreadPool::TryBatchParallelFor(
         p_ctx->GetOperatorThreadPool(), static_cast<int32_t>(task_count),
         [&](ptrdiff_t task_idx) {
-          ComputeJob(input_data, skip_data, gamma_data, beta_data, bias_data, task_idx, hidden_size, skip_size,
-                     epsilon_, simplified, output_data, skip_input_bias_add_output_data, mean_data, inv_std_var_data);
+          ComputeJob<T, std::is_same_v<T, float>>(
+              input_data, skip_data, gamma_data, beta_data, bias_data, task_idx, hidden_size, skip_size,
+              epsilon_, simplified, output_data, residual_data, mean_data, inv_std_var_data);
         },
         0);
   }
