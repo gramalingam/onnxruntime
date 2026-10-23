@@ -15,6 +15,83 @@ the original text need not outlive the rule. Rules remain copyable and movable.
 The matcher establishes structural and deletion safety. **The rule author must establish
 semantic equivalence, supported types, and kernel compatibility.**
 
+## Composable Mobius MoE proof of concept
+
+`MakeMoEFusionRules()` reimplements the
+[GroupedMatMul MoE experiment](https://github.com/gramalingam/onnxruntime/pull/11)
+using `PatternLibrary`. This is an **opt-in structural proof of concept**, not
+a generally equivalent or production-ready MoE optimizer. It is not registered
+as a default graph transformer.
+
+```cpp
+rewrite::PatternRewriter rewriter(rewrite::MakeMoEFusionRules());
+rewrite::Statistics statistics;
+ORT_THROW_IF_ERROR(rewriter.Run(graph, statistics));
+ORT_THROW_IF_ERROR(graph.Resolve());
+```
+
+Apply it to a resolved graph before function inlining or generic
+MatMul/activation fusions. The source uses `local.moe.GroupedMatMul` version 1,
+a model-local ONNX function implementing the bias-free
+[GroupedMatMul RFC](https://github.com/onnx/onnx/pull/8193): inputs `[M,H]`,
+weights `[E,H,I]`, indices `[M,k]`, output `[M,k,I]`. The rule assumes this
+trusted local function's semantics; the function name is not a standard ONNX
+schema or a validation of arbitrary model-local function definitions.
+
+One rule composes the following named patterns rather than constructing
+different pattern strings for each routing choice:
+
+- `Routing` is the common logits/weights/indices tensor contract.
+  `RoutingForms = topk_softmax | softmax_topk | normalized` recognizes
+  `Softmax(TopK(logits))`, `TopK(Softmax(logits))`, and the latter divided by the
+  sum of selected probabilities. `normalized` calls `softmax_topk` directly.
+  The constant `top_k` is discovered by the selected body, not a common call port.
+- `Experts` is implemented by `grouped_experts`, which discovers gate/up/down
+  weights and reshape constants. It calls the ordinary `swiglu` body for the
+  gated `Swish(alpha=1)` activation. `Fuse` calls the routing and expert bodies,
+  weights the expert outputs, and reduces over selected slots.
+
+Handwritten `RoutingView` and `ExpertsView` use scoped `BindingView` lookups;
+the routing view descends through the selected alternative and, for normalized
+routing, its nested `selected` instance. Shared C++ checks decode immutable
+int64 tensors with `ReadConstantTensor`, propagating malformed-payload errors.
+They require opset 24 float32, rank-2 token inputs, positive static expert,
+hidden and intermediate dimensions, matching token dimensions proven by equal
+positive integers or the same nonempty symbolic name, and static `1 <= k <= E`.
+Anonymous unknown dimensions are not equality evidence. Flatten/regroup shapes
+must be `[-1,I]` and `[-1,k,H]`; down-projection indices must flatten the same
+selected indices to `[-1,1]`.
+
+The checker binds `k` and the normalization attribute with `Match::update`.
+One pre-parsed replacement references scoped expert leaves, transposes and
+interleaves gate/up rows to `[E,2*I,H]`, and emits
+`com.microsoft.MoE(activation_type="swiglu", swiglu_fusion=1)`. It passes raw
+logits and sets `normalize_routing_weights=1` for the first and third routing
+forms, otherwise zero. Constant folding may evaluate weight packing.
+The layout targets CPU MoE; it is not a portable CUDA/other-EP lowering.
+The default rewriter provider and deletion-boundary checks reject incompatible
+assigned providers, external consumers and exposed intermediate graph outputs.
+Quantized experts, biases, clipped activations and other routing/layout choices
+are deliberately out of scope.
+
+**Numerical limitations:** CPU MoE's expert selection does not implement ONNX
+TopK's lower-index tie preference. Full-softmax versus selected-softmax
+evaluation and normalization can also differ through rounding, underflow,
+overflow and nonfinite values. These rules do not prove absence of routing
+ties or numerical equivalence; graph resolution is not an execution comparison.
+Use only as an explicit experiment with trusted inputs/functions and separate
+target-specific numerical validation, not as a general-purpose optimization.
+
+The three `test/testdata/transform/fusion/mobius_moe_*.onnx` fixtures and adjacent
+`generate_mobius_moe.py` are preserved from the original experiment. The
+generator records Mobius revision `b1e9c8e9dec1dfa206183f957e77d07cfb734df2`,
+uses real Mobius routing with deterministic synthetic weights and a grouped
+expert body, embeds the local function, and downloads no checkpoints.
+`MoEFusionRulesTests.*` checks all routing forms and different expert counts,
+raw-logit and attribute preservation, resolve/reload/idempotence, scoped nested
+views, and rejection/error cases in indexed and reference modes. These remain
+structural tests; end-to-end numerical comparison is deferred.
+
 ## Example: HardSigmoid followed by Mul
 
 This complete rule recognizes the HardSwish decomposition with the exact

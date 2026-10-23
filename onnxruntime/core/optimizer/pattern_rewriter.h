@@ -326,5 +326,8 @@ class PatternRewriter final : public GraphTransformer {
 // Float32 examples adapted from genuine ONNXScript rules; EP eligibility is controlled by Options.
 Rules MakeExampleRules();
 
+// Experimental GroupedMatMul MoE proof of concept; not registered as a default optimizer.
+Rules MakeMoEFusionRules();
+
 }  // namespace rewrite
 }  // namespace onnxruntime
