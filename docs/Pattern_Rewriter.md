@@ -1,20 +1,5 @@
 # Writing C++ graph rewrite rules
 
-The experimental `onnxruntime::rewrite::PatternRewriter` replaces connected
-operator patterns with semantically equivalent graphs. Include
-`core/optimizer/pattern_rewriter.h`. Construct `Pattern` and `Replacement` from
-text; programmatic builders and mutable replacement recipes are not public APIs.
-Check-and-bind callbacks and replacement callbacks remain ordinary C++ functions.
-
-A `Rule` takes `(name, pattern, replacement, check_and_bind, opset_requirements)`.
-The pattern may be text or a parsed `Pattern`; the replacement may be text,
-a parsed `Replacement`, or a callback returning one. Text accepts string literals,
-`std::string`, and `std::string_view` and is parsed once during rule construction;
-syntax errors are reported immediately. Parsed definitions own their data, so
-the original text need not outlive the rule. Rules remain copyable and movable.
-The matcher establishes structural and deletion safety. **The rule author must establish
-semantic equivalence, supported types, and kernel compatibility.**
-
 ## Example: HardSigmoid followed by Mul
 
 This complete rule recognizes the HardSwish decomposition with the exact
@@ -28,7 +13,7 @@ using namespace onnxruntime::rewrite;
 
 Rule MakeHardSwishRule() {
   const auto* pattern = R"(
-    (x:float[]) => {
+    (x:float[...]) => {
       sigmoid = HardSigmoid(x, alpha=0.16666667, beta=0.5)
       return Mul(sigmoid, x)
     }
@@ -39,7 +24,7 @@ Rule MakeHardSwishRule() {
 ```
 
 Both occurrences of `x` must bind the **same `NodeArg`**, not just tensors with
-equal shapes or contents. `float[]` checks that `x` is a float32 tensor of any
+equal shapes or contents. `float[...]` checks that `x` is a float32 tensor of any
 rank, including unknown rank (`float` alone would require a scalar);
 resolved schemas establish the corresponding intermediate and output types.
 It does not require every matched value to have the same element type.
@@ -59,6 +44,23 @@ actually invoked, so an empty callback contributes zero.
 These opset bounds are a conservative supported range for this example, not an
 automatic statement about every schema version. Floating-point rewrites can
 change evaluation order; validate equivalence within the intended tolerance.
+
+## Constructing rules
+
+The experimental `onnxruntime::rewrite::PatternRewriter` replaces connected
+operator patterns with semantically equivalent graphs. Include
+`core/optimizer/pattern_rewriter.h`. Construct `Pattern` and `Replacement` from
+text; programmatic builders and mutable replacement recipes are not public APIs.
+Check-and-bind callbacks and replacement callbacks remain ordinary C++ functions.
+
+A `Rule` takes `(name, pattern, replacement, check_and_bind, opset_requirements)`.
+The pattern may be text or a parsed `Pattern`; the replacement may be text,
+a parsed `Replacement`, or a callback returning one. Text accepts string literals,
+`std::string`, and `std::string_view` and is parsed once during rule construction;
+syntax errors are reported immediately. Parsed definitions own their data, so
+the original text need not outlive the rule. Rules remain copyable and movable.
+The matcher establishes structural and deletion safety. **The rule author must establish
+semantic equivalence, supported types, and kernel compatibility.**
 
 ## Pattern and replacement syntax
 
@@ -163,12 +165,27 @@ binding any dimensions or element type.
 The matcher uses the model's existing metadata; it does not infer shapes or
 solve equations. Rank-specific constraints reject unknown rank, and fixed
 dimensions require known equal integers. A named dimension binds to an integer
-for a static dimension or a nonempty string for a symbolic dimension. Repeated
-known bindings must agree exactly: integer 2 differs from symbolic `"batch"`,
-and `"batch"` differs from `"other"`. An anonymous unknown dimension leaves
-the variable unbound and does not conflict with a later known binding.
-Consequently, repeated names do **not** prove runtime equality when occurrences
-are unknown; check-and-bind callbacks requiring that proof must reject unknown metadata.
+for a static dimension or a nonempty string for a symbolic dimension.
+A name occurring **once** in the expanded selected annotation combination is
+a capture: an anonymous unknown source dimension is allowed and leaves the
+capture unbound. A **repeated** name is an equality constraint: every occurrence
+must have a known integer or nonempty symbolic name, and all must agree exactly.
+Unknown-plus-known and unknown-plus-unknown both reject before the checker,
+regardless of traversal order. Integer 2 differs from symbolic `"batch"`, and
+`"batch"` differs from `"other"`. `_` accepts any dimension, including unknown,
+without creating a capture or equality constraint.
+
+For example, `(x:float[M,K],y:float[M,N])` requires both `M` dimensions to be
+known and equal; the singleton `K` and `N` dimensions may be anonymous unknowns.
+`float[M,M]` imposes equality between two positions of one tensor as well.
+Counts include only the selected alternative at each annotation occurrence,
+not mutually exclusive alternatives or failed search branches. Calls preserve
+hygienic dimension names and each conjunctive annotation occurrence. Merely
+forwarding an interface formal through a call does not duplicate its annotation;
+an explicit interface output annotation is an additional constraint, even if
+the output aliases an input. Repeating a name there therefore also requires
+known metadata. `Options::on_failure` reports a type/shape failure naming the
+unknown repeated dimension or conflicting bindings.
 Likewise, a missing element type leaves `T` unbound, while a concrete annotation
 such as `float` requires a known matching element type.
 
@@ -210,17 +227,15 @@ Pattern pattern("(x:float[M] | float[M,N]) => return Identity(x)");
 Pattern optional("(x,low:float | None) => return Clip(x,low)");
 ```
 
-Alternatives are tried left to right, with annotated variables processed in
-definition order. Matching finds the first **globally consistent** combination:
+Type alternatives are tried left to right, with annotated variables processed
+in definition order. Matching finds the first **globally consistent** combination:
 if a later constraint conflicts with a tentative dimension or element-type
 binding, earlier annotation alternatives are reconsidered. Failed alternatives
 leave no bindings behind. Variables mentioned only in unchosen alternatives
 remain unbound. Check-and-bind callbacks run once after a consistent combination is selected;
 Callback rejection does not trigger another combination.
 
-This bounded search applies only to type/shape annotations, not graph structure:
-there is still no search over producers or operand permutations. The product
-of alternative counts across annotations is limited to 64 at parse time.
+The product of alternative counts across annotations is limited to 64 at parse time.
 Empty branches, duplicate constraints, and `None` alone are rejected.
 `None | float[M]` is also accepted, but `None` is permitted only for header tensor
 inputs, not assigned outputs or attribute captures. Replacements remain untyped.
@@ -282,7 +297,9 @@ Attribute equality compares the protobuf attribute type as well as its value.
 For example, `axis=-1` is an integer attribute, while `epsilon=1e-5` is a float.
 Single- or double-quoted string attributes are supported; strings may escape
 quotes and backslashes. Other attributes are unconstrained. A listed attribute
-must be present in the resolved node's attribute map.
+must be present in the resolved node's attribute map. Staged replacement nodes
+receive schema default attributes before verification and requeueing, so later
+rules and callbacks see defaults without an intervening `Graph::Resolve()`.
 
 In keyword positions the same numeric list syntax instead denotes an attribute:
 
@@ -491,7 +508,11 @@ it reports safe rewrite eligibility, not arbitrary structural occurrences.
 
 ### Types in the supplied examples
 
-`MakeExampleRules()` supplies six rules when contrib operators are enabled:
+The test-local `MakeExampleRules()` in
+`onnxruntime/test/optimizer/pattern_rewriter_test.cc` constructs six examples
+when contrib operators are enabled. These illustrate rule authoring and are
+not a public factory or part of the default optimizer pipeline. Production
+callers construct their own `Rules` and pass them to `PatternRewriter`.
 
 | Rule | Explicit float32 checks |
 |---|---|
@@ -510,7 +531,7 @@ width and a matching one-dimensional scale, with pre-opset-18 attribute axes.
 TransposeMatMul requires a known rank of at least two and exactly the last-two-axis
 swap. Division examples require a finite scaling result. Consult the rule
 definitions and correctness tests before extending their supported ranges.
-Contrib-disabled builds supply only the two HardSwish rules.
+Contrib-disabled tests construct only the two HardSwish examples.
 
 ## Opset and execution-provider applicability
 
@@ -657,9 +678,10 @@ normally and are not converted to nonmatches.
 
 ## Limits and unsupported forms
 
-Definitions are limited to 64 nodes, 256 values, and 64 inputs/outputs per
+Concrete entry plans are limited to 64 nodes, 256 values, and 64 inputs/outputs per
 operator. They are connected acyclic graphs rooted at the final operator.
-There is no operator/subgraph alternation, implicit commutation, variadic matching,
+Named pattern alternatives are expanded as described below. There is no inline
+operator/subgraph alternation, implicit commutation, variadic matching,
 general tensor synthesis, domain-import editing, or model-local function
 rewriting. Control-flow operators are not matched, although their subgraphs can
 be rewritten through `Apply`.
@@ -707,6 +729,430 @@ groups using the model node as the prospective pattern root. Structurally
 identical patterns can share a traversal, followed by their rule-specific check-and-bind callbacks;
 patterns with attribute predicates or type/shape annotations are kept separate. The earliest passing
 rule wins even across groups, and lower-priority work is skipped when possible.
+Structural results are cached per group and candidate node, but callbacks
+run in global registration order, not group order. Rewrite mode stops at
+the first accepted rule without invoking lower-priority callbacks; match-only
+mode visits all matching rules in that same order. Group signatures use
+locale-independent serialization.
 With `indexed=false`, the reference mode instead tries all opset-applicable
 rules in registration order at each node. Match-only mode processes one batch,
 counts all passing rules, and never applies replacements.
+
+## Composable pattern libraries
+
+`PatternLibrary` parses an owning library of interfaces and named patterns.
+Every concrete named pattern is callable; graph bodies and alternatives are
+two definition forms in one namespace, not separate declaration kinds.
+Definitions may refer forward to other definitions.
+`library.GetPattern("Fuse")` returns a copyable `Pattern` usable by every
+existing `Rule` constructor. The library and its source text need not outlive
+the returned pattern.
+
+```cpp
+PatternLibrary library(R"(
+  pattern activation(g:float[M,N], u:float[M,N],
+                     alpha:float[...] | None) -> (product:float[M,N]) {
+    scaled = (Mul(g,alpha) | g)
+    s = Sigmoid(scaled)
+    a = Mul(g,s)
+    product = Mul(a,u)
+    return product
+  }
+
+  pattern Fuse(g,u,alpha:float[...] | None) {
+    product = activation(g,u,alpha)
+    return Identity(product)
+  }
+)");
+```
+
+Ordinary patterns declare typed positional inputs and, optionally, positional
+outputs using `-> (product:float[M,N])`. `return product` supplies that result;
+multiple results use `return first,second`. Output annotations constrain the
+returned values and share the definition's dimension variables with inputs;
+they do not manufacture shape evidence. Output names must not shadow a
+different local value. Without an output signature, names and annotations
+are inferred from returned variables. An alias may inherit an input annotation
+while another expression branch returns an unannotated operator result; these
+are compatible unconstrained-result alternatives. Each selected plan keeps
+only its actual annotation occurrences, so reconciliation does not create
+additional repeated-dimension constraints.
+
+Ordinary inputs retain their tensor/attribute classification from use, including
+typed attribute formals such as
+`pattern P(x,axis:int)->(y){y=Softmax(x,axis=axis);return y}`.
+Adding an output signature does not impose an interface's all-tensor input
+contract. Declared outputs themselves must be tensors. Output labels cannot
+replace a different existing tensor binding, including a direct alias or a
+positional call result; reusing a label for the same handle remains valid.
+
+`product=activation(g,u,alpha)` binds a tensor directly. For multiple results
+write `first,second=Pair(x)`, just as for a multi-output ONNX operator.
+Explicit multi-target calls require exact positional arity and distinct,
+previously unused target names. No `product.port` notation is needed.
+
+### Expressions, alternatives, and branch-local inputs
+
+The example factors optional scaling outside the shared Sigmoid/Mul suffix:
+`scaled=(Mul(g,alpha) | g)`. An assignment `scaled=g` is an alias to the exact
+same `NodeArg`, not an inserted Identity. Reusing both names therefore imposes
+the same binding-identity requirement as reusing either name.
+
+Alternatives are tried in source order, expanding into complete concrete
+plans. Put multiplication first to prefer it when both alternatives can match.
+There is no automatic longest match. Checker rejection may try the next
+complete plan, with fresh bindings. Every included operator must contribute
+to a returned value in **each** plan. Thus
+`alpha=Add(a,b);scaled=(Mul(g,alpha)|g);return Sigmoid(scaled)` is rejected
+because the Add is disconnected in the identity plan. Connecting that Add
+through another returned computation makes the definition valid.
+
+Call-expression alternatives may invoke definitions with different input
+signatures. Each call checks its own actual arguments; only positional result
+arity and declared result annotations must be compatible. No named interface
+is required:
+
+```text
+pattern plain(g:float[M,N],u:float[M,N]) -> (product:float[M,N]) {
+  s=Sigmoid(g);a=Mul(g,s);product=Mul(a,u);return product
+}
+pattern scaled(g:float[M,N],u:float[M,N],alpha:float[...]) -> (product:float[M,N]) {
+  v=Mul(g,alpha);s=Sigmoid(v);a=Mul(g,s);product=Mul(a,u);return product
+}
+pattern choice(g,u,alpha:float[...] | None) {
+  product=plain(g,u) | scaled(g,u,alpha)
+  return product
+}
+pattern discovered(g,u) {
+  product=plain(g,u) | scaled(g,u,_)
+  return product
+}
+```
+
+`_` as a call actual binds a **real, present tensor** without a caller-level
+name. It is not ONNX's omitted input slot (`None`). Each `_` is independent;
+callee type/shape/constancy and repeated-formal binding requirements still
+apply. The callee-local binding remains available to scoped C++ views.
+Wildcards for attribute formals are rejected.
+
+A declared input may be unused in a selected branch only if its annotation
+permits `None`. In `choice` the plain plan leaves `alpha` unbound. Another
+reachable use may bind it, in which case its tensor annotation and all uses'
+`NodeArg` identity must agree. Required inputs remain required; `None` cannot
+disable an actual required operator slot. `match.optionalValueOf("alpha")`
+returns `nullptr` for a declared unbound optional tensor and throws for an
+unknown name or attribute. Existing `valueOf` retains its optional-null
+behavior; required unbound lookups remain errors. Select an appropriate
+pre-parsed replacement in C++ when an optional capture is absent: consuming
+it in a required replacement input is an explicit schema-validation error,
+not a successful rewrite or candidate retry.
+
+Result compatibility compares the ordered declared constraints structurally,
+including dimension symbol spellings, but ignores result labels. An
+unannotated result is unconstrained. Parenthesized expressions may nest;
+calls and aliases preserve source-order selection identities. Expression
+occurrences expose their selected call/operator/alias name via
+`match.instance("product").alternative()`, with `alternativeView()` descending
+into a selected call's metadata. Operator and value-alias leaves have no
+callee-local scope or deeper `alternativeView()`; grouped branches retain
+their nested selection metadata under the `<group>` tag.
+
+Interfaces remain optional reusable tensor contracts, not callable graphs:
+`interface Unary(x:float[N])->(y:float[N])` and
+`pattern Copy implements Unary { y=Identity(x);return y }` remain supported.
+The older explicit `(port=local_value)` returns, colon-signature extra
+discovered inputs, and scoped DSL `p.port` accesses are compatibility syntax,
+not necessary for new positional examples. An unnamed returned operator call
+still exposes `output` (or `output0`, `output1`, etc.).
+
+### Calls versus standalone entries
+
+Reusable bodies may return identity aliases or independent output branches.
+Every required declared input must be used, and every operator must reach at least
+one returned value, but those returned values need not have a single root.
+`GetPattern(name)` validates **every fully expanded plan** as a standalone
+entry: it must have an operator root, all operators must feed that final
+operator, and returned values cannot be leaf/identity aliases or duplicate
+the same value through different output names. Callable bodies may still
+export multiple aliases of the same value. An entry violation raises a
+use-time diagnostic naming the requested entry. Inherited interface inputs
+and mapped outputs must remain tensor bindings, checked during library
+construction; extra body-only inputs may capture attributes. Mapped interface
+outputs are always required to be present, even when unannotated and aliased
+to an optional input. Interface tensor-kind requirements survive calls and
+aliases; callers cannot reclassify these mapped values as attribute captures
+or pass them to attribute formals. Conflicts fail during library construction.
+Thus a library
+may contain useful callable patterns that cannot independently serve as rules:
+
+```text
+pattern identity(x) -> (y) { return x }
+pattern branches(x,z) {
+  left = Identity(x)
+  right = Neg(z)
+  return left,right
+}
+pattern join(x,z) {
+  left,right = branches(x,z)
+  value = identity(left)
+  return Add(value,right)
+}
+```
+
+`GetPattern("join")` succeeds; `GetPattern("identity")` and
+`GetPattern("branches")` fail. These checks apply equally to body patterns,
+aliases and alternative definitions. Legacy standalone `Pattern("(x)=>...")`
+syntax remains supported; its operator-root and output-boundary checks are unchanged.
+
+The legacy colon signature extends an interface implementation with external
+inputs discovered by matching. For example,
+`pattern extra implements Unary: (alpha:float[...]) -> { y=Mul(x,alpha);return y }`
+is called with just `extra(x)`, while `alpha` binds to the matched Mul's input.
+It remains a tensor, not an automatically decoded float.
+Additional attribute captures can also be declared in that signature using
+the existing attribute-annotation syntax. There is no separate capture
+language. Both `float[]` and `float[...]` continue to mean **any rank**, not
+scalar.
+
+An **alternative pattern** supplies ordered named members. Members can be
+body patterns, other alternative patterns, or single aliases; interfaces
+cannot be members. They must have the same named interface (or all have no
+interface) and identical ordered input/output port names and annotations.
+This is a strict structural annotation check (including symbol spellings),
+not semantic type equivalence; equivalent any-rank `[]`/`[...]` are normalized.
+Extra discovered inputs of an `implements` body are not common call ports.
+A named call `value=Forms(x)` and the legacy anonymous call
+`value=(first | second)(x)` have the same matching behavior when `Forms=first|second`.
+Unlike call-expression alternatives, these definition alternatives retain
+the common input signature requirement. Each occurrence
+has an independent selected immediate member, available through `alternative()`;
+no user-defined tag name is required. Nesting and single aliases preserve
+their selection identities:
+
+```text
+pattern first(x) { value=Identity(x);return value }
+pattern second(x) { value=Neg(x);return value }
+pattern Inner = first | second
+pattern Outer = Inner | first
+pattern Alias = Outer
+pattern nested(x) {
+  value = Alias(x)
+  return Identity(value)
+}
+```
+
+For a selection of `second`, `value` reports definition `Alias`, member `Outer`;
+successive `alternativeView()` calls report `Outer`/`Inner`, `Inner`/`second`,
+then body `second` with no member. Legacy anonymous alternatives use the same
+representation and retain their immediate named members too. Patterns may
+call other patterns within the expansion and dependency-nesting bounds.
+The separate `|` type-annotation syntax is unchanged.
+
+Calls bind positional output variables. The **first output name** is also
+the C++ occurrence-scope handle for `match.instance("first")`; this explicit
+introspection API is separate from `match.valueOf("first")`, which returns
+the actual result tensor. Legacy one-name calls to multi-output patterns
+remain instance-only: `p=Pair(x)` requires `p.port` to address a result and
+`valueOf("p")`/tensor use of `p` fails, rather than selecting an arbitrary
+output. Tensor handles, attribute captures,
+dimensions and element-type variables are remapped into the call occurrence.
+Two instances do not share a capture just because its local spelling is the
+same. Formal inputs and returned aliases bind to the caller's actual
+`NodeArg`s; no integer handle from another definition is reused.
+Caller and callee annotations are conjunctive, while alternatives within
+one annotation remain disjunctive. A call inserts its callee's ordered
+constraint occurrences at the call site, preserving callee order even when
+actual arguments are reordered or aliased to the same value.
+An annotation classified as a tensor in a compiled callee stays a tensor
+after composition. A caller cannot turn that mapped value into an attribute
+through a later keyword capture or attribute-formal call; this unsupported
+conversion fails during construction, including for ordinary identity aliases.
+Typed attribute formals already classified as attributes in the callee remain
+supported.
+
+Graph alternatives expand to at most **64 complete concrete plans per
+definition**, in source order (the rightmost call varies fastest).
+Each plan retains the existing limits of 64 nodes, 256 values and 64
+type-annotation combinations. Each plan also permits at most **256 expanded
+call occurrences**, counted cumulatively through nested bodies, including
+zero-node identity calls. This bounds scoped metadata even when composition
+adds no nodes or values; overflow is rejected before copying callee metadata.
+Libraries contain at most 256 definitions. A dependency path may contain at
+most **64 concrete pattern definitions**, including its entry and any named
+alternative/alias wrappers (interfaces do not count). This bound is independent
+of declaration order and is enforced before deeper recursive compilation to
+protect native stack usage. Forward-reference chains at 64 succeed; 65 or
+more fail with an explicit nesting-limit diagnostic.
+Expression nesting is also bounded to 64 (including call parentheses), sharing the native
+recursion budget with active dependency compilation. No expression has more
+than 64 branches, and expression alternatives share the 64-complete-plan limit.
+Recursive calls, duplicate definitions/ports, missing members, incompatible
+interfaces and invalid mappings fail during construction. An unresolved
+unqualified call must name a registered standard ONNX operator; use an
+explicit domain for other operators. This disambiguates misspelled pattern
+calls from ONNX calls without changing standalone `Pattern` parsing.
+
+Each complete candidate passes the existing structural, type/constant,
+deletion-boundary, layer, provider and opset checks before C++ acceptance.
+If the checker rejects it, the next concrete candidate is tried with fresh
+captures and computed attributes. Earlier rules retain priority over every
+alternative of a later rule. Search is bounded enumeration, not a recursive
+producer/permutation matcher. Replacement or callback errors propagate;
+they never cause a retry. Match-only statistics count passing concrete plans,
+so multiple alternatives of one logical rule can contribute matches.
+
+Graph alternatives and type alternatives have different retry behavior.
+For each concrete graph candidate, the bounded annotation search selects the
+first globally consistent type/shape combination. Checker rejection does not
+try another annotation combination for that candidate; it advances to the
+next concrete graph candidate. Neither search permutes operands or explores
+different producers.
+
+### Instance binding views and handwritten C++ structs
+
+`match.instance("product")` returns a read-only `BindingView` for the activation
+call in the example. `view.instance("scaled")` selects its nested expression
+occurrence. Its `valueOf`, `optionalValueOf`, `attributeOf`, `dimensionOf`,
+and `elementTypeOf` use names relative to that occurrence. `definition()` identifies the called definition,
+`interfaceName()` its contract, and `alternative()` the selected immediate member
+(empty for a body call). `alternativeView()` enters a selected call/member's metadata;
+calling it on a body or operator/value-alias leaf raises an error. Repeated calls traverse nested
+alternatives/aliases without losing intermediate tags. This navigation does
+not add tensor namespaces: all selected member locals use the same occurrence
+path, and `instance("child")` addresses a nested call inside the selected body.
+Entry metadata is available through `match.bindings()`.
+Fully qualified lookups such as
+`match.valueOf("product.alpha")` are equivalent. Missing instances and
+unavailable member-local names raise errors; they are not nullable optional
+fields. Explicitly declared optional tensors are the exception described above.
+Only the selected member's concrete bindings exist.
+
+Views are non-owning and valid only during the candidate callback. They must
+not be retained across graph mutation. The following manual structs show what
+a future generator could emit; **this API does not generate C++**:
+
+```cpp
+struct GatedView {
+  const NodeArg* g;
+  const NodeArg* u;
+  const NodeArg* product;
+  explicit GatedView(BindingView v)
+      : g(v.valueOf("g")), u(v.valueOf("u")), product(v.valueOf("product")) {}
+};
+struct PlainView {
+  GatedView ports;
+  const NodeArg* sigmoid;
+  explicit PlainView(BindingView v) : ports(v), sigmoid(v.valueOf("s")) {}
+};
+struct ScaledView {
+  GatedView ports;
+  const NodeArg* alpha;
+  explicit ScaledView(BindingView v) : ports(v), alpha(v.optionalValueOf("alpha")) {
+    ORT_ENFORCE(alpha, "Selected scaling requires alpha.");
+  }
+};
+struct ActivationView {
+  GatedView ports;
+  std::variant<PlainView, ScaledView> alternative;
+  static std::variant<PlainView, ScaledView> Select(BindingView v) {
+    const auto scaling = v.instance("scaled");
+    if (scaling.alternative() == "g") return PlainView(v);
+    ORT_ENFORCE(scaling.alternative() == "Mul", "Unexpected scaling alternative.");
+    return ScaledView(v);
+  }
+  explicit ActivationView(BindingView v) : ports(v), alternative(Select(v)) {}
+};
+struct FusionView {
+  ActivationView activation;
+  explicit FusionView(const Match& m) : activation(m.instance("product")) {}
+};
+
+bool CheckGatingShapes(const GatedView& v) {
+  if (!v.g->Shape() || !v.u->Shape() ||
+      v.g->Shape()->dim_size() != 2 || v.u->Shape()->dim_size() != 2)
+    return false;
+  for (int i = 0; i < 2; ++i) {
+    const auto& g = v.g->Shape()->dim(i);
+    const auto& u = v.u->Shape()->dim(i);
+    if (!g.has_dim_value() || !u.has_dim_value() ||
+        g.dim_value() <= 0 || g.dim_value() != u.dim_value())
+      return false;
+  }
+  return true;
+}
+
+Rule MakePatternFusion(const PatternLibrary& library) {
+  auto check = [](const Graph& graph, Match& match) {
+    FusionView view(match);
+    if (!CheckGatingShapes(view.activation.ports))
+      return match.Reject("Unsupported gating shapes.");
+    float alpha = 1.0f;
+    if (const auto* scaled = std::get_if<ScaledView>(&view.activation.alternative)) {
+      const auto* shape = scaled->alpha->Shape();
+      if (!shape || !(shape->dim_size() == 0 ||
+                      (shape->dim_size() == 1 && shape->dim(0).has_dim_value() &&
+                       shape->dim(0).dim_value() == 1)))
+        return match.Reject("Alpha must have scalar or [1] shape.");
+      InlinedVector<float> data;
+      bool available;
+      ORT_THROW_IF_ERROR(ReadConstantTensor(graph, scaled->alpha, data, available));
+      if (!available || data.size() != 1 || !std::isfinite(data[0]) || data[0] <= 0)
+        return match.Reject("Unsupported alpha.");
+      alpha = data[0];
+    }
+    ONNX_NAMESPACE::AttributeProto attribute;
+    attribute.set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_FLOAT);
+    attribute.set_f(alpha);
+    match.update("activation_alpha", std::move(attribute));
+    return true;
+  };
+  Replacement recipe(R"(
+    (g,u,activation_alpha) => {
+      a = com.microsoft.QuickGelu(g,alpha=activation_alpha)
+      return Mul(a,u)
+    }
+  )");
+  return Rule{"PatternActivation", library.GetPattern("Fuse"), recipe, check,
+              {{kOnnxDomain, 17, 17}, {kMSDomain, 1, 1}}};
+}
+```
+
+Include `<cmath>` for `std::isfinite`, in addition to the rewriter header.
+This synthetic fusion recognizes `g * sigmoid(alpha*g) * u`, removes its
+trailing Identity, and selects the QuickGelu alpha in C++. The tests execute both source and replacement with CPU EP for plain,
+scalar-alpha and one-element-alpha cases, including the factored positional
+form above. This is a small floating-point example, not a
+general MoE/QMoE lowering or a bitwise-equivalence guarantee.
+
+Replacement callbacks may likewise select among pre-parsed recipes in C++;
+that choice is host construction, **not** an ONNX If. Pre-parsed recipes can
+reference scoped tensor leaves, for example `(x,p.alpha)=>Mul(x,p.alpha)`.
+Such names must exist in every concrete plan when the recipe is attached
+directly to a rule; use a callback to choose a member-specific recipe.
+Matched internal outputs remain forbidden replacement inputs, including
+when accessed through an interface alias.
+
+### Optional immutable tensor constraints and constant readers
+
+The prefix qualifier `const`, as in `top_k:const int64[1]`, requires an
+immutable constant initializer in addition to the tensor annotation.
+It does not decode contents, bind a scalar, or require local payload storage.
+Runtime inputs and overridable initializers do not satisfy it.
+It can qualify individual tensor alternatives, including
+`const float[1] | float[] | None`. It cannot qualify an attribute type.
+
+`ReadConstantTensor(graph, value, data, available)` has typed overloads for
+`InlinedVector<float>` and `InlinedVector<int64_t>`. A missing value,
+nonconstant/overridable initializer, wrong element type, or external payload
+returns OK with `available=false`, leaving `data` unchanged. A malformed
+available payload returns an error, leaving both outputs unchanged.
+Success decodes raw or typed protobuf storage and sets `available=true`.
+C++ checks rank, supported values and all dependent relationships; decoding
+does not implicitly enforce scalar shape. Propagate reader errors, for
+example with `ORT_THROW_IF_ERROR` in a bool checker, rather than turning
+corruption into an ordinary alternative rejection.
+
+There are no pattern-valued parameters, construction-time scalar parameters,
+`where` clauses, tensor-content capture declarations, or C++ code generation.
+Semantic acceptance, tensor decoding, arithmetic and kernel support checks
+remain C++ responsibilities.
