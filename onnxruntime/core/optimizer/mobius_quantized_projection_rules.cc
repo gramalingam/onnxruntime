@@ -151,12 +151,13 @@ bool CheckInt4(const Graph& graph, Match& match) {
   const auto* a_shape = a->Shape();
   const auto type = match.elementTypeOf("T");
   const int64_t block = match.attributeOf("block").i();
+  // FP16 MatMulNBits can remove the source's FP16 dequantized-weight rounding.
+  // Use the CPU-supported block range even before provider assignment.
   if (!ProviderIs(match, false) || !ShapesAreFull(match) ||
-      (type != ONNX_NAMESPACE::TensorProto_DataType_FLOAT &&
-       type != ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) ||
+      type != ONNX_NAMESPACE::TensorProto_DataType_FLOAT ||
       !n || !blocks || !bytes || !a_shape || a_shape->dim_size() < 1 ||
-      block < 16 || (block & (block - 1)) != 0 || *bytes != block / 2)
-    return match.Reject("INT4 requires FP32/FP16, full shapes and canonical power-of-two packed blocks.");
+      block < 16 || block > 256 || (block & (block - 1)) != 0 || *bytes != block / 2)
+    return match.Reject("INT4 requires FP32, full shapes and packed blocks of size 16/32/64/128/256.");
 
   const auto k = PositiveDimension(*a, a_shape->dim_size() - 1);
   // Division avoids overflowing while also rejecting padded/trimmed logical K.

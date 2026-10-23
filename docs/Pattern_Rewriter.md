@@ -1068,14 +1068,20 @@ return empty rule lists. They do not change the pattern language.
 
 The INT4 rule composes concrete nibble-unpacking calls with a packed/default
 zero-point alternative. It requires immutable UINT8 `[N,blocks,block_size/2]`
-weights, matching FP32 or FP16 scales/activations, a power-of-two block size at
-least 16, and exact unpadded `K = blocks * block_size`. Both nibble paths are
+weights, matching **FP32** scales/activations, block size in
+**16/32/64/128/256**, and exact unpadded `K = blocks * block_size`. This block-size
+set is required by the CPU target and is conservatively enforced for unassigned
+and CUDA-assigned graphs too; no larger CUDA-only subset is claimed. Both nibble paths are
 low-first. Packed zero points have `[N,ceil(blocks/2)]` storage; the body trims
 the unused last nibble for odd block counts. The omitted-zero-point overload
 must synthesize UINT8 midpoint **8**. The replacement preserves the original
 packed tensors and scale dtype and uses `accuracy_level=0` (no requested
-activation quantization/downcast). FP32 CPU and CUDA destinations are eligible;
-FP16 retains the target provider's precision policy.
+activation quantization/downcast). FP32 CPU and CUDA destinations are eligible.
+**FP16 INT4 remains unfused on every provider:** CPU MatMulNBits can widen
+scales and dequantize in FP32, removing the source's FP16 weight-rounding
+boundary even at `accuracy_level=0`. This can change a source infinity to a
+finite result, as well as change finite cancellation results. No quantization
+approximation contract or CUDA preservation proof is assumed.
 
 The separately opted-in NVFP4 rule requires FP16 activations, immutable UINT8
 `[N,K/2]` low-first E2M1 weights, raw E4M3FN scale bytes `[N,K/16]`, `K % 16 == 0`,
@@ -1099,9 +1105,13 @@ the local NVFP4 coverage is structural, not a numerical accuracy claim.
 
 `mobius_quantized_projection_rules_test.cc` contains a reproducible, faithful
 C++ fixture generator ported from the pinned bodies. Tests compare standard and
-fused **FP32 INT4 on CPU** (ranks 1–3, blocks 16/32/64, odd/even packed-zero
-counts, midpoint, and separate bias), check FP16 INT4 and NVFP4 graph structure,
+fused **FP32 INT4 on CPU** (ranks 1–3, blocks 16/32/64/128/256, odd/even packed-zero
+counts, midpoint, and separate bias), reject FP16 INT4 and check NVFP4 graph structure,
 and exercise constant, layout, provider, opset, and deletion-boundary rejection.
+Executable CPU regressions cover valid block-512 source execution without fusion
+and the FP16 overflow/cancellation counterexamples against directly constructed
+MatMulNBits targets. These targets only reproduce why FP16 is excluded; the
+factory never emits them.
 No dense-weight recovery, padded-K trimming, `g_idx`, float zero points, MoE,
 QMoE, BF16, or other FP4 formats are inferred. Bias `Add` remains outside both
 rules. The geometry/precision checks were informed by

@@ -274,7 +274,7 @@ TEST(MobiusQuantizedProjectionTests, Int4StructureAndCpuNumerics) {
   for (bool indexed : {false, true}) {
     for (bool packed_zero : {false, true}) {
       for (int rank : {1, 2, 3}) {
-        for (int64_t block : {16, 32, 64}) {
+        for (int64_t block : {16, 32, 64, 128, 256}) {
           SCOPED_TRACE(MakeString(indexed, " packed=", packed_zero, " rank=", rank, " block=", block));
           TestModel test;
           FixtureOptions fixture{.packed_zero = packed_zero, .bias = true, .block = block, .blocks = block == 16 ? 3 : block == 32 ? 2
@@ -329,18 +329,134 @@ TEST(MobiusQuantizedProjectionTests, Int4StructureAndCpuNumerics) {
   }
 }
 
-TEST(MobiusQuantizedProjectionTests, Int4Fp16Structure) {
-  for (bool packed_zero : {false, true}) {
-    TestModel test;
-    BuildInt4<MLFloat16>(test.builder, {.packed_zero = packed_zero});
-    test.builder.SetGraphOutputs();
-    ASSERT_STATUS_OK(test.graph.Resolve());
+TEST(MobiusQuantizedProjectionTests, RejectInt4Fp16ForEveryDestination) {
+  for (bool indexed : {false, true}) {
+    for (bool packed_zero : {false, true}) {
+      for (const std::string provider : {"", kCpuExecutionProvider, kCudaExecutionProvider}) {
+        TestModel test;
+        BuildInt4<MLFloat16>(test.builder, {.packed_zero = packed_zero});
+        test.builder.SetGraphOutputs();
+        ASSERT_STATUS_OK(test.graph.Resolve());
+        for (auto& node : test.graph.Nodes()) node.SetExecutionProviderType(provider);
+        const auto original = Serialize(test.model);
+        Options options{.indexed = indexed};
+        options.compatible_execution_providers.insert(kCudaExecutionProvider);
+        Statistics stats;
+        ASSERT_STATUS_OK(PatternRewriter(MakeMobiusMatMulNBitsRules(), options).Run(test.graph, stats));
+        EXPECT_EQ(stats.rewrites, 0u);
+        EXPECT_EQ(Count(test.graph, "MatMulNBits"), 0u);
+        EXPECT_TRUE(Serialize(test.model) == original);
+      }
+    }
+  }
+}
+
+TEST(MobiusQuantizedProjectionTests, RejectInt4Block512WithExecutableSource) {
+  for (bool indexed : {false, true}) {
+    for (const std::string provider : {"", kCpuExecutionProvider, kCudaExecutionProvider}) {
+      TestModel test;
+      BuildInt4<float>(test.builder, {.block = 512, .blocks = 1, .n = 1});
+      test.builder.SetGraphOutputs();
+      ASSERT_STATUS_OK(test.graph.Resolve());
+      std::vector<OrtValue> expected;
+      ASSERT_STATUS_OK(Execute(Serialize(test.model), test.builder, expected));
+      ASSERT_EQ(expected.size(), 1u);
+      for (int64_t i = 0; i < expected[0].Get<Tensor>().Shape().Size(); ++i)
+        ASSERT_TRUE(std::isfinite(expected[0].Get<Tensor>().Data<float>()[i]));
+      for (auto& node : test.graph.Nodes()) node.SetExecutionProviderType(provider);
+      const auto original = Serialize(test.model);
+      Options options{.indexed = indexed};
+      options.compatible_execution_providers.insert(kCudaExecutionProvider);
+      Statistics stats;
+      ASSERT_STATUS_OK(PatternRewriter(MakeMobiusMatMulNBitsRules(), options).Run(test.graph, stats));
+      EXPECT_EQ(stats.rewrites, 0u);
+      EXPECT_EQ(Count(test.graph, "MatMulNBits"), 0u);
+      EXPECT_TRUE(Serialize(test.model) == original);
+      std::vector<OrtValue> actual;
+      ASSERT_STATUS_OK(Execute(Serialize(test.model), test.builder, actual));
+      const auto& x = expected[0].Get<Tensor>();
+      const auto& y = actual[0].Get<Tensor>();
+      ASSERT_EQ(x.Shape(), y.Shape());
+      for (int64_t i = 0; i < x.Shape().Size(); ++i) EXPECT_EQ(x.Data<float>()[i], y.Data<float>()[i]);
+    }
+  }
+}
+
+void BuildFp16RoundingProbe(ModelTestBuilder& b, bool overflow, bool native) {
+  ProjectionBody f{b, Mutation::None};
+  std::vector<MLFloat16> activation(16, MLFloat16(overflow ? 0.01f : 0.0f));
+  if (!overflow) {
+    activation[0] = MLFloat16(1.0f);
+    activation[1] = MLFloat16(-7.0f);
+  }
+  auto* a = b.MakeInput<MLFloat16>({1, 16}, activation);
+  std::vector<uint8_t> packed(8, overflow ? 0xff : 0x88);
+  if (!overflow) packed[0] = 0x9f;
+  auto* w = b.MakeInitializer<uint8_t>({1, 1, 8}, packed);
+  auto* s = b.MakeInitializer<MLFloat16>({1, 1}, {MLFloat16(overflow ? 10000.0f : 0.1f)});
+  if (native) {
+    auto& node = b.AddNode("MatMulNBits", {a, w, s}, {b.MakeOutput()}, kMSDomain);
+    node.AddAttribute("K", int64_t{16});
+    node.AddAttribute("N", int64_t{1});
+    node.AddAttribute("bits", int64_t{4});
+    node.AddAttribute("block_size", int64_t{16});
+    node.AddAttribute("accuracy_level", int64_t{0});
+    return;
+  }
+  auto* codes = f.Cast(f.Reshape(f.Reshape(f.Nibbles(w, 3), {0, 0, -1}), {0, -1}),
+                       ONNX_NAMESPACE::TensorProto_DataType_UINT4);
+  ONNX_NAMESPACE::TensorProto midpoint;
+  midpoint.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_UINT8);
+  midpoint.add_dims(1);
+  midpoint.add_int32_data(8);
+  auto* zero = b.MakeIntermediate();
+  b.AddNode("ConstantOfShape", {f.Shape(s)}, {zero}).AddAttribute("value", midpoint);
+  zero = f.Cast(zero, ONNX_NAMESPACE::TensorProto_DataType_UINT4);
+  auto* weight = b.MakeIntermediate();
+  auto& dequant = b.AddNode("DequantizeLinear", {codes, s, zero}, {weight});
+  dequant.AddAttribute("axis", int64_t{1});
+  dequant.AddAttribute("block_size", int64_t{16});
+  f.Finish<MLFloat16>(a, weight, 1, false);
+}
+
+TEST(MobiusQuantizedProjectionTests, Int4Fp16WeightRoundingCounterexamples) {
+#if !defined(_M_AMD64) && !defined(__x86_64__)
+  GTEST_SKIP() << "These counterexamples reproduce the x86-64 CPU MatMulNBits FP16-to-FP32 path.";
+#endif
+  for (bool overflow : {false, true}) {
+    SCOPED_TRACE(MakeString("overflow=", overflow));
+    TestModel source, target;
+    BuildFp16RoundingProbe(source.builder, overflow, false);
+    BuildFp16RoundingProbe(target.builder, overflow, true);
+    source.builder.SetGraphOutputs();
+    target.builder.SetGraphOutputs();
+    ASSERT_STATUS_OK(source.graph.Resolve());
+    ASSERT_STATUS_OK(target.graph.Resolve());
+    ASSERT_EQ(Count(source.graph, "DequantizeLinear"), 1u);
+    ASSERT_EQ(Count(target.graph, "MatMulNBits"), 1u);
+    std::vector<OrtValue> expected, counterexample;
+    ASSERT_STATUS_OK(Execute(Serialize(source.model), source.builder, expected));
+    ASSERT_STATUS_OK(Execute(Serialize(target.model), target.builder, counterexample));
+    ASSERT_EQ(expected.size(), 1u);
+    ASSERT_EQ(counterexample.size(), 1u);
+    const float standard = expected[0].Get<Tensor>().Data<MLFloat16>()[0].ToFloat();
+    const float fused = counterexample[0].Get<Tensor>().Data<MLFloat16>()[0].ToFloat();
+    if (overflow) {
+      EXPECT_TRUE(std::isinf(standard) && standard > 0);
+      EXPECT_TRUE(std::isfinite(fused));
+      EXPECT_FLOAT_EQ(fused, 11200.0f);
+    } else {
+      EXPECT_FLOAT_EQ(standard, -0.0001220703125f);
+      EXPECT_FLOAT_EQ(fused, 0.0f);
+    }
+    const auto original = Serialize(source.model);
     Statistics stats;
-    ASSERT_STATUS_OK(PatternRewriter(MakeMobiusMatMulNBitsRules()).Run(test.graph, stats));
-    ASSERT_EQ(stats.rewrites, 1u);
-    ASSERT_STATUS_OK(test.graph.Resolve());
-    EXPECT_EQ(test.graph.GetOutputs()[0]->TypeAsProto()->tensor_type().elem_type(),
-              ONNX_NAMESPACE::TensorProto_DataType_FLOAT16);
+    ASSERT_STATUS_OK(PatternRewriter(MakeMobiusMatMulNBitsRules()).Run(source.graph, stats));
+    EXPECT_EQ(stats.rewrites, 0u);
+    EXPECT_TRUE(Serialize(source.model) == original);
+    std::vector<OrtValue> unchanged;
+    ASSERT_STATUS_OK(Execute(Serialize(source.model), source.builder, unchanged));
+    EXPECT_EQ(unchanged[0].Get<Tensor>().Data<MLFloat16>()[0].ToFloat(), standard);
   }
 }
 
