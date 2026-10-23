@@ -172,7 +172,7 @@ TEST(MoEFusionRulesTests, ComposedRoutingViews) {
       ORT_TSTR("testdata/transform/fusion/mobius_moe_topk.onnx"),
       ORT_TSTR("testdata/transform/fusion/mobius_moe_softmax_topk.onnx"),
       ORT_TSTR("testdata/transform/fusion/mobius_moe_softmax_topk_normalized.onnx")};
-  const std::array<std::string_view, 3> members{"topk_softmax", "softmax_topk", "normalized"};
+  const std::array<std::string_view, 3> members{"TopKSoftmax", "SoftmaxTopK", "NormalizedSoftmaxTopK"};
   for (size_t i = 0; i < paths.size(); ++i) {
     for (bool indexed : {true, false}) {
       std::shared_ptr<Model> model;
@@ -183,21 +183,27 @@ TEST(MoEFusionRulesTests, ComposedRoutingViews) {
       size_t callbacks = 0;
       rules[0].check_and_bind = [&](const Graph& graph, rewrite::Match& match) {
         ++callbacks;
+        EXPECT_EQ(match.bindings().definition(), "MoEPattern");
         const auto route = match.instance("route");
         EXPECT_EQ(route.definition(), "RoutingForms");
         EXPECT_EQ(route.interfaceName(), "Routing");
         EXPECT_EQ(route.alternative(), members[i]);
         auto body = route.alternativeView();
         EXPECT_EQ(body.definition(), members[i]);
+        EXPECT_EQ(route.valueOf("top_k"), match.valueOf("top_k"));
+        EXPECT_EQ(body.valueOf("top_k"), match.valueOf("top_k"));
         if (i == 2) {
           body = body.instance("selected");
-          EXPECT_EQ(body.definition(), "softmax_topk");
+          EXPECT_EQ(body.definition(), "SoftmaxTopK");
           EXPECT_EQ(body.interfaceName(), "Routing");
         }
-        EXPECT_NE(body.valueOf("top_k"), nullptr);
+        EXPECT_EQ(body.valueOf("top_k"), match.valueOf("top_k"));
+        for (const auto& node : graph.Nodes()) {
+          if (node.OpType() == "TopK") EXPECT_EQ(node.InputDefs()[1], route.valueOf("top_k"));
+        }
         EXPECT_EQ(route.valueOf("indices"), match.instance("experts").valueOf("indices"));
         const auto activation = match.instance("experts").instance("activation");
-        EXPECT_EQ(activation.definition(), "swiglu");
+        EXPECT_EQ(activation.definition(), "SwiGLU");
         EXPECT_NE(activation.valueOf("product"), nullptr);
         return check(graph, match);
       };
@@ -259,6 +265,36 @@ TEST(MoEFusionRulesTests, AcceptsSharedSymbolicTokenMetadata) {
     ASSERT_STATUS_OK(graph.Resolve());
     ASSERT_EQ(graph.GetOutputs().size(), 1u);
     EXPECT_EQ(graph.GetOutputs()[0]->Shape()->dim(0).dim_param(), "tokens");
+  }
+}
+
+TEST(MoEFusionRulesTests, RejectsUnknownRankBeforeSemanticChecks) {
+  for (bool indexed : {true, false}) {
+    for (const auto* target : {"hidden", "logits", "indices", "expert_gate"}) {
+      SCOPED_TRACE(target);
+      std::shared_ptr<Model> model;
+      ASSERT_STATUS_OK(Model::Load(ORT_TSTR("testdata/transform/fusion/mobius_moe_topk.onnx"),
+                                   model, nullptr, DefaultLoggingManager().DefaultLogger()));
+      auto& graph = model->MainGraph();
+      NodeArg* value = nullptr;
+      if (std::string_view(target) == "logits" || std::string_view(target) == "indices") {
+        for (auto& node : graph.Nodes()) {
+          if (node.OpType() != "TopK") continue;
+          value = std::string_view(target) == "logits" ? node.MutableInputDefs()[0] : node.MutableOutputDefs()[1];
+        }
+      } else {
+        value = graph.GetNodeArg(target);
+      }
+      ASSERT_NE(value, nullptr);
+      value->ClearShape();
+      ASSERT_EQ(value->Shape(), nullptr);
+      rewrite::Statistics stats;
+      ASSERT_STATUS_OK(rewrite::PatternRewriter(rewrite::MakeMoEFusionRules(), {.indexed = indexed}).Run(graph, stats));
+      EXPECT_EQ(stats.check_and_bind_calls, 0u);
+      EXPECT_EQ(stats.rewrites, 0u);
+      EXPECT_EQ(Count(graph, "GroupedMatMul", "local.moe"), 3u);
+      EXPECT_EQ(Count(graph, "MoE", kMSDomain), 0u);
+    }
   }
 }
 

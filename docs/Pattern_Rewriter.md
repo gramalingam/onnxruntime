@@ -41,19 +41,24 @@ schema or a validation of arbitrary model-local function definitions.
 One rule composes the following named patterns rather than constructing
 different pattern strings for each routing choice:
 
-- `Routing` is the common logits/weights/indices tensor contract.
-  `RoutingForms = topk_softmax | softmax_topk | normalized` recognizes
+- `Routing` is the common logits/top-k/weights/indices tensor contract.
+  `RoutingForms = TopKSoftmax | SoftmaxTopK | NormalizedSoftmaxTopK` recognizes
   `Softmax(TopK(logits))`, `TopK(Softmax(logits))`, and the latter divided by the
-  sum of selected probabilities. `normalized` calls `softmax_topk` directly.
-  The constant `top_k` is discovered by the selected body, not a common call port.
-- `Experts` is implemented by `grouped_experts`, which discovers gate/up/down
-  weights and reshape constants. It calls the ordinary `swiglu` body for the
-  gated `Swish(alpha=1)` activation. `Fuse` calls the routing and expert bodies,
+  sum of selected probabilities. `NormalizedSoftmaxTopK` calls `SoftmaxTopK`
+  directly, passing the same immutable `top_k` interface input explicitly.
+- `Experts` is implemented by `GroupedExperts`, which discovers gate/up/down
+  weights and reshape constants. It calls the ordinary `SwiGLU` body for the
+  gated `Swish(alpha=1)` activation. `MoEPattern` calls the routing and expert bodies,
   weights the expert outputs, and reduces over selected slots.
 
+This library uses PascalCase for all interface and pattern definitions
+(bodies and alternatives alike), and snake_case for tensor and instance names.
+Capitalization is a local naming convention, not a distinction in DSL semantics.
+
 Handwritten `RoutingView` and `ExpertsView` use scoped `BindingView` lookups;
-the routing view descends through the selected alternative and, for normalized
-routing, its nested `selected` instance. Shared C++ checks decode immutable
+the routing view reads common ports directly, while the scoped-view tests also
+inspect selected alternatives and the normalized form's nested `selected`
+instance. Shared C++ checks decode immutable
 int64 tensors with `ReadConstantTensor`, propagating malformed-payload errors.
 They require opset 24 float32, rank-2 token inputs, positive static expert,
 hidden and intermediate dimensions, matching token dimensions proven by equal
