@@ -326,5 +326,8 @@ class PatternRewriter final : public GraphTransformer {
 // Float32 examples adapted from genuine ONNXScript rules; EP eligibility is controlled by Options.
 Rules MakeExampleRules();
 
+// Opt-in float32 CPU Mobius residual normalization and exact bias-Gelu fusions.
+Rules MakeMobiusNormalizationRules();
+
 }  // namespace rewrite
 }  // namespace onnxruntime

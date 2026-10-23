@@ -1048,3 +1048,70 @@ There are no pattern-valued parameters, construction-time scalar parameters,
 `where` clauses, tensor-content capture declarations, or C++ code generation.
 Semantic acceptance, tensor decoding, arithmetic and kernel support checks
 remain C++ responsibilities.
+
+## Opt-in Mobius normalization and activation rules
+
+`MakeMobiusNormalizationRules()` is a separate factory; it is not included in
+`MakeExampleRules()` or registered with the default optimizer pipeline:
+
+```cpp
+rewrite::PatternRewriter transformer(rewrite::MakeMobiusNormalizationRules());
+rewrite::Statistics statistics;
+ORT_RETURN_IF_ERROR(transformer.Run(graph, statistics));
+```
+
+These rules use composable `PatternLibrary` bodies, a bias-Add alternation,
+handwritten binding views, C++ semantic checks and pre-parsed replacement
+callbacks. Their source baseline is
+[Mobius `d69efe03a9f4c1ada744bc31dd01077a710b3c39`](https://github.com/onnxruntime/mobius/tree/d69efe03a9f4c1ada744bc31dd01077a710b3c39),
+whose default standard opset is 24.
+
+| Source body | Target in `com.microsoft`, version 1 | Supported subset |
+|---|---|---|
+| `Add` followed by `LayerNormalization` | `SkipLayerNormalization` | Standard opsets 17-24, one or three normalization outputs, optional beta |
+| `Add` followed by `RMSNormalization` | `SkipSimplifiedLayerNormalization` | Standard opsets 23-24, single RMS output |
+| `Gelu(Add(x,bias))` | `BiasGelu` | Standard opsets 20-24, exact/default `approximate="none"`, either Add operand order |
+
+All matched tensors are float32. Assigned nodes must be CPU, even if
+`Options` permits another provider; unassigned nodes are eligible for CPU
+partitioning. Residual inputs must have rank 2 or 3 and provably equal
+dimensions (equal positive static sizes or identical nonempty symbols).
+The hidden width must be a positive static integer supported by the CPU
+kernel; scale and optional beta must be 1D vectors of that width.
+Normalization must reduce only the last axis (`-1` or its positive equivalent),
+use float32 `stash_type`, and have finite positive epsilon, copied exactly.
+Schema defaults are supported after graph resolution. These are numerical,
+not bitwise, fusions: the CPU normalization kernels may accumulate differently.
+
+The residual sum is always replacement output **3**, including when it is a
+graph output or has additional consumers. Three-output LayerNormalization
+preserves both live statistics at outputs 1 and 2. When either statistic is
+a graph output or has a consumer, explicit CPU assignment on the matched nodes
+is required: the CUDA skip kernel does not compute these statistics, so their
+placement cannot safely be left open. Three-output norms with unused statistics
+are also eligible unassigned. The two-output form is
+currently rejected rather than dropping a statistic. Independent dummy
+constants at outputs 1 and 2 of the
+[Mobius RMS function](https://github.com/onnxruntime/mobius/blob/d69efe03a9f4c1ada744bc31dd01077a710b3c39/src/mobius/functions/skip_layer_normalization.py)
+are not matched or reinterpreted as RMS statistics.
+This base already pins ONNX v1.23.2 with `RMSNormalization` schema/kernel 23;
+no ONNX upgrade or synthetic RMS primitive pattern is required.
+
+Unsupported variants are rejected: float16/bfloat16/double, non-CPU assigned
+nodes, unknown or unequal residual dimensions, residual broadcasting, other
+normalization axes/precision, nonvector scale/beta, nonpositive/nonfinite
+epsilon, and model imports outside the ranges above. Primitive norm/Gelu
+expansions, cast sandwiches, and an extra pre-normalization input bias are
+not absorbed. BiasGelu additionally requires a known positive last dimension
+and a matching 1D bias; scalar and multidimensional broadcast biases and
+externally consumed/graph-output Add results are rejected.
+In particular, the pinned
+[Mobius BiasGelu rule](https://github.com/onnxruntime/mobius/blob/d69efe03a9f4c1ada744bc31dd01077a710b3c39/src/mobius/rewrite_rules/_bias_gelu.py)
+incorrectly accepts `approximate="tanh"`; this factory explicitly rejects it
+because ORT BiasGelu computes the exact erf-based activation.
+
+`mobius_normalization_rules_test.cc` builds small faithful fixtures from those
+pinned sources. It checks indexed/reference parity, serialization/reload,
+idempotence, output slots and boundary rejections, and executes unfused/fused
+CPU models (including residuals and live LayerNormalization statistics).
+Contrib-disabled builds expose an empty factory.
