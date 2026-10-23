@@ -28,7 +28,7 @@ struct ConvCase {
 
 // Faithful standard-ONNX expansion of Mobius causal_conv_nd_with_state at
 // d69efe03a9f4c1ada744bc31dd01077a710b3c39, with an optional folded Slice.
-void BuildConv(ModelTestBuilder& b, const ConvCase& c) {
+std::pair<const NodeArg*, const NodeArg*> BuildConv(ModelTestBuilder& b, const ConvCase& c) {
   constexpr int64_t batch = 2, channels = 4;
   auto* x = b.MakeInput<float>({batch, channels, c.sequence}, -0.5f, 0.5f);
   auto* past = b.MakeInput<float>({batch, channels, c.kernel - 1 + (c.mutation == "past_shape" ? 1 : 0)},
@@ -94,6 +94,7 @@ void BuildConv(ModelTestBuilder& b, const ConvCase& c) {
     b.AddNode("Identity", {output}, {b.MakeOutput()});
     b.AddNode("Identity", {present}, {b.MakeOutput()});
   }
+  return {output, present};
 }
 
 struct TestGraph {
@@ -120,7 +121,7 @@ TEST(MobiusStatefulFusionTests, StructuralFormsAndOutputIdentity) {
         c.kernel = kernel;
         c.explicit_step = !computed;
         c.output_consumers = true;
-        BuildConv(test.builder, c);
+        const auto original = BuildConv(test.builder, c);
         ASSERT_STATUS_OK(test.graph.Resolve());
         const auto outputs = test.graph.GetOutputs();
         PatternRewriter rewriter(MakeMobiusStatefulRules());
@@ -132,11 +133,14 @@ TEST(MobiusStatefulFusionTests, StructuralFormsAndOutputIdentity) {
         EXPECT_EQ(Count(test.graph, "Slice"), 0u);
         EXPECT_EQ(Count(test.graph, "Concat"), 0u);
         EXPECT_EQ(Count(test.graph, "Identity"), 2u);
+        EXPECT_EQ(Count(test.graph, "Sigmoid"), 0u);
+        EXPECT_EQ(Count(test.graph, "Swish"), 0u);
         for (const auto& node : test.graph.Nodes()) {
           if (node.OpType() != "CausalConvWithState") continue;
           ASSERT_EQ(node.OutputDefs().size(), 2u);
-          EXPECT_EQ(node.OutputDefs()[0], outputs[1]);
-          EXPECT_EQ(node.OutputDefs()[1], outputs[0]);
+          EXPECT_EQ(node.OutputDefs()[0], original.first);
+          EXPECT_EQ(node.OutputDefs()[1], original.second);
+          EXPECT_EQ(node.GetAttributes().at("activation").s(), c.activation == "none" ? "none" : "silu");
         }
         EXPECT_EQ(test.graph.GetOutputs(), outputs);
         ASSERT_STATUS_OK(test.graph.Resolve());
@@ -189,9 +193,14 @@ TEST(MobiusStatefulFusionTests, CpuNumericalBothOutputs) {
         c.output_consumers = true;
         TransformerTester(
             [c](ModelTestBuilder& b) { BuildConv(b, c); },
-            [](InferenceSessionWrapper& session) {
+            [c](InferenceSessionWrapper& session) {
               EXPECT_EQ(Count(session.GetGraph(), "CausalConvWithState"), 1u);
               EXPECT_EQ(Count(session.GetGraph(), "Conv"), 0u);
+              EXPECT_EQ(Count(session.GetGraph(), "Sigmoid"), 0u);
+              for (const auto& node : session.GetGraph().Nodes()) {
+                if (node.OpType() == "CausalConvWithState")
+                  EXPECT_EQ(node.GetAttributes().at("activation").s(), c.activation);
+              }
             },
             TransformerLevel::Default, TransformerLevel::Level1, 17, 1e-6, 1e-5,
             std::make_unique<PatternRewriter>(MakeMobiusStatefulRules()));
@@ -231,6 +240,30 @@ TEST(MobiusStatefulFusionTests, AmbiguousStateBranchIsRejected) {
     ASSERT_STATUS_OK(rewriter.Run(test.graph, stats));
     EXPECT_EQ(stats.rewrites, 0u);
     EXPECT_EQ(Count(test.graph, "Conv"), 1u);
+  }
+}
+
+TEST(MobiusStatefulFusionTests, MultipleFusionsAgreeWithReference) {
+  for (bool indexed : {false, true}) {
+    TestGraph test;
+    ConvCase c;
+    BuildConv(test.builder, c);
+    c.activation = "silu";
+    c.computed_slice = true;
+    BuildConv(test.builder, c);
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    Options options;
+    options.indexed = indexed;
+    PatternRewriter rewriter(MakeMobiusStatefulRules(), options);
+    Statistics stats;
+    ASSERT_STATUS_OK(rewriter.Run(test.graph, stats));
+    EXPECT_EQ(stats.rewrites, 2u);
+    EXPECT_EQ(Count(test.graph, "CausalConvWithState"), 2u);
+    EXPECT_EQ(Count(test.graph, "Slice"), 0u);
+    EXPECT_EQ(Count(test.graph, "Sigmoid"), 0u);
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    ASSERT_STATUS_OK(rewriter.Run(test.graph, stats));
+    EXPECT_EQ(stats.rewrites, 0u);
   }
 }
 

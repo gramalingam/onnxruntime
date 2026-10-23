@@ -113,6 +113,14 @@ bool Constant(const Graph& graph, const NodeArg* value, int64_t expected) {
 
 bool CheckConv(const Graph& graph, Match& match) {
   const ConvView view(match);
+  if (match.nodes.back()->OpType() == "Add") {
+    // Do not let the no-activation prefix preempt a complete activation rule.
+    for (const auto* consumer : graph.GetConsumerNodes(view.body.valueOf("biased")->Name())) {
+      if (consumer && consumer->Domain() == kOnnxDomain &&
+          (consumer->OpType() == "Sigmoid" || consumer->OpType() == "Swish"))
+        return match.Reject("Leave activation consumers for the complete stateful-convolution rule.");
+    }
+  }
   InlinedVector<int64_t> x, weight, bias, past;
   if (!Shape(view.x, x) || !Shape(view.weight, weight) || !Shape(view.bias, bias) || !Shape(view.past, past) ||
       x.size() != 3 || weight.size() != 3 || bias.size() != 1 || past.size() != 3 ||

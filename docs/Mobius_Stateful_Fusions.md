@@ -23,6 +23,8 @@ External consumers of internal values prevent fusion.
 The family uses `GetPattern(name, true)`'s opt-in, unique-consumer sibling-output
 matching for the otherwise independent Conv and state-Slice branches.
 Ambiguous sibling Slices conservatively prevent fusion.
+The no-activation rule declines a prefix consumed by Sigmoid or Swish so it
+cannot preempt complete activation matching or bypass an unsupported Swish alpha.
 
 The rules require fixed float32 input `[B,C,T]`, weight `[C,1,K]`, bias `[C]`,
 and state `[B,C,K-1]`; B, C, T, K must be positive. K=1 is supported with
