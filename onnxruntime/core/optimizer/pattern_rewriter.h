@@ -326,5 +326,9 @@ class PatternRewriter final : public GraphTransformer {
 // Float32 examples adapted from genuine ONNXScript rules; EP eligibility is controlled by Options.
 Rules MakeExampleRules();
 
+// Opt-in grouped/dense CPU MoE experiments; dense lowering assumes finite intermediates.
+// Not registered as a default optimizer.
+Rules MakeMoEFusionRules();
+
 }  // namespace rewrite
 }  // namespace onnxruntime

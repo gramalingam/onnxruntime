@@ -3778,6 +3778,80 @@ TEST(PatternRewriterTests, PatternCompositionHygienicDimensionsAttributesAndComm
   ASSERT_STATUS_OK(test.graph.Resolve());
 }
 
+TEST(PatternRewriterTests, PatternCompositionExplicitOutputBindings) {
+  const PatternLibrary library(R"(
+    interface Pair(x:float[N]) -> (first:float[N], second:float[N])
+    pattern Positive implements Pair {
+      a = Identity(x)
+      b = Neg(x)
+      return (second=b, first=a)
+    }
+    pattern Negative implements Pair {
+      a = Neg(x)
+      b = Identity(x)
+      return a, b
+    }
+    pattern Forms = Positive | Negative
+    pattern Nested implements Pair {
+      a, b = Forms(x)
+      return a, b
+    }
+    pattern P(x,z) {
+      a:float[2], b = Nested(x)
+      c, d = Nested(z)
+      left = Add(a,b)
+      right = Add(c,d)
+      return Add(left,right)
+    }
+  )");
+  for (bool indexed : {true, false}) {
+    TestGraph test;
+    auto& b = test.builder;
+    auto* x = b.MakeInput<float>({2}, 0.0f, 1.0f);
+    auto* z = b.MakeInput<float>({2}, 0.0f, 1.0f);
+    auto* a = b.MakeIntermediate();
+    auto* second = b.MakeIntermediate();
+    auto* c = b.MakeIntermediate();
+    auto* d = b.MakeIntermediate();
+    auto* left = b.MakeIntermediate();
+    auto* right = b.MakeIntermediate();
+    b.AddNode("Identity", {x}, {a});
+    b.AddNode("Neg", {x}, {second});
+    b.AddNode("Neg", {z}, {c});
+    b.AddNode("Identity", {z}, {d});
+    b.AddNode("Add", {a, second}, {left});
+    b.AddNode("Add", {c, d}, {right});
+    b.AddNode("Add", {left, right}, {b.MakeOutput()});
+    b.SetGraphOutputs();
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    size_t callbacks = 0;
+    auto check = [&](const Graph&, Match& match) {
+      ++callbacks;
+      EXPECT_EQ(match.valueOf("a"), a);
+      EXPECT_EQ(match.valueOf("b"), second);
+      EXPECT_EQ(match.valueOf("c"), c);
+      EXPECT_EQ(match.valueOf("d"), d);
+      EXPECT_THROW(match.instance("a"), OnnxRuntimeException);
+      EXPECT_THROW(match.update("a", {}), OnnxRuntimeException);
+      return true;
+    };
+    Statistics stats;
+    Rule rule{"Explicit", library.GetPattern("P"), "(x,z)=>Add(x,z)", check, {{kOnnxDomain, 17, 17}}};
+    ASSERT_STATUS_OK(PatternRewriter({rule}, {.match_only = true, .indexed = indexed}).Run(test.graph, stats));
+    EXPECT_EQ(stats.matches, 1u);
+    EXPECT_EQ(callbacks, 1u);
+  }
+  for (const auto* body : {
+           "a,b,c=PairBody(x);return Add(a,b)",
+           "a,a=PairBody(x);return Identity(a)",
+           "x,b=PairBody(x);return Add(x,b)",
+           "a,b=PairBody(x);a=Identity(b);return Add(a,b)"}) {
+    const std::string text =
+        "pattern PairBody(x){a=Identity(x);b=Neg(x);return a,b} pattern P(x){" + std::string(body) + "}";
+    EXPECT_THROW(PatternLibrary{text}, OnnxRuntimeException);
+  }
+}
+
 TEST(PatternRewriterTests, PatternCompositionIdentityPortsRemapAndInterfaceConstraintsConjoin) {
   PatternLibrary library(R"(
     interface Pass(x:float[N]) -> (y:float[N])
@@ -4575,6 +4649,93 @@ TEST(PatternRewriterTests, ZeroNodeCompositionHasCumulativeCallBudget) {
   }
   EXPECT_THROW(PatternLibrary(text + "pattern P10(x){a=P7(x);b=P7(a.y);return (y=b.y)}"),
                OnnxRuntimeException);
+}
+
+TEST(PatternRewriterTests, ExplicitOutputBindingsPreserveAliasesAndCallBudget) {
+  const PatternLibrary library(R"(
+    pattern Pair(x) { return (a=x,b=x) }
+    pattern P(x) { a,b=Pair(x); return Add(a,b) }
+  )");
+  for (bool indexed : {true, false}) {
+    TestGraph test;
+    auto& b = test.builder;
+    auto* x = b.MakeInput<float>({2}, 0.0f, 1.0f);
+    b.AddNode("Add", {x, x}, {b.MakeOutput()});
+    b.SetGraphOutputs();
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    auto check = [&](const Graph&, Match& match) {
+      EXPECT_EQ(match.valueOf("a"), x);
+      EXPECT_EQ(match.valueOf("b"), x);
+      return true;
+    };
+    Rule rule{"Alias", library.GetPattern("P"), "(x)=>Identity(x)", check, {{kOnnxDomain, 17, 17}}};
+    Statistics stats;
+    ASSERT_STATUS_OK(PatternRewriter({rule}, {.indexed = indexed}).Run(test.graph, stats));
+    EXPECT_EQ(stats.rewrites, 1u);
+    ASSERT_STATUS_OK(test.graph.Resolve());
+  }
+  std::string text = "pattern P0(x){return (a=x,b=x)} ";
+  for (int i = 1; i <= 7; ++i) {
+    const auto previous = "P" + std::to_string(i - 1);
+    text += "pattern P" + std::to_string(i) + "(x){a,b=" + previous + "(x);c,d=" + previous + "(a);return c,d} ";
+  }
+  text += "pattern P8(x){a,b=P7(x);return a,b} pattern P9(x){a,b=P8(x);return a,b} ";
+  EXPECT_NO_THROW(PatternLibrary{text});
+  try {
+    PatternLibrary overflow(text + "pattern P10(x){a,b=P9(x);return a,b}");
+    FAIL() << "Explicit output binding must retain the cumulative call budget.";
+  } catch (const OnnxRuntimeException& error) {
+    EXPECT_NE(std::string(error.what()).find("expanded call limit of 256"), std::string::npos);
+  }
+}
+
+TEST(PatternRewriterTests, ExplicitOutputAliasAnnotationsConjoin) {
+  const PatternLibrary library(R"(
+    pattern InputPair(x) { return (a=x,b=x) }
+    pattern OutputPair(x) { y=Identity(x); return (a=y,b=y) }
+    pattern InputConflict(x:float[2]) { a:float[3],b=InputPair(x); return Add(a,b) }
+    pattern InputCompatible(x:float[2]) { a:float[2],b=InputPair(x); return Add(a,b) }
+    pattern OutputConflict(x) { a:float[2],b:float[3]=OutputPair(x); return Add(a,b) }
+    pattern OutputCompatible(x) { a:float[2],b:float[2]=OutputPair(x); return Add(a,b) }
+    pattern RepeatedConflict(x:float[]) { a:float[2],b:float[3]=InputPair(x); return Add(a,b) }
+    pattern RepeatedCompatible(x:float[]) { a:float[2],b:float[2]=InputPair(x); return Add(a,b) }
+  )");
+  for (const char* name : {"InputConflict", "InputCompatible", "OutputConflict", "OutputCompatible",
+                           "RepeatedConflict", "RepeatedCompatible"}) {
+    for (bool indexed : {true, false}) {
+      for (int64_t size : {2, 3}) {
+        SCOPED_TRACE(name);
+        SCOPED_TRACE(indexed);
+        SCOPED_TRACE(size);
+        const bool produced = std::string_view(name).find("Output") == 0;
+        const bool accepted = std::string_view(name).find("Compatible") != std::string_view::npos && size == 2;
+        TestGraph test;
+        auto& b = test.builder;
+        auto* x = b.MakeInput<float>({size}, 0.0f, 1.0f);
+        auto* alias = x;
+        if (produced) {
+          alias = b.MakeIntermediate();
+          b.AddNode("Identity", {x}, {alias});
+        }
+        b.AddNode("Add", {alias, alias}, {b.MakeOutput()});
+        b.SetGraphOutputs();
+        ASSERT_STATUS_OK(test.graph.Resolve());
+        size_t callbacks = 0;
+        auto check = [&](const Graph&, Match& match) {
+          ++callbacks;
+          EXPECT_EQ(match.valueOf("a"), alias);
+          EXPECT_EQ(match.valueOf("b"), alias);
+          return true;
+        };
+        Rule rule{"AliasConstraints", library.GetPattern(name), "(x)=>Neg(x)", check, {{kOnnxDomain, 17, 17}}};
+        Statistics stats;
+        ASSERT_STATUS_OK(PatternRewriter({rule}, {.indexed = indexed}).Run(test.graph, stats));
+        EXPECT_EQ(stats.rewrites, accepted ? 1u : 0u);
+        EXPECT_EQ(callbacks, accepted ? 1u : 0u);
+        ASSERT_STATUS_OK(test.graph.Resolve());
+      }
+    }
+  }
 }
 
 TEST(PatternRewriterTests, InterfacePortsCannotBecomeAttributes) {

@@ -15,6 +15,198 @@ the original text need not outlive the rule. Rules remain copyable and movable.
 The matcher establishes structural and deletion safety. **The rule author must establish
 semantic equivalence, supported types, and kernel compatibility.**
 
+## Composable Mobius MoE experiments
+
+`MakeMoEFusionRules()` reimplements the
+[GroupedMatMul MoE experiment](https://github.com/gramalingam/onnxruntime/pull/11)
+using `PatternLibrary`, and adds a bounded dense-source rule described below.
+These are **opt-in experiments**, not a generally equivalent or production-ready
+MoE optimizer. They are not registered as default graph transformers.
+
+```cpp
+rewrite::PatternRewriter rewriter(rewrite::MakeMoEFusionRules());
+rewrite::Statistics statistics;
+ORT_THROW_IF_ERROR(rewriter.Run(graph, statistics));
+ORT_THROW_IF_ERROR(graph.Resolve());
+```
+
+Apply it to a resolved graph before function inlining or generic
+MatMul/activation fusions. The source uses `local.moe.GroupedMatMul` version 1,
+a model-local ONNX function implementing the bias-free
+[GroupedMatMul RFC](https://github.com/onnx/onnx/pull/8193): inputs `[M,H]`,
+weights `[E,H,I]`, indices `[M,k]`, output `[M,k,I]`. The rule assumes this
+trusted local function's semantics; the function name is not a standard ONNX
+schema or a validation of arbitrary model-local function definitions.
+
+One rule composes the following named patterns rather than constructing
+different pattern strings for each routing choice:
+
+- `Routing` is the common logits/top-k/weights/indices tensor contract.
+  `RoutingForms = TopKSoftmax | SoftmaxTopK | NormalizedSoftmaxTopK` recognizes
+  `Softmax(TopK(logits))`, `TopK(Softmax(logits))`, and the latter divided by the
+  sum of selected probabilities. `NormalizedSoftmaxTopK` calls `SoftmaxTopK`
+  directly, passing the same immutable `top_k` interface input explicitly.
+- `Experts` is implemented by `GroupedExperts`, with explicit inputs for
+  gate/up/down weights and reshape constants. It calls the ordinary `SwiGLU` body for the
+  gated `Swish(alpha=1)` activation. `MoEPattern` calls the routing and expert bodies,
+  weights the expert outputs, and reduces over selected slots.
+
+This library uses PascalCase for all interface and pattern definitions
+(bodies and alternatives alike), and snake_case for tensor and instance names.
+Capitalization is a local naming convention, not a distinction in DSL semantics.
+`weights, indices = RoutingForms(logits, top_k)` binds the two output tensors
+directly to local names, in interface output order. The checker reads them with
+`match.valueOf("weights")` and `match.valueOf("indices")`, without a routing
+instance view.
+`GroupedExperts` receives every interface input explicitly at its call site.
+
+Handwritten `RoutingView` reads directly bound tensors from `Match`, while
+`ExpertsView` uses scoped `BindingView` lookups for the named expert instance.
+The matched weights producer distinguishes unnormalized
+TopK weights from the two normalized forms. Shared C++ checks decode immutable
+int64 tensors with `ReadConstantTensor`, propagating malformed-payload errors.
+They require opset 24 float32, rank-2 token inputs, positive static expert,
+hidden and intermediate dimensions, matching token dimensions proven by equal
+positive integers or the same nonempty symbolic name, and static `1 <= k <= E`.
+Anonymous unknown dimensions are not equality evidence. Flatten/regroup shapes
+must be `[-1,I]` and `[-1,k,H]`; down-projection indices must flatten the same
+selected indices to `[-1,1]`.
+
+The checker binds `k` and the normalization attribute with `Match::update`.
+One pre-parsed replacement references scoped expert leaves, transposes and
+interleaves gate/up rows to `[E,2*I,H]`, and emits
+`com.microsoft.MoE(activation_type="swiglu", swiglu_fusion=1)`. It passes raw
+logits and sets `normalize_routing_weights=1` for the first and third routing
+forms, otherwise zero. Constant folding may evaluate weight packing.
+The layout targets CPU MoE; it is not a portable CUDA/other-EP lowering.
+The default rewriter provider and deletion-boundary checks reject incompatible
+assigned providers, external consumers and exposed intermediate graph outputs.
+Quantized experts, biases, clipped activations and other routing/layout choices
+are deliberately out of scope.
+
+**Grouped-rule numerical limitations:** CPU MoE's expert selection does not implement ONNX
+TopK's lower-index tie preference. Full-softmax versus selected-softmax
+evaluation and normalization can also differ through rounding, underflow,
+overflow and nonfinite values. These rules do not prove absence of routing
+ties or numerical equivalence; graph resolution is not an execution comparison.
+Use only as an explicit experiment with trusted inputs/functions and separate
+target-specific numerical validation, not as a general-purpose optimization.
+
+The three `test/testdata/transform/fusion/mobius_moe_*.onnx` fixtures and adjacent
+`generate_mobius_moe.py` are preserved from the original experiment. The
+generator records Mobius revision `b1e9c8e9dec1dfa206183f957e77d07cfb734df2`,
+uses real Mobius routing with deterministic synthetic weights and a grouped
+expert body, embeds the local function, and downloads no checkpoints.
+`MoEFusionRulesTests.*` checks all routing forms and different expert counts,
+raw-logit and attribute preservation, resolve/reload/idempotence, explicit routing
+output bindings, scoped expert views, and rejection/error cases in indexed and reference modes.
+The grouped-fixture cases remain structural tests; their end-to-end numerical comparison is deferred.
+The CPU packing regression separately constant-folds the generated weight
+subgraph with distinct gate/up/down entries and checks every interleaved FC1
+and transposed FC2 element in both matcher modes.
+
+### Bounded dense two-expert Mobius lowering
+
+`DenseTwoExpertMoE` recognizes the standard-op skeleton of Mobius
+`TopKGate` + bias-free SiLU `MLP` + `MoELayer.forward`: `TopK` followed by
+selected-logit `Softmax`, two complete expert bodies, per-expert
+`Equal`/`CastLike`/weighted `ReduceSum` masks, then an ordered sum of the
+contributions. `DenseMoEPattern` calls the shared `TopKSoftmax` body and two
+`DenseExpert` bodies, each of which calls the shared `SwiGLU` body.
+No local GroupedMatMul function or matcher extension is needed.
+
+This initial rule requires exactly **two experts, top-k=1, float32, opset 24**,
+rank-2 token inputs with proven matching token dimensions, positive static
+hidden/intermediate sizes, unscaled routing, and immutable bias-free weights. Source gate/up
+weights are `[I,H]` and down weights `[H,I]`, each used through
+`Transpose(perm=[1,0])` + `MatMul`. The checker verifies the two scalar expert
+IDs are 0 and 1 and all six matrices have uniform geometry. Apply before
+constant folding removes those Transposes or generic expert fusions hide
+the source operators. Constants must already be represented as initializers.
+
+The pre-parsed replacement reproduces ONNX `TopK` on the original logits,
+then uses `Equal(indices, [0,1])` and a float `Cast` as CPU MoE routing scores.
+With `k=1` and normalized routing, the sole selected weight is one.
+The scores have a unique winner, so CPU MoE cannot override ONNX's lower-index
+tie choice (or lose close unequal logits through its full-softmax rounding).
+This adapter is specific to `k=1`; extending it to larger k requires preserving
+the actual selected routing weights, not just one-hot membership.
+Gate/up rows are interleaved, not concatenated, into `[2,2*I,H]`, and down
+matrices are stacked into `[2,H,I]` for CPU `swiglu_fusion=1`.
+
+**Admitted numerical contract:** opting into this dense rule assumes finite
+inputs, weights, logits and all source/target intermediates, and accepts
+tolerance-based float32 equivalence rather than bitwise equality or signed-zero
+preservation. This assumption is supplied by the caller, not proven by the
+static checker or enforced with runtime guards. In particular, finite
+parameters alone do not guarantee finite intermediates for arbitrary runtime
+activations. A TODO at eligibility records that dense inactive-expert NaN/Inf
+propagation versus target skipping still needs investigation.
+The overflow counterexample remains a regression demonstrating behavior
+**outside** this contract; the rule is not IEEE-equivalent on such inputs.
+
+`DenseTwoExpertMobiusNumericalParityAndPacking` runs both genuine standard
+source and rewritten CPU graphs with automatic optimization disabled. Distinct
+non-square expert weights, multiple tokens, negative/zero activations, equal
+and unequal logits (including differences lost by full-softmax rounding),
+both experts selected, static/symbolic token metadata,
+and both matcher modes are covered. The output is checked against both the
+source and an independent double-precision reference using absolute-plus-relative
+tolerance `1e-5 + 1e-5 * |reference|`. The test asserts that CPU executes
+the MoE node and separately verifies every packed gate/up/down element after
+constant folding, serialization/reload, and rewrite idempotence.
+Negative cases reject top-k=2, wrong activation/transpose/mask/reduction,
+overridable weights, exposed intermediate outputs, incompatible providers,
+and unproven expert dimensions or unknown-rank token metadata.
+
+### Coverage relative to current Mobius MoE sources
+
+The inventory baseline is Mobius
+[`d69efe03a9f4c1ada744bc31dd01077a710b3c39`](https://github.com/onnxruntime/mobius/tree/d69efe03a9f4c1ada744bc31dd01077a710b3c39).
+The grouped fixtures above use real routing components but substitute a local
+GroupedMatMul expert body. They are **not evidence of matching** standard or
+mixed-op sources; the separate dense tests above establish only the bounded
+coverage listed here.
+
+| Source | Current coverage | Required before extending |
+|---|---|---|
+| A10 Qwen4 `_standard_dispatch` | Deferred | Verify `Scan` accumulator recurrence, nested nonempty `If`, captured weight banks, token gathering/scattering, FP32 SiLU opmath and casts. Pattern nodes with subgraphs are currently rejected; matching an isolated body is not proof of the enclosing recurrence. |
+| A10 `MoELayer.forward` dense mask-and-sum | Two bias-free float32 SiLU experts, top-k=1, under the finite-intermediate tolerance contract | Other counts/k, activations, biases and routing forms remain deferred. The explicit ONNX selection adapter preserves ties; inactive nonfinite propagation is outside the admitted contract. |
+| A10 Gemma4 vectorized fallback | Deferred | Separate Einsum/routing-layout checks and exact activation qualification. QuickGELU with alpha 1.702 is not exact erf/tanh GELU. |
+| B1 dense `MatMulNBits` experts to QMoE | Deferred | Uniform INT4 geometry, interleaved packed weights **and** scales/zero points, CPU ABI qualification, routing and dense inactive-expert semantics. Not covered by float grouped rules or by projection fusion alone. |
+
+Source anchors: [`MoELayer.forward`](https://github.com/onnxruntime/mobius/blob/d69efe03a9f4c1ada744bc31dd01077a710b3c39/src/mobius/components/_moe.py#L671-L691),
+[`Qwen4._standard_dispatch`](https://github.com/onnxruntime/mobius/blob/d69efe03a9f4c1ada744bc31dd01077a710b3c39/src/mobius/models/qwen4_exp.py#L1108-L1184),
+and [`_qmoe_fusion._fuse_layer`](https://github.com/onnxruntime/mobius/blob/d69efe03a9f4c1ada744bc31dd01077a710b3c39/src/mobius/rewrite_rules/_qmoe_fusion.py#L350-L449).
+The last source emits concatenated gate/up rows with `swiglu_fusion=2`;
+this tree's CPU QMoE requires interleaved `swiglu_fusion=1`. Copying that
+upstream replacement is therefore not a runnable CPU implementation.
+
+`DenseMobiusRoutingAndInactiveExpertCounterexamples` faithfully reproduces
+the pinned `TopKGate`, bias-free `MLP` and dense `MoELayer.forward` graph for
+two experts and `k=1`, without downloading checkpoints or introducing a local
+GroupedMatMul function. It runs the source, two hand-built candidate targets,
+and the new dense rule's replacement on CPU:
+
+- With equal logits and distinct expert outputs, ONNX TopK selects expert 0,
+  whereas CPU MoE selects expert 1. Building selection scores from the original
+  TopK indices with `Equal`/`Cast` restores the selected expert and the finite
+  output in this test; raw-logit substitution does not. The registered dense
+  rule uses this adapter, and its actual rewritten target also passes.
+- With untied logits, finite activations and finite weights, an inactive
+  expert's `FLT_MAX` down-projection overflows. Dense evaluation multiplies
+  that infinity by its zero mask and returns NaN. Both naive and
+  selection-adapted MoE skip the inactive expert and return finite results.
+  Thus a tie adapter alone is insufficient, and checking finite constant
+  weights does not prove finite runtime intermediates. The registered dense
+  replacement exhibits the same divergence outside its admitted contract.
+
+No full A10 or B1 coverage is claimed. Arbitrary nonfinite/overflow behavior
+would require runtime guards with a faithful fallback or a different target
+execution policy, and the recurrent source independently requires region
+support. A static match callback cannot infer the needed runtime activation
+bounds.
+
 ## Example: HardSigmoid followed by Mul
 
 This complete rule recognizes the HardSwish decomposition with the exact
@@ -857,8 +1049,25 @@ Inline operator or
 subgraph alternative spellings are not supported; existing `|` type
 annotations are unchanged.
 
-Calls require one assigned instance name. Use `act.product` for common outputs
-and C++ views for concrete internals. A single-output instance additionally
+Multi-output calls can bind output tensors explicitly:
+
+```text
+weights, indices = RoutingForms(logits, top_k)
+```
+
+Names bind directly to the corresponding output `NodeArg`s in declared output
+order, just as for multi-output ONNX operators. The number of names must match
+the number of outputs; duplicate or already-defined names are rejected.
+Annotations on these names constrain the bound output tensors conjunctively,
+including when multiple outputs alias each other or a previously annotated input.
+Nested calls and
+alternatives retain occurrence-local internal bindings without exposing an
+instance under any of the output names. Checkers use `match.valueOf("weights")`,
+not `match.instance("weights")`. Internal generated scopes are private.
+
+The existing named-instance form remains supported for inspecting concrete
+internals: use `act=Forms(g,u)`, `act.product` for common outputs, and C++ views.
+A single-output instance additionally
 allows `act` as shorthand for its output. Tensor handles, attribute captures,
 dimensions and element-type variables are remapped into the call occurrence.
 Two instances do not share a capture just because its local spelling is the
