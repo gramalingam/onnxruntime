@@ -1081,7 +1081,16 @@ kernel; scale and optional beta must be 1D vectors of that width.
 Normalization must reduce only the last axis (`-1` or its positive equivalent),
 use float32 `stash_type`, and have finite positive epsilon, copied exactly.
 Schema defaults are supported after graph resolution. These are numerical,
-not bitwise, fusions: the CPU normalization kernels may accumulate differently.
+not bitwise, fusions. Native float32 CPU skip normalization uses the same
+`MlasLayerNormF32` dispatcher and scalar fallback as standard normalization,
+avoiding a scalar-Welford versus centered-MLAS algorithm mismatch on wide,
+high-offset LayerNormalization rows. The kernel first materializes the rounded
+residual (including optional input bias for direct kernel callers) separately
+from the normalized output. It reuses output 3 when present, otherwise allocates
+an ORT-owned float32 scratch tensor of the input size. No platform-specific
+MLAS input/output aliasing guarantee is assumed. MLAS decline leaves the
+residual intact for scalar fallback; RMS mean remains the ABI's zero placeholder.
+Double and float16/bfloat16 kernel arithmetic is not switched to this new path.
 
 The residual sum is always replacement output **3**, including when it is a
 graph output or has additional consumers. Three-output LayerNormalization
@@ -1114,4 +1123,9 @@ because ORT BiasGelu computes the exact erf-based activation.
 pinned sources. It checks indexed/reference parity, serialization/reload,
 idempotence, output slots and boundary rejections, and executes unfused/fused
 CPU models (including residuals and live LayerNormalization statistics).
+Wide high-offset fixtures cover widths 8, 16, 33 and 256, both optional-beta
+forms, live statistics, and residual-output versus scratch-buffer paths.
+Direct CPU skip-kernel tests additionally cover widths 4, 8, 16 and 33,
+optional input bias/beta, broadcast skip, RMS mean semantics and residual
+preservation, plus high-offset statistics against the standard CPU kernel.
 Contrib-disabled builds expose an empty factory.

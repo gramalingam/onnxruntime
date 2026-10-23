@@ -254,6 +254,47 @@ TEST(MobiusNormalizationRulesTests, SourceBackedLayerNormAndRmsFixtures) {
   }
 }
 
+TEST(MobiusNormalizationRulesTests, WideHighOffsetRowsPreserveNormalizationAndLiveStatistics) {
+  for (bool rms : {false, true}) {
+    for (int64_t width : {8, 16, 33, 256}) {
+      for (bool beta : {false, true}) {
+        for (bool statistics : {false, true}) {
+          if (rms && statistics) continue;
+          SCOPED_TRACE(rms);
+          SCOPED_TRACE(width);
+          SCOPED_TRACE(beta);
+          SCOPED_TRACE(statistics);
+          Fixture fixture;
+          NormConfig config;
+          config.rms = rms;
+          config.beta = beta;
+          config.outputs = statistics ? 3 : 1;
+          config.sum_output = config.sum_consumer = statistics;
+          config.shape = config.skip_shape = {2, width};
+          config.scale_width = config.beta_width = width;
+          auto nodes = BuildNorm(fixture.builder, config);
+          auto* input = fixture.builder.feeds_.at(nodes.x->Name()).GetMutable<Tensor>()->MutableData<float>();
+          auto* skip = fixture.builder.feeds_.at(nodes.skip->Name()).GetMutable<Tensor>()->MutableData<float>();
+          for (int64_t row = 0; row < 2; ++row) {
+            for (int64_t i = 0; i < width; ++i) {
+              input[row * width + i] = 100000000.0f + 8.0f * static_cast<float>(i);
+              skip[row * width + i] = 0.0f;
+            }
+          }
+          nodes.norm->MutableInputDefs()[1] = fixture.builder.MakeInitializer<float>(
+              {width}, std::vector<float>(static_cast<size_t>(width), 1.0f));
+          if (!rms && beta) {
+            nodes.norm->MutableInputDefs()[2] = fixture.builder.MakeInitializer<float>(
+                {width}, std::vector<float>(static_cast<size_t>(width), 0.0f));
+          }
+          for (auto& node : fixture.graph.Nodes()) node.SetExecutionProviderType(kCpuExecutionProvider);
+          CheckFixture(fixture, rms ? "SkipSimplifiedLayerNormalization" : "SkipLayerNormalization", true, true);
+        }
+      }
+    }
+  }
+}
+
 TEST(MobiusNormalizationRulesTests, RejectsUnprovedResidualAndUnsupportedNormalization) {
   for (bool rms : {false, true}) {
     for (int variant = 0; variant < 17; ++variant) {
