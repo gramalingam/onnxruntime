@@ -94,6 +94,7 @@ class Pattern {
   const auto& TypeConstraints() const { return type_constraints_; }
   bool IsAttribute(Value value) const { return attribute_inputs_.count(value.handle) != 0; }
   const auto& OrderedTypeConstraints() const { return ordered_type_constraints_; }
+  bool AllowsSiblingOutputs() const { return allow_sibling_outputs_; }
 
  private:
   friend class detail::PatternParser;
@@ -114,6 +115,7 @@ class Pattern {
 
   size_t value_count_ = 0;
   size_t expanded_calls_ = 0;
+  bool allow_sibling_outputs_ = false;
   InlinedVector<NodePattern, 1> nodes_;
   InlinedVector<Value> values_;
   InlinedHashMap<int, Literal> constants_;
@@ -142,7 +144,9 @@ class Pattern {
 class PatternLibrary {
  public:
   explicit PatternLibrary(std::string_view text);
-  Pattern GetPattern(std::string_view name) const;
+  // Opt in to returned sibling branches, identified only through uniquely matching
+  // consumers of already bound inputs. Does not permit subgraph-owning operators.
+  Pattern GetPattern(std::string_view name, bool allow_sibling_outputs = false) const;
 
  private:
   std::shared_ptr<const detail::PatternModule> module_;

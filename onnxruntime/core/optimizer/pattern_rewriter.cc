@@ -28,7 +28,7 @@ std::string Key(const std::string& op, const std::string& domain) { return domai
 std::string Signature(const Pattern& pattern) {
   std::ostringstream stream;
   stream.imbue(std::locale::classic());
-  stream << pattern.ValueCount() << ':';
+  stream << pattern.ValueCount() << ':' << pattern.AllowsSiblingOutputs() << ':';
   for (Value output : pattern.Outputs()) stream << 'r' << output.handle << ',';
   for (int id = 0; id < static_cast<int>(pattern.ValueCount()); ++id)
     if (pattern.IsOptional(id)) stream << '?' << id << ',';
@@ -148,6 +148,39 @@ bool MatchPattern(const Pattern& pattern, const Graph& graph, const Node& root, 
         auto it = producers.find(match.values[output]);
         if (it != producers.end()) node = graph.GetNode(it->second);
         break;
+      }
+    }
+    if (!node && pattern.AllowsSiblingOutputs()) {
+      const NodeArg* shared_input = nullptr;
+      for (Value input : expected.inputs) {
+        if (input.handle >= 0 && bound[input.handle] && match.values[input.handle]) {
+          shared_input = match.values[input.handle];
+          break;
+        }
+      }
+      if (shared_input) {
+        for (const Node* candidate : graph.GetConsumerNodes(shared_input->Name())) {
+          if (!candidate || distinct.count(candidate->Index()) || candidate->OpType() != expected.op.name ||
+              candidate->Domain() != expected.op.domain || candidate->InputDefs().size() > expected.inputs.size() ||
+              candidate->OutputDefs().size() != expected.outputs.size())
+            continue;
+          bool compatible = true;
+          for (size_t j = 0; j < expected.inputs.size() && compatible; ++j) {
+            const auto input = expected.inputs[j];
+            const NodeArg* actual = j < candidate->InputDefs().size() && candidate->InputDefs()[j]->Exists()
+                                        ? candidate->InputDefs()[j]
+                                        : nullptr;
+            compatible = input.handle < 0 ? actual == nullptr
+                                          : (!bound[input.handle] || match.values[input.handle] == actual);
+          }
+          for (const auto& attribute : expected.attributes) {
+            auto found = candidate->GetAttributes().find(attribute.name);
+            compatible = compatible && found != candidate->GetAttributes().end() && attribute.Matches(found->second);
+          }
+          if (!compatible) continue;
+          if (node && node != candidate) return fail(FailureStage::Structure, "Ambiguous sibling output branch.");
+          node = candidate;
+        }
       }
     }
     if (!node) return fail(FailureStage::Structure, "No producer for the expected node.");
@@ -1557,19 +1590,28 @@ class PatternModule {
     for (auto& definition : definitions_) Compile(definition);
   }
 
-  Pattern GetPattern(std::string_view name) const {
+  Pattern GetPattern(std::string_view name, bool allow_sibling_outputs) const {
     auto found = by_name_.find(std::string(name));
     ORT_ENFORCE(found != by_name_.end(), "Unknown library pattern: ", name);
     const auto& definition = definitions_[found->second];
     ORT_ENFORCE(definition.kind != Definition::Kind::Interface, "Interfaces cannot be rule entries: ", name);
-    for (const auto& plan : definition.plans) ValidateEntry(*plan, name);
+    for (const auto& plan : definition.plans) ValidateEntry(*plan, name, allow_sibling_outputs);
     Pattern result = *definition.plans.front();
-    for (size_t i = 1; i < definition.plans.size(); ++i) result.alternatives_.push_back(definition.plans[i]);
+    result.allow_sibling_outputs_ = allow_sibling_outputs;
+    for (size_t i = 1; i < definition.plans.size(); ++i) {
+      if (!allow_sibling_outputs) {
+        result.alternatives_.push_back(definition.plans[i]);
+        continue;
+      }
+      auto alternative = std::make_shared<Pattern>(*definition.plans[i]);
+      alternative->allow_sibling_outputs_ = true;
+      result.alternatives_.push_back(std::move(alternative));
+    }
     return result;
   }
 
  private:
-  static void ValidateEntry(const Pattern& plan, std::string_view name) {
+  static void ValidateEntry(const Pattern& plan, std::string_view name, bool allow_sibling_outputs) {
     ORT_ENFORCE(!plan.Nodes().empty(), "Pattern ", name, " cannot be a rule entry: no operator root.");
     InlinedHashSet<int> returned;
     for (Value output : plan.Outputs()) {
@@ -1580,6 +1622,9 @@ class PatternModule {
     }
     InlinedHashSet<int> reachable;
     for (Value value : plan.Nodes().back().outputs) reachable.insert(value.handle);
+    if (allow_sibling_outputs) {
+      for (Value value : plan.Outputs()) reachable.insert(value.handle);
+    }
     for (auto it = plan.Nodes().rbegin(); it != plan.Nodes().rend(); ++it) {
       ORT_ENFORCE(std::any_of(it->outputs.begin(), it->outputs.end(),
                               [&](Value value) { return reachable.count(value.handle); }),
@@ -1714,7 +1759,9 @@ class PatternModule {
 }  // namespace detail
 
 PatternLibrary::PatternLibrary(std::string_view text) : module_(std::make_shared<const detail::PatternModule>(text)) {}
-Pattern PatternLibrary::GetPattern(std::string_view name) const { return module_->GetPattern(name); }
+Pattern PatternLibrary::GetPattern(std::string_view name, bool allow_sibling_outputs) const {
+  return module_->GetPattern(name, allow_sibling_outputs);
+}
 
 Rule::Rule(std::string name, Pattern pattern, ReplacementFunction replacement, CheckAndBind check_and_bind,
            InlinedVector<OpsetRequirement, 1> opsets)
@@ -1989,10 +2036,13 @@ PatternRewriter::PatternRewriter(Rules rules, Options options)
       }
       recipe->plan_ = std::make_shared<const InlinedVector<Replacement::NodeRecipe, 1>>(std::move(nodes));
     }
-    // Every node must reach the last node. Disconnected definitions are not patterns.
+    // Sibling-output entries additionally permit ancestors of other returned values.
     const auto& root_outputs = rule.pattern.Nodes().back().outputs;
     InlinedHashSet<int> reachable;
     for (Value output : root_outputs) reachable.insert(output.handle);
+    if (rule.pattern.AllowsSiblingOutputs()) {
+      for (Value output : rule.pattern.Outputs()) reachable.insert(output.handle);
+    }
     for (auto it = rule.pattern.Nodes().rbegin(); it != rule.pattern.Nodes().rend(); ++it) {
       ORT_ENFORCE(
           std::any_of(it->outputs.begin(), it->outputs.end(), [&](Value output) { return reachable.count(output); }),

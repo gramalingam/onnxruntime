@@ -493,6 +493,22 @@ Returned values may have graph outputs or external consumers because their
 identities are preserved. Even match-only mode applies deletion-boundary checks:
 it reports safe rewrite eligibility, not arbitrary structural occurrences.
 
+### Opt-in sibling outputs
+
+`PatternLibrary::GetPattern(name, true)` additionally permits returned branches
+that are not ancestors of the last operator, such as a convolution output and a
+carry-state Slice sharing a concatenated input. The default remains single-root.
+When reverse producer traversal cannot bind an operator, this mode examines
+consumers of an already bound input and requires exactly one candidate with the
+expected operator, arity, bound inputs and listed attributes. Ambiguity rejects
+the match; it does not trigger search/backtracking based on constants or semantic
+checks. Branches with no already bound input cannot match.
+
+All ordinary dtype, constant, deletion-boundary, provider and cycle checks still
+apply. Subgraph owners and implicit inputs remain forbidden. Replacement recipes
+still require a single sink, which may expose multiple outputs. This bounded
+facility does not provide general multi-root search or nested-graph matching.
+
 ### Types in the supplied examples
 
 `MakeExampleRules()` supplies six rules when contrib operators are enabled:
