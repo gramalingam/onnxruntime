@@ -15,13 +15,13 @@ the original text need not outlive the rule. Rules remain copyable and movable.
 The matcher establishes structural and deletion safety. **The rule author must establish
 semantic equivalence, supported types, and kernel compatibility.**
 
-## Composable Mobius MoE proof of concept
+## Composable Mobius MoE experiments
 
 `MakeMoEFusionRules()` reimplements the
 [GroupedMatMul MoE experiment](https://github.com/gramalingam/onnxruntime/pull/11)
-using `PatternLibrary`. This is an **opt-in structural proof of concept**, not
-a generally equivalent or production-ready MoE optimizer. It is not registered
-as a default graph transformer.
+using `PatternLibrary`, and adds a bounded dense-source rule described below.
+These are **opt-in experiments**, not a generally equivalent or production-ready
+MoE optimizer. They are not registered as default graph transformers.
 
 ```cpp
 rewrite::PatternRewriter rewriter(rewrite::MakeMoEFusionRules());
@@ -84,7 +84,7 @@ assigned providers, external consumers and exposed intermediate graph outputs.
 Quantized experts, biases, clipped activations and other routing/layout choices
 are deliberately out of scope.
 
-**Numerical limitations:** CPU MoE's expert selection does not implement ONNX
+**Grouped-rule numerical limitations:** CPU MoE's expert selection does not implement ONNX
 TopK's lower-index tie preference. Full-softmax versus selected-softmax
 evaluation and normalization can also differ through rounding, underflow,
 overflow and nonfinite values. These rules do not prove absence of routing
@@ -99,24 +99,79 @@ uses real Mobius routing with deterministic synthetic weights and a grouped
 expert body, embeds the local function, and downloads no checkpoints.
 `MoEFusionRulesTests.*` checks all routing forms and different expert counts,
 raw-logit and attribute preservation, resolve/reload/idempotence, explicit routing
-output bindings, scoped expert views, and rejection/error cases in indexed and reference modes. These remain
-structural tests; end-to-end numerical comparison is deferred.
+output bindings, scoped expert views, and rejection/error cases in indexed and reference modes.
+The grouped-fixture cases remain structural tests; their end-to-end numerical comparison is deferred.
 The CPU packing regression separately constant-folds the generated weight
 subgraph with distinct gate/up/down entries and checks every interleaved FC1
 and transposed FC2 element in both matcher modes.
+
+### Bounded dense two-expert Mobius lowering
+
+`DenseTwoExpertMoE` recognizes the standard-op skeleton of Mobius
+`TopKGate` + bias-free SiLU `MLP` + `MoELayer.forward`: `TopK` followed by
+selected-logit `Softmax`, two complete expert bodies, per-expert
+`Equal`/`CastLike`/weighted `ReduceSum` masks, then an ordered sum of the
+contributions. `DenseMoEPattern` calls the shared `TopKSoftmax` body and two
+`DenseExpert` bodies, each of which calls the shared `SwiGLU` body.
+No local GroupedMatMul function or matcher extension is needed.
+
+This initial rule requires exactly **two experts, top-k=1, float32, opset 24**,
+rank-2 token inputs with proven matching token dimensions, positive static
+hidden/intermediate sizes, unscaled routing, and immutable bias-free weights. Source gate/up
+weights are `[I,H]` and down weights `[H,I]`, each used through
+`Transpose(perm=[1,0])` + `MatMul`. The checker verifies the two scalar expert
+IDs are 0 and 1 and all six matrices have uniform geometry. Apply before
+constant folding removes those Transposes or generic expert fusions hide
+the source operators. Constants must already be represented as initializers.
+
+The pre-parsed replacement reproduces ONNX `TopK` on the original logits,
+then uses `Equal(indices, [0,1])` and a float `Cast` as CPU MoE routing scores.
+With `k=1` and normalized routing, the sole selected weight is one.
+The scores have a unique winner, so CPU MoE cannot override ONNX's lower-index
+tie choice (or lose close unequal logits through its full-softmax rounding).
+This adapter is specific to `k=1`; extending it to larger k requires preserving
+the actual selected routing weights, not just one-hot membership.
+Gate/up rows are interleaved, not concatenated, into `[2,2*I,H]`, and down
+matrices are stacked into `[2,H,I]` for CPU `swiglu_fusion=1`.
+
+**Admitted numerical contract:** opting into this dense rule assumes finite
+inputs, weights, logits and all source/target intermediates, and accepts
+tolerance-based float32 equivalence rather than bitwise equality or signed-zero
+preservation. This assumption is supplied by the caller, not proven by the
+static checker or enforced with runtime guards. In particular, finite
+parameters alone do not guarantee finite intermediates for arbitrary runtime
+activations. A TODO at eligibility records that dense inactive-expert NaN/Inf
+propagation versus target skipping still needs investigation.
+The overflow counterexample remains a regression demonstrating behavior
+**outside** this contract; the rule is not IEEE-equivalent on such inputs.
+
+`DenseTwoExpertMobiusNumericalParityAndPacking` runs both genuine standard
+source and rewritten CPU graphs with automatic optimization disabled. Distinct
+non-square expert weights, multiple tokens, negative/zero activations, equal
+and unequal logits (including differences lost by full-softmax rounding),
+both experts selected, static/symbolic token metadata,
+and both matcher modes are covered. The output is checked against both the
+source and an independent double-precision reference using absolute-plus-relative
+tolerance `1e-5 + 1e-5 * |reference|`. The test asserts that CPU executes
+the MoE node and separately verifies every packed gate/up/down element after
+constant folding, serialization/reload, and rewrite idempotence.
+Negative cases reject top-k=2, wrong activation/transpose/mask/reduction,
+overridable weights, exposed intermediate outputs, incompatible providers,
+and unproven expert dimensions or unknown-rank token metadata.
 
 ### Coverage relative to current Mobius MoE sources
 
 The inventory baseline is Mobius
 [`d69efe03a9f4c1ada744bc31dd01077a710b3c39`](https://github.com/onnxruntime/mobius/tree/d69efe03a9f4c1ada744bc31dd01077a710b3c39).
 The grouped fixtures above use real routing components but substitute a local
-GroupedMatMul expert body. They are **not evidence of matching** the following
-standard or mixed-op source representations.
+GroupedMatMul expert body. They are **not evidence of matching** standard or
+mixed-op sources; the separate dense tests above establish only the bounded
+coverage listed here.
 
 | Source | Current coverage | Required before extending |
 |---|---|---|
 | A10 Qwen4 `_standard_dispatch` | Deferred | Verify `Scan` accumulator recurrence, nested nonempty `If`, captured weight banks, token gathering/scattering, FP32 SiLU opmath and casts. Pattern nodes with subgraphs are currently rejected; matching an isolated body is not proof of the enclosing recurrence. |
-| A10 `MoELayer.forward` dense mask-and-sum | Deferred, including bounded two-expert form | Preserve explicit selected indices and dense inactive-expert IEEE behavior; do not assume untied logits or finite intermediates. |
+| A10 `MoELayer.forward` dense mask-and-sum | Two bias-free float32 SiLU experts, top-k=1, under the finite-intermediate tolerance contract | Other counts/k, activations, biases and routing forms remain deferred. The explicit ONNX selection adapter preserves ties; inactive nonfinite propagation is outside the admitted contract. |
 | A10 Gemma4 vectorized fallback | Deferred | Separate Einsum/routing-layout checks and exact activation qualification. QuickGELU with alpha 1.702 is not exact erf/tanh GELU. |
 | B1 dense `MatMulNBits` experts to QMoE | Deferred | Uniform INT4 geometry, interleaved packed weights **and** scales/zero points, CPU ABI qualification, routing and dense inactive-expert semantics. Not covered by float grouped rules or by projection fusion alone. |
 
@@ -130,26 +185,27 @@ upstream replacement is therefore not a runnable CPU implementation.
 `DenseMobiusRoutingAndInactiveExpertCounterexamples` faithfully reproduces
 the pinned `TopKGate`, bias-free `MLP` and dense `MoELayer.forward` graph for
 two experts and `k=1`, without downloading checkpoints or introducing a local
-GroupedMatMul function. It runs the source and two hand-built candidate targets
-on CPU (these candidates are **not registered rewrite rules**):
+GroupedMatMul function. It runs the source, two hand-built candidate targets,
+and the new dense rule's replacement on CPU:
 
 - With equal logits and distinct expert outputs, ONNX TopK selects expert 0,
   whereas CPU MoE selects expert 1. Building selection scores from the original
   TopK indices with `Equal`/`Cast` restores the selected expert and the finite
-  output in this test; raw-logit substitution does not.
+  output in this test; raw-logit substitution does not. The registered dense
+  rule uses this adapter, and its actual rewritten target also passes.
 - With untied logits, finite activations and finite weights, an inactive
   expert's `FLT_MAX` down-projection overflows. Dense evaluation multiplies
   that infinity by its zero mask and returns NaN. Both naive and
   selection-adapted MoE skip the inactive expert and return finite results.
   Thus a tie adapter alone is insufficient, and checking finite constant
-  weights does not prove finite runtime intermediates.
+  weights does not prove finite runtime intermediates. The registered dense
+  replacement exhibits the same divergence outside its admitted contract.
 
-The test also verifies that the current grouped rules leave the genuine dense
-source unfused in both matcher modes. No practical multi-expert A10/B1 coverage
-is claimed. A safe extension needs a separately specified numerical/admissible
-input contract or runtime guards with a faithful fallback, plus independent
-region support for the recurrent source. A static match callback cannot infer
-the needed bounds on arbitrary runtime activations.
+No full A10 or B1 coverage is claimed. Arbitrary nonfinite/overflow behavior
+would require runtime guards with a faithful fallback or a different target
+execution policy, and the recurrent source independently requires region
+support. A static match callback cannot infer the needed runtime activation
+bounds.
 
 ## Example: HardSigmoid followed by Mul
 

@@ -63,6 +63,31 @@ constexpr const char* kMoELibrary = R"(
     weighted = Mul(experts.output, expanded)
     return ReduceSum(weighted, [1], keepdims=0, noop_with_empty_axes=0)
   }
+
+  pattern DenseExpert(x:float[M,H], weights:float[M,K], indices:int64[M,K],
+      expert:const int64, gate:const float[I,H], up:const float[I,H], down:const float[H,I]) {
+    gt = Transpose(gate, perm=[1,0])
+    ut = Transpose(up, perm=[1,0])
+    dt = Transpose(down, perm=[1,0])
+    g = MatMul(x, gt)
+    u = MatMul(x, ut)
+    activation = SwiGLU(g,u)
+    projected = MatMul(activation.product, dt)
+    mask = Equal(indices, expert)
+    float_mask = CastLike(mask, weights)
+    masked_weights = Mul(weights, float_mask)
+    weight = ReduceSum(masked_weights, [-1], keepdims=1, noop_with_empty_axes=0)
+    output = Mul(projected, weight)
+    return output
+  }
+
+  pattern DenseMoEPattern(x:float[M,H], logits:float[M,E], top_k:const int64[1],
+      expert0:const int64, expert1:const int64, gate0, up0, down0, gate1, up1, down1) {
+    weights, indices = TopKSoftmax(logits, top_k)
+    e0 = DenseExpert(x, weights, indices, expert0, gate0, up0, down0)
+    e1 = DenseExpert(x, weights, indices, expert1, gate1, up1, down1)
+    return Add(e0.output, e1.output)
+  }
 )";
 
 struct RoutingView {
@@ -159,6 +184,40 @@ bool CheckMoE(const Graph& graph, Match& match) {
   BindInteger(match, "normalize", route.normalize ? 1 : 0);
   return true;
 }
+
+bool CheckDenseMoE(const Graph& graph, Match& match) {
+  const auto first = match.instance("e0");
+  const auto second = match.instance("e1");
+  const auto* gate_shape = first.valueOf("gate")->Shape();
+  if (!gate_shape || gate_shape->dim_size() != 2 ||
+      !gate_shape->dim(0).has_dim_value() || !gate_shape->dim(1).has_dim_value())
+    return match.Reject("Dense MoE requires static expert dimensions.");
+  const int64_t intermediate = gate_shape->dim(0).dim_value();
+  const int64_t hidden = gate_shape->dim(1).dim_value();
+  if (intermediate <= 0 || hidden <= 0)
+    return match.Reject("Dense MoE requires positive expert dimensions.");
+  for (const auto& expert : {first, second}) {
+    if (!HasDimensions(expert.valueOf("gate"), std::array<int64_t, 2>{intermediate, hidden}) ||
+        !HasDimensions(expert.valueOf("up"), std::array<int64_t, 2>{intermediate, hidden}) ||
+        !HasDimensions(expert.valueOf("down"), std::array<int64_t, 2>{hidden, intermediate}))
+      return match.Reject("Dense MoE requires uniform gate/up/down geometry.");
+  }
+  const auto* x = match.valueOf("x");
+  const auto* logits = match.valueOf("logits");
+  const auto* indices = match.valueOf("indices");
+  if (!HasDimensions(x, std::array<int64_t, 1>{hidden}, 1) ||
+      !HasDimensions(logits, std::array<int64_t, 1>{2}, 1) ||
+      !HasDimensions(indices, std::array<int64_t, 1>{1}, 1) ||
+      !SameTokens(x, logits) || !SameTokens(x, indices) ||
+      !HasInt64Values(graph, match.valueOf("top_k"), std::array<int64_t, 1>{1}) ||
+      !HasInt64Values(graph, match.valueOf("expert0"), std::array<int64_t, 1>{0}) ||
+      !HasInt64Values(graph, match.valueOf("expert1"), std::array<int64_t, 1>{1}))
+    return match.Reject("Dense MoE supports exactly two experts and top-k=1 with proven token dimensions.");
+
+  // TODO: Investigate dense inactive-expert NaN/Inf propagation versus MoE skipping.
+  // This opt-in rule assumes finite intermediates and tolerance-based equivalence.
+  return true;
+}
 #endif
 }  // namespace
 
@@ -183,6 +242,32 @@ Rules MakeMoEFusionRules() {
     }
   )");
   rules.push_back(Rule{"GroupedMoE", library.GetPattern("MoEPattern"), recipe, CheckMoE, {{kOnnxDomain, 24, 24}, {"local.moe", 1, 1}, {kMSDomain, 1, 1}}});
+  const Replacement dense_recipe(R"(
+    (x, logits, top_k, e0.gate, e0.up, e0.down, e1.gate, e1.up, e1.down) => {
+      selected, indices = TopK(logits, top_k, axis=-1, largest=1)
+      mask = Equal(indices, [0,1])
+      router = Cast(mask, to=1)
+      g0 = Unsqueeze(e0.gate, [1])
+      u0 = Unsqueeze(e0.up, [1])
+      g1 = Unsqueeze(e1.gate, [1])
+      u1 = Unsqueeze(e1.up, [1])
+      expert0 = Concat(g0, u0, axis=1)
+      expert1 = Concat(g1, u1, axis=1)
+      expanded0 = Unsqueeze(expert0, [0])
+      expanded1 = Unsqueeze(expert1, [0])
+      stacked = Concat(expanded0, expanded1, axis=0)
+      shape = Shape(e0.gate)
+      doubled = Mul(shape, [2,1])
+      packed_shape = Concat([2], doubled, axis=0)
+      fc1 = Reshape(stacked, packed_shape)
+      down0 = Unsqueeze(e0.down, [0])
+      down1 = Unsqueeze(e1.down, [0])
+      fc2 = Concat(down0, down1, axis=0)
+      return com.microsoft.MoE(x, router, fc1, None, fc2,
+        activation_type="swiglu", swiglu_fusion=1, k=1, normalize_routing_weights=1)
+    }
+  )");
+  rules.push_back(Rule{"DenseTwoExpertMoE", library.GetPattern("DenseMoEPattern"), dense_recipe, CheckDenseMoE, {{kOnnxDomain, 24, 24}, {kMSDomain, 1, 1}}});
 #endif
   return rules;
 }
