@@ -4,12 +4,17 @@
 #include "core/optimizer/pattern_rewriter.h"
 
 #include <array>
+#include <cmath>
+#include <limits>
+#include <sstream>
 
 #include "gtest/gtest.h"
 #include "core/graph/model.h"
 #include "core/optimizer/constant_folding.h"
 #include "core/optimizer/initializer.h"
+#include "test/optimizer/graph_transform_test_fixture.h"
 #include "test/test_environment.h"
+#include "test/unittest_util/graph_transform_test_builder.h"
 #include "test/util/include/asserts.h"
 #include "test/util/include/default_providers.h"
 
@@ -69,6 +74,126 @@ void CheckGroupedModel(const PathString& path, bool indexed, int64_t k = 2, int6
 TEST(MoEFusionRulesTests, GroupedTopKSoftmax) {
   for (bool indexed : {true, false})
     CheckGroupedModel(ORT_TSTR("testdata/transform/fusion/mobius_moe_topk.onnx"), indexed);
+}
+
+TEST(MoEFusionRulesTests, DenseMobiusRoutingAndInactiveExpertCounterexamples) {
+  // Faithful standard skeleton from Mobius d69efe03's TopKGate + MLP + MoELayer.forward.
+  for (bool overflow : {false, true}) {
+    SCOPED_TRACE(overflow);
+    std::array<std::vector<float>, 3> results;
+    for (int form = 0; form < 3; ++form) {
+      Model model("dense_mobius", false, ModelMetaData(), PathString(), IOnnxRuntimeOpSchemaRegistryList(),
+                  {{kOnnxDomain, 24}, {kMSDomain, 1}}, {}, DefaultLoggingManager().DefaultLogger());
+      auto& graph = model.MainGraph();
+      ModelTestBuilder b(graph);
+      auto* x = b.MakeInput<float>({1, 2}, std::vector<float>{2.0f, 2.0f});
+      auto* logits = b.MakeInput<float>({1, 2}, overflow ? std::vector<float>{1.0f, 0.0f}
+                                                         : std::vector<float>{0.0f, 0.0f});
+      auto* selected = b.MakeIntermediate();
+      auto* indices = b.MakeIntermediate();
+      auto* weights = b.MakeIntermediate();
+      b.AddNode("TopK", {logits, b.MakeInitializer<int64_t>({1}, {1})}, {selected, indices})
+          .AddAttribute("axis", int64_t{-1});
+      b.AddNode("Softmax", {selected}, {weights}).AddAttribute("axis", int64_t{-1});
+      const float large = overflow ? std::numeric_limits<float>::max() : 2.0f;
+      auto* output = b.MakeOutput();
+      if (form == 0) {
+        NodeArg* sum = nullptr;
+        for (int64_t expert = 0; expert < 2; ++expert) {
+          auto* gate_t = b.MakeIntermediate();
+          auto* up_t = b.MakeIntermediate();
+          auto* down_t = b.MakeIntermediate();
+          auto* gate = b.MakeIntermediate();
+          auto* up = b.MakeIntermediate();
+          auto* activated = b.MakeIntermediate();
+          auto* product = b.MakeIntermediate();
+          auto* projected = b.MakeIntermediate();
+          const std::vector<float> identity{1, 0, 0, 1};
+          const float scale = expert == 0 ? 1.0f : large;
+          for (auto* transpose : {gate_t, up_t})
+            b.AddNode("Transpose", {b.MakeInitializer<float>({2, 2}, identity)}, {transpose})
+                .AddAttribute("perm", std::vector<int64_t>{1, 0});
+          b.AddNode("Transpose", {b.MakeInitializer<float>({2, 2}, {scale, 0, 0, scale})}, {down_t})
+              .AddAttribute("perm", std::vector<int64_t>{1, 0});
+          b.AddNode("MatMul", {x, gate_t}, {gate});
+          b.AddNode("MatMul", {x, up_t}, {up});
+          b.AddNode("Swish", {gate}, {activated});
+          b.AddNode("Mul", {activated, up}, {product});
+          b.AddNode("MatMul", {product, down_t}, {projected});
+          auto* mask = b.MakeIntermediate();
+          auto* mask_float = b.MakeIntermediate();
+          auto* weighted = b.MakeIntermediate();
+          auto* weight = b.MakeIntermediate();
+          auto* contribution = expert == 0 ? b.MakeIntermediate() : output;
+          b.AddNode("Equal", {indices, b.MakeScalarInitializer<int64_t>(expert)}, {mask});
+          b.AddNode("CastLike", {mask, weights}, {mask_float});
+          b.AddNode("Mul", {weights, mask_float}, {weighted});
+          b.AddNode("ReduceSum", {weighted, b.MakeInitializer<int64_t>({1}, {-1})}, {weight})
+              .AddAttribute("keepdims", int64_t{1});
+          auto* current = expert == 0 ? contribution : b.MakeIntermediate();
+          b.AddNode("Mul", {projected, weight}, {current});
+          if (sum) b.AddNode("Add", {sum, current}, {contribution});
+          sum = contribution;
+        }
+      } else {
+        auto* router = logits;
+        if (form == 2) {
+          auto* mask = b.MakeIntermediate();
+          router = b.MakeIntermediate();
+          b.AddNode("Equal", {indices, b.MakeInitializer<int64_t>({2}, {0, 1})}, {mask});
+          b.AddNode("Cast", {mask}, {router})
+              .AddAttribute("to", int64_t{ONNX_NAMESPACE::TensorProto_DataType_FLOAT});
+        }
+        const std::vector<float> packed{1, 0, 1, 0, 0, 1, 0, 1,
+                                        1, 0, 1, 0, 0, 1, 0, 1};
+        auto& node = b.AddNode("MoE",
+                               {x, router, b.MakeInitializer<float>({2, 4, 2}, packed),
+                                &graph.GetOrCreateNodeArg("", nullptr),
+                                b.MakeInitializer<float>({2, 2, 2}, {1, 0, 0, 1, large, 0, 0, large})},
+                               {output}, kMSDomain);
+        node.AddAttribute("k", int64_t{1});
+        node.AddAttribute("activation_type", "swiglu");
+        node.AddAttribute("swiglu_fusion", int64_t{1});
+        node.AddAttribute("normalize_routing_weights", int64_t{1});
+      }
+      b.SetGraphOutputs();
+      ASSERT_STATUS_OK(graph.Resolve());
+      if (form == 0) {
+        for (bool indexed : {true, false}) {
+          rewrite::Statistics stats;
+          ASSERT_STATUS_OK(rewrite::PatternRewriter(rewrite::MakeMoEFusionRules(), {.indexed = indexed}).Run(graph, stats));
+          EXPECT_EQ(stats.rewrites, 0u);
+          EXPECT_EQ(Count(graph, "MoE", kMSDomain), 0u);
+        }
+      }
+      SessionOptions options;
+      options.graph_optimization_level = TransformerLevel::Default;
+      options.intra_op_param.thread_pool_size = 1;
+      InferenceSessionWrapper session(options, GetEnvironment());
+      std::istringstream stream(model.ToProto().SerializeAsString());
+      ASSERT_STATUS_OK(session.Load(stream));
+      ASSERT_STATUS_OK(session.Initialize());
+      EXPECT_EQ(Count(session.GetGraph(), "MoE", kMSDomain), form == 0 ? 0u : 1u);
+      std::vector<OrtValue> outputs;
+      ASSERT_STATUS_OK(session.Run(RunOptions{}, b.feeds_, b.output_names_, &outputs));
+      ASSERT_EQ(outputs.size(), 1u);
+      const auto& tensor = outputs[0].Get<Tensor>();
+      ASSERT_EQ(tensor.Shape().Size(), 2);
+      results[form].assign(tensor.Data<float>(), tensor.Data<float>() + 2);
+    }
+    for (size_t i = 0; i < 2; ++i) {
+      if (overflow) {
+        EXPECT_TRUE(std::isnan(results[0][i]));
+        EXPECT_TRUE(std::isfinite(results[1][i]));
+        EXPECT_TRUE(std::isfinite(results[2][i]));
+      } else {
+        ASSERT_TRUE(std::isfinite(results[0][i]));
+        ASSERT_GT(results[0][i], 0.0f);
+        EXPECT_NEAR(results[1][i], 2 * results[0][i], 1e-5f);
+        EXPECT_NEAR(results[2][i], results[0][i], 1e-5f);
+      }
+    }
+  }
 }
 
 TEST(MoEFusionRulesTests, GroupedSoftmaxTopKNormalized) {

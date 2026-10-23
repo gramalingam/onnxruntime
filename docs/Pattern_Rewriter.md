@@ -105,6 +105,52 @@ The CPU packing regression separately constant-folds the generated weight
 subgraph with distinct gate/up/down entries and checks every interleaved FC1
 and transposed FC2 element in both matcher modes.
 
+### Coverage relative to current Mobius MoE sources
+
+The inventory baseline is Mobius
+[`d69efe03a9f4c1ada744bc31dd01077a710b3c39`](https://github.com/onnxruntime/mobius/tree/d69efe03a9f4c1ada744bc31dd01077a710b3c39).
+The grouped fixtures above use real routing components but substitute a local
+GroupedMatMul expert body. They are **not evidence of matching** the following
+standard or mixed-op source representations.
+
+| Source | Current coverage | Required before extending |
+|---|---|---|
+| A10 Qwen4 `_standard_dispatch` | Deferred | Verify `Scan` accumulator recurrence, nested nonempty `If`, captured weight banks, token gathering/scattering, FP32 SiLU opmath and casts. Pattern nodes with subgraphs are currently rejected; matching an isolated body is not proof of the enclosing recurrence. |
+| A10 `MoELayer.forward` dense mask-and-sum | Deferred, including bounded two-expert form | Preserve explicit selected indices and dense inactive-expert IEEE behavior; do not assume untied logits or finite intermediates. |
+| A10 Gemma4 vectorized fallback | Deferred | Separate Einsum/routing-layout checks and exact activation qualification. QuickGELU with alpha 1.702 is not exact erf/tanh GELU. |
+| B1 dense `MatMulNBits` experts to QMoE | Deferred | Uniform INT4 geometry, interleaved packed weights **and** scales/zero points, CPU ABI qualification, routing and dense inactive-expert semantics. Not covered by float grouped rules or by projection fusion alone. |
+
+Source anchors: [`MoELayer.forward`](https://github.com/onnxruntime/mobius/blob/d69efe03a9f4c1ada744bc31dd01077a710b3c39/src/mobius/components/_moe.py#L671-L691),
+[`Qwen4._standard_dispatch`](https://github.com/onnxruntime/mobius/blob/d69efe03a9f4c1ada744bc31dd01077a710b3c39/src/mobius/models/qwen4_exp.py#L1108-L1184),
+and [`_qmoe_fusion._fuse_layer`](https://github.com/onnxruntime/mobius/blob/d69efe03a9f4c1ada744bc31dd01077a710b3c39/src/mobius/rewrite_rules/_qmoe_fusion.py#L350-L449).
+The last source emits concatenated gate/up rows with `swiglu_fusion=2`;
+this tree's CPU QMoE requires interleaved `swiglu_fusion=1`. Copying that
+upstream replacement is therefore not a runnable CPU implementation.
+
+`DenseMobiusRoutingAndInactiveExpertCounterexamples` faithfully reproduces
+the pinned `TopKGate`, bias-free `MLP` and dense `MoELayer.forward` graph for
+two experts and `k=1`, without downloading checkpoints or introducing a local
+GroupedMatMul function. It runs the source and two hand-built candidate targets
+on CPU (these candidates are **not registered rewrite rules**):
+
+- With equal logits and distinct expert outputs, ONNX TopK selects expert 0,
+  whereas CPU MoE selects expert 1. Building selection scores from the original
+  TopK indices with `Equal`/`Cast` restores the selected expert and the finite
+  output in this test; raw-logit substitution does not.
+- With untied logits, finite activations and finite weights, an inactive
+  expert's `FLT_MAX` down-projection overflows. Dense evaluation multiplies
+  that infinity by its zero mask and returns NaN. Both naive and
+  selection-adapted MoE skip the inactive expert and return finite results.
+  Thus a tie adapter alone is insufficient, and checking finite constant
+  weights does not prove finite runtime intermediates.
+
+The test also verifies that the current grouped rules leave the genuine dense
+source unfused in both matcher modes. No practical multi-expert A10/B1 coverage
+is claimed. A safe extension needs a separately specified numerical/admissible
+input contract or runtime guards with a faithful fallback, plus independent
+region support for the recurrent source. A static match callback cannot infer
+the needed bounds on arbitrary runtime activations.
+
 ## Example: HardSigmoid followed by Mul
 
 This complete rule recognizes the HardSwish decomposition with the exact
