@@ -1437,6 +1437,7 @@ Status PatternParser::PatternCall(const InlinedVector<std::string>& names, const
   const bool destructured = names.size() > 1;
   ORT_RETURN_IF(names.empty() || (destructured && names.size() != definition.outputs.size()),
                 Error("pattern output count mismatch"));
+  // '$' cannot appear in a user identifier, keeping unexposed call internals hygienic.
   const std::string path = destructured ? "$call" + std::to_string(radices_.size()) : names.front();
   ORT_RETURN_IF(pattern_.instances_.count(path), Error("duplicate pattern instance"));
   ORT_RETURN_IF_ERROR(Expect("("));

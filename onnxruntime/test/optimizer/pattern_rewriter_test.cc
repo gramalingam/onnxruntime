@@ -4651,6 +4651,44 @@ TEST(PatternRewriterTests, ZeroNodeCompositionHasCumulativeCallBudget) {
                OnnxRuntimeException);
 }
 
+TEST(PatternRewriterTests, ExplicitOutputBindingsPreserveAliasesAndCallBudget) {
+  const PatternLibrary library(R"(
+    pattern Pair(x) { return (a=x,b=x) }
+    pattern P(x) { a,b=Pair(x); return Add(a,b) }
+  )");
+  for (bool indexed : {true, false}) {
+    TestGraph test;
+    auto& b = test.builder;
+    auto* x = b.MakeInput<float>({2}, 0.0f, 1.0f);
+    b.AddNode("Add", {x, x}, {b.MakeOutput()});
+    b.SetGraphOutputs();
+    ASSERT_STATUS_OK(test.graph.Resolve());
+    auto check = [&](const Graph&, Match& match) {
+      EXPECT_EQ(match.valueOf("a"), x);
+      EXPECT_EQ(match.valueOf("b"), x);
+      return true;
+    };
+    Rule rule{"Alias", library.GetPattern("P"), "(x)=>Identity(x)", check, {{kOnnxDomain, 17, 17}}};
+    Statistics stats;
+    ASSERT_STATUS_OK(PatternRewriter({rule}, {.indexed = indexed}).Run(test.graph, stats));
+    EXPECT_EQ(stats.rewrites, 1u);
+    ASSERT_STATUS_OK(test.graph.Resolve());
+  }
+  std::string text = "pattern P0(x){return (a=x,b=x)} ";
+  for (int i = 1; i <= 7; ++i) {
+    const auto previous = "P" + std::to_string(i - 1);
+    text += "pattern P" + std::to_string(i) + "(x){a,b=" + previous + "(x);c,d=" + previous + "(a);return c,d} ";
+  }
+  text += "pattern P8(x){a,b=P7(x);return a,b} pattern P9(x){a,b=P8(x);return a,b} ";
+  EXPECT_NO_THROW(PatternLibrary{text});
+  try {
+    PatternLibrary overflow(text + "pattern P10(x){a,b=P9(x);return a,b}");
+    FAIL() << "Explicit output binding must retain the cumulative call budget.";
+  } catch (const OnnxRuntimeException& error) {
+    EXPECT_NE(std::string(error.what()).find("expanded call limit of 256"), std::string::npos);
+  }
+}
+
 TEST(PatternRewriterTests, InterfacePortsCannotBecomeAttributes) {
   for (const char* text : {
            "interface I(x,alpha:float)->(y) pattern P implements I {y=LeakyRelu(x,alpha=alpha);return y}",

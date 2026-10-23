@@ -60,9 +60,9 @@ directly to local names, in interface output order. The checker reads them with
 instance view.
 `GroupedExperts` receives every interface input explicitly at its call site.
 
-Handwritten `RoutingView` and `ExpertsView` use scoped `BindingView` lookups;
-the routing view reads directly bound tensors, and the expert view reads the
-named expert instance. The matched weights producer distinguishes unnormalized
+Handwritten `RoutingView` reads directly bound tensors from `Match`, while
+`ExpertsView` uses scoped `BindingView` lookups for the named expert instance.
+The matched weights producer distinguishes unnormalized
 TopK weights from the two normalized forms. Shared C++ checks decode immutable
 int64 tensors with `ReadConstantTensor`, propagating malformed-payload errors.
 They require opset 24 float32, rank-2 token inputs, positive static expert,
