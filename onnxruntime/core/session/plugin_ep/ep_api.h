@@ -106,6 +106,15 @@ ORT_API_STATUS_IMPL(KernelDef_GetOutputMemType, _In_ const OrtKernelDef* kernel_
 
 ORT_API_STATUS_IMPL(GetTensorDataType, _In_ ONNXTensorElementDataType elem_type,
                     _Outptr_ const OrtDataType** out);
+ORT_API_STATUS_IMPL(RegisterOpaqueDataType, _In_z_ const char* domain, _In_z_ const char* name,
+                    _In_ size_t size, _In_ OrtEpOpaqueTypeCreateFunc create,
+                    _In_ OrtEpOpaqueTypeReleaseFunc release, _In_opt_ void* user_data,
+                    _Outptr_ const OrtDataType** out);
+ORT_API_STATUS_IMPL(KernelContext_GetOpaqueInput, _In_ const OrtKernelContext* context, _In_ size_t index,
+                    _In_ const OrtDataType* type, _Outptr_ const void** out);
+ORT_API_STATUS_IMPL(KernelContext_GetOpaqueOutput, _Inout_ OrtKernelContext* context, _In_ size_t index,
+                    _In_ const OrtDataType* type, _Outptr_ void** out);
+ORT_API_STATUS_IMPL(UnregisterOpaqueDataType, _In_ const OrtDataType* type);
 ORT_API_STATUS_IMPL(EpGraphSupportInfo_LookUpKernel, _In_ OrtEpGraphSupportInfo* graph_support_info,
                     _In_ const OrtNode* node, _Outptr_result_maybenull_ const OrtKernelDef** out_kernel_def);
 

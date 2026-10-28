@@ -5,12 +5,16 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "core/common/semver.h"
+#include "core/framework/data_types.h"
 #include "core/framework/error_code_helper.h"
 #include "core/framework/func_api.h"
 #include "core/framework/op_kernel_info.h"
@@ -40,6 +44,57 @@
 
 using namespace onnxruntime;
 namespace OrtExecutionProviderApi {
+namespace {
+
+class PluginOpaqueType final : public NonTensorTypeBase {
+ public:
+  PluginOpaqueType(const char* domain, const char* name, size_t size,
+                   OrtEpOpaqueTypeCreateFunc create, OrtEpOpaqueTypeReleaseFunc release, void* user_data)
+      : NonTensorTypeBase(size), create_(create), release_(release), user_data_(user_data) {
+    data_types_internal::AssignOpaqueDomainName(domain, name, MutableTypeProto());
+  }
+
+  bool IsCompatible(const ONNX_NAMESPACE::TypeProto& type_proto) const override {
+    return IsOpaqueCompatible(type_proto);
+  }
+
+  DeleteFunc GetDeleteFunc() const override {
+    return nullptr;
+  }
+
+  CreateFunc GetCreateFunc() const override {
+    return nullptr;
+  }
+
+  void CreateOrtValue(OrtValue& output) const override {
+    const auto release = release_;
+    void* user_data = user_data_;
+    std::function<void(void*)> deleter = [release, user_data](void* p) { release(user_data, p); };
+    void* value = create_(user_data_);
+    ORT_ENFORCE(value != nullptr, "Opaque type create callback returned null");
+    output.Init(value, this, std::move(deleter));
+  }
+
+ private:
+  OrtEpOpaqueTypeCreateFunc create_;
+  OrtEpOpaqueTypeReleaseFunc release_;
+  void* user_data_;
+};
+
+std::mutex opaque_types_mutex;
+std::vector<std::unique_ptr<PluginOpaqueType>> opaque_types;
+
+const PluginOpaqueType* FindPluginOpaqueType(const OrtDataType* type) {
+  const auto* type_ptr = reinterpret_cast<const DataTypeImpl*>(type);
+  const auto it = std::find_if(opaque_types.begin(), opaque_types.end(),
+                               [type_ptr](const auto& registered_type) {
+                                 return registered_type.get() == type_ptr;
+                               });
+  return it == opaque_types.end() ? nullptr : it->get();
+}
+
+}  // namespace
+
 ORT_API_STATUS_IMPL(CreateEpDevice, _In_ OrtEpFactory* ep_factory,
                     _In_ const OrtHardwareDevice* hardware_device,
                     _In_opt_ const OrtKeyValuePairs* ep_metadata,
@@ -606,6 +661,101 @@ ORT_API_STATUS_IMPL(GetTensorDataType, _In_ ONNXTensorElementDataType elem_type,
   API_IMPL_BEGIN
   const DataTypeImpl* ml_type = DataTypeImpl::TensorTypeFromONNXEnum(utils::ToTensorProtoElementType(elem_type));
   *out = reinterpret_cast<const OrtDataType*>(ml_type);
+  return nullptr;
+  API_IMPL_END
+}
+
+ORT_API_STATUS_IMPL(RegisterOpaqueDataType, _In_z_ const char* domain, _In_z_ const char* name,
+                    _In_ size_t size, _In_ OrtEpOpaqueTypeCreateFunc create,
+                    _In_ OrtEpOpaqueTypeReleaseFunc release, _In_opt_ void* user_data,
+                    _Outptr_ const OrtDataType** out) {
+  API_IMPL_BEGIN
+  ORT_ENFORCE(domain != nullptr && domain[0] != '\0' && name != nullptr && name[0] != '\0',
+              "Opaque type domain and name are required");
+  ORT_ENFORCE(size != 0 && create != nullptr && release != nullptr,
+              "Opaque type size, create callback, and release callback are required");
+  ORT_ENFORCE(out != nullptr, "Opaque type output is required");
+
+  std::lock_guard<std::mutex> lock(opaque_types_mutex);
+  std::string type_string("opaque(");
+  type_string.append(domain).append(",").append(name).append(")");
+  ORT_ENFORCE(DataTypeImpl::GetDataType(type_string) == nullptr,
+              "Opaque type is already registered: ", type_string);
+
+  auto type = std::make_unique<PluginOpaqueType>(domain, name, size, create, release, user_data);
+  const auto* type_ptr = type.get();
+  opaque_types.push_back(std::move(type));
+  ORT_TRY {
+    DataTypeImpl::RegisterDataType(type_ptr);
+  }
+  ORT_CATCH(...) {
+    opaque_types.pop_back();
+    ORT_RETHROW;
+  }
+  *out = reinterpret_cast<const OrtDataType*>(type_ptr);
+  return nullptr;
+  API_IMPL_END
+}
+
+ORT_API_STATUS_IMPL(UnregisterOpaqueDataType, _In_ const OrtDataType* type) {
+  API_IMPL_BEGIN
+  ORT_ENFORCE(type != nullptr, "Opaque type is required");
+
+  std::lock_guard<std::mutex> lock(opaque_types_mutex);
+  const auto* type_ptr = reinterpret_cast<const DataTypeImpl*>(type);
+  const auto it = std::find_if(opaque_types.begin(), opaque_types.end(),
+                               [type_ptr](const auto& registered_type) {
+                                 return registered_type.get() == type_ptr;
+                               });
+  ORT_ENFORCE(it != opaque_types.end(), "Opaque type is not registered");
+  DataTypeImpl::UnregisterDataType(type_ptr);
+  opaque_types.erase(it);
+  return nullptr;
+  API_IMPL_END
+}
+
+ORT_API_STATUS_IMPL(KernelContext_GetOpaqueInput, _In_ const OrtKernelContext* context, _In_ size_t index,
+                    _In_ const OrtDataType* type, _Outptr_ const void** out) {
+  API_IMPL_BEGIN
+  ORT_ENFORCE(context != nullptr && type != nullptr && out != nullptr, "Arguments must not be null");
+  ORT_ENFORCE(index <= static_cast<size_t>(std::numeric_limits<int>::max()),
+              "Opaque input index is out of range");
+  const auto* kernel_context = reinterpret_cast<const OpKernelContext*>(context);
+  ORT_ENFORCE(index < static_cast<size_t>(kernel_context->InputCount()), "Opaque input index is out of range");
+  const PluginOpaqueType* expected_type;
+  {
+    std::lock_guard<std::mutex> lock(opaque_types_mutex);
+    expected_type = FindPluginOpaqueType(type);
+  }
+  ORT_ENFORCE(expected_type != nullptr, "Opaque input type is not registered");
+  ORT_ENFORCE(kernel_context->InputType(static_cast<int>(index)) == expected_type,
+              "Opaque input has an unexpected type");
+  const auto* value = kernel_context->GetInputOrtValue(static_cast<int>(index));
+  ORT_ENFORCE(value != nullptr, "Opaque input is missing");
+  *out = value->GetOpaqueData(expected_type);
+  return nullptr;
+  API_IMPL_END
+}
+
+ORT_API_STATUS_IMPL(KernelContext_GetOpaqueOutput, _Inout_ OrtKernelContext* context, _In_ size_t index,
+                    _In_ const OrtDataType* type, _Outptr_ void** out) {
+  API_IMPL_BEGIN
+  ORT_ENFORCE(context != nullptr && type != nullptr && out != nullptr, "Arguments must not be null");
+  ORT_ENFORCE(index <= static_cast<size_t>(std::numeric_limits<int>::max()),
+              "Opaque output index is out of range");
+  auto* kernel_context = reinterpret_cast<OpKernelContext*>(context);
+  ORT_ENFORCE(index < static_cast<size_t>(kernel_context->OutputCount()), "Opaque output index is out of range");
+  const PluginOpaqueType* expected_type;
+  {
+    std::lock_guard<std::mutex> lock(opaque_types_mutex);
+    expected_type = FindPluginOpaqueType(type);
+  }
+  ORT_ENFORCE(expected_type != nullptr, "Opaque output type is not registered");
+  ORT_ENFORCE(kernel_context->OutputType(static_cast<int>(index)) == expected_type,
+              "Opaque output has an unexpected type");
+  auto* value = kernel_context->GetOrCreateOutputOrtValue(static_cast<int>(index));
+  ORT_ENFORCE(value != nullptr, "Opaque output is missing");
+  *out = value->GetMutableOpaqueData(expected_type);
   return nullptr;
   API_IMPL_END
 }
@@ -1354,6 +1504,11 @@ static constexpr OrtEpApi ort_ep_api = {
     &OrtExecutionProviderApi::ReleaseEpContextConfig,
     &OrtExecutionProviderApi::EpContextConfigGetEpContextDataReadFunc,
     &OrtExecutionProviderApi::EpContextConfigGetEpContextDataWriteFunc,
+
+    &OrtExecutionProviderApi::RegisterOpaqueDataType,
+    &OrtExecutionProviderApi::KernelContext_GetOpaqueInput,
+    &OrtExecutionProviderApi::KernelContext_GetOpaqueOutput,
+    &OrtExecutionProviderApi::UnregisterOpaqueDataType,
 };
 
 // checks that we don't violate the rule that the functions must remain in the slots they were originally assigned

@@ -75,6 +75,10 @@ struct OrtValue {
     return type_;
   }
 
+  // Require an allocated opaque value with the exact expected runtime type.
+  const void* GetOpaqueData(onnxruntime::MLDataType expected_type) const;
+  void* GetMutableOpaqueData(onnxruntime::MLDataType expected_type);
+
  private:
   std::shared_ptr<void> data_;
   onnxruntime::MLDataType type_{nullptr};
