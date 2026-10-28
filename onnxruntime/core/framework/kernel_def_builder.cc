@@ -73,6 +73,14 @@ bool KernelDef::IsConflict(const KernelDef& other) const {
       return false;
   }
 
+  // check required in-place
+  if (must_inplace_map_.empty() && !other.MustInplace().empty())
+    return false;
+  for (auto& it : must_inplace_map_) {
+    if (std::find(other.MustInplace().begin(), other.MustInplace().end(), it) == other.MustInplace().end())
+      return false;
+  }
+
   // check alias
   for (auto& it : alias_map_) {
     if (std::find(other.Alias().begin(), other.Alias().end(), it) == other.Alias().end())
@@ -160,6 +168,16 @@ KernelDefBuilder& KernelDefBuilder::MayInplace(const std::vector<std::pair<int, 
 KernelDefBuilder& KernelDefBuilder::MayInplace(int input_index, int output_index) {
   // TODO: validate inputs.
   kernel_def_->inplace_map_.emplace_back(input_index, output_index);
+  return *this;
+}
+
+KernelDefBuilder& KernelDefBuilder::MustInplace(const std::vector<std::pair<int, int>>& inplaces) {
+  kernel_def_->must_inplace_map_ = inplaces;
+  return *this;
+}
+
+KernelDefBuilder& KernelDefBuilder::MustInplace(int input_index, int output_index) {
+  kernel_def_->must_inplace_map_.emplace_back(input_index, output_index);
   return *this;
 }
 
